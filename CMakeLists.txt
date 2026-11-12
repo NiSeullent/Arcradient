@@ -130,9 +130,6 @@ target_include_directories(arcr_webp_obj PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libwebp"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libwebp/src"
 )
-if(ARCR_LEGACY_X86_WIN2000)
-    target_compile_definitions(arcr_webp_obj PRIVATE WEBP_HAVE_SSE2=0 WEBP_HAVE_SSE41=0)
-endif()
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(arcr_webp_obj PRIVATE -w)
 endif()
