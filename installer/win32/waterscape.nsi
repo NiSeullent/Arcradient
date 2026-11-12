@@ -1,5 +1,5 @@
 ; ============================================================================
-; Waterscape Browser 1.0 / Arcradient Engine (MSHTML-Next)
+; Waterscape Browser 2.0 / Arcradient Engine (MSHTML-Next)
 ; installer/win32/waterscape.nsi - Alternative NSIS 3 Scriptable Windows Recipe
 ;
 ; Usage:
@@ -16,7 +16,7 @@ SetCompressor /SOLID lzma
   !define APP_NAME "Waterscape Browser"
 !endif
 !ifndef APP_VERSION
-  !define APP_VERSION "1.0.0"
+  !define APP_VERSION "2.0.0"
 !endif
 !ifndef APP_PUBLISHER
   !define APP_PUBLISHER "Arcradient Project"

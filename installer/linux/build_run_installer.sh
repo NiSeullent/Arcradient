@@ -128,11 +128,11 @@ sed \
     -e "s|@WS_BYTES@|${PAYLOAD_BYTES}|g" \
     <<'EOF_RUN_TEMPLATE' > "${OUTPUT_RUN}"
 #!/bin/sh
-# Waterscape Web Browser 1.0.0 Self-Extracting Linux Installer
+# Waterscape Web Browser 2.0.0 Self-Extracting Linux Installer
 set -eu
 
 APP_NAME="Waterscape Web Browser"
-APP_VERSION="1.0.0"
+APP_VERSION="2.0.0"
 APP_ARCH="@WS_ARCH@"
 EXPECTED_SHA256="@WS_SHA256@"
 PAYLOAD_BYTES="@WS_BYTES@"

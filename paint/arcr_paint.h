@@ -1,6 +1,6 @@
 /*
- * Waterscape Browser / Arcradient Engine (MSHTML-Next)
- * paint/arcr_paint.h - Display List Recorder & Multi-Core 64x64 Tile SIMD Rasterizer
+ * Waterscape Browser 2.0 / Arcradient Engine (MSHTML-Next)
+ * paint/arcr_paint.h - Z-Ordered Display List Recorder, O(N) Tile-Row Binning & Multi-Core SIMD Rasterizer
  */
 #ifndef ARCR_PAINT_H
 #define ARCR_PAINT_H
@@ -14,18 +14,25 @@
 #define ARCR_TILE_SIZE_PX 64
 
 typedef enum ArcrDisplayCmdKind {
-    ARCR_DCMD_SOLID_RECT   = 0,
-    ARCR_DCMD_ROUNDED_RECT = 1,
-    ARCR_DCMD_ROUNDED_STROKE = 2,
-    ARCR_DCMD_BOX_SHADOW   = 3,
-    ARCR_DCMD_IMAGE_BLIT   = 4,
-    ARCR_DCMD_GLYPH_BATCH  = 5
+    ARCR_DCMD_SOLID_RECT      = 0,
+    ARCR_DCMD_ROUNDED_RECT    = 1,
+    ARCR_DCMD_ROUNDED_STROKE  = 2,
+    ARCR_DCMD_BOX_SHADOW      = 3,
+    ARCR_DCMD_IMAGE_BLIT      = 4,
+    ARCR_DCMD_GLYPH_BATCH     = 5,
+    ARCR_DCMD_LINEAR_GRADIENT = 6
 } ArcrDisplayCmdKind;
 
 typedef struct ArcrDisplayCmd {
     ArcrDisplayCmdKind         kind;
     ArcrRect                   bounds;
+    ArcrRect                   clip_rect;
+    bool                       has_clip;
+    bool                       is_fixed; /* Viewport-fixed: does NOT shift by scroll_y! */
+    uint8_t                    opacity;  /* 0..255 */
     uint32_t                   color_argb;
+    uint32_t                   color2_argb; /* End color for linear gradient */
+    int32_t                    angle_deg;
     int32_t                    radius_px;
     int32_t                    border_or_blur_px;
     int32_t                    offset_y;
@@ -34,12 +41,24 @@ typedef struct ArcrDisplayCmd {
     uint32_t                   glyph_count;
 } ArcrDisplayCmd;
 
-typedef struct ArcrDisplayList {
-    ArcrArena       arena;
-    ArcrDisplayCmd *cmds;
+/* Per-64px-band spatial index for O(1) tile command lookup */
+typedef struct ArcrTileBandBin {
+    const uint32_t *cmd_indices;
     uint32_t        count;
-    uint32_t        capacity;
-    uint32_t        default_bg_argb;
+} ArcrTileBandBin;
+
+typedef struct ArcrDisplayList {
+    ArcrArena        arena;
+    ArcrDisplayCmd  *cmds;
+    uint32_t         count;
+    uint32_t         capacity;
+    uint32_t         default_bg_argb;
+
+    /* Spatial Y-band bins (64px document-space bands) + viewport-fixed list */
+    ArcrTileBandBin *doc_bands;
+    uint32_t         doc_band_count;
+    uint32_t        *fixed_cmd_indices;
+    uint32_t         fixed_cmd_count;
 } ArcrDisplayList;
 
 ArcrDisplayList *arcr_paint_build_display_list(const ArcrLayoutTree *layout);
@@ -63,9 +82,8 @@ void arcr_paint_rasterize(const ArcrDisplayList *dl,
 
 /*
  * Multi-core 64x64 Tile-Binned Parallel Rasterizer!
- * Splits `viewport_rect` into 64x64 screen-space tiles, culls display commands
- * per tile, and dispatches tiles across `pool` hardware worker threads.
- * Returns the number of tiles rendered.
+ * Pre-warms all viewport glyphs on the main thread (lock-free tile reads),
+ * uses O(1) spatial Y-band bins per tile, and dispatches across `pool` worker threads.
  */
 uint32_t arcr_paint_rasterize_parallel(const ArcrDisplayList *dl,
                                        ArcrAccelContext      *accel,

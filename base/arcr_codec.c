@@ -1,11 +1,64 @@
 /*
- * Waterscape Browser / Arcradient Engine (MSHTML-Next)
- * base/arcr_codec.c - Pure C11 DEFLATE/ZLIB/GZIP, ZIP (.wsx) & PNG/BMP Codecs
+ * Waterscape Browser 2.0 / Arcradient Engine (MSHTML-Next)
+ * base/arcr_codec.c - Pure C11 DEFLATE/ZLIB/GZIP/Brotli, ZIP (.wsx) & Modern Image/SVG Codecs
  */
 #include "arcr_codec.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#if defined(ARCR_HAVE_MODERN_CODECS)
+#include <math.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wvla"
+#pragma GCC diagnostic ignored "-Woverflow"
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+#pragma GCC diagnostic ignored "-Wimplicit-fallthrough"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
+
+#include <brotli/decode.h>
+#include <webp/decode.h>
+
+#if !defined(__SSE2__)
+#ifndef STBI_NO_SIMD
+#define STBI_NO_SIMD
+#endif
+#ifndef STBIR_NO_SIMD
+#define STBIR_NO_SIMD
+#endif
+#endif
+
+#define STBI_NO_THREAD_LOCALS
+#define STBI_NO_STDIO
+#define STBI_NO_HDR
+#define STBI_NO_LINEAR
+#define STBI_MAX_DIMENSIONS 8192
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+
+#define STB_IMAGE_RESIZE_STATIC
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "stb_image_resize2.h"
+
+#define NANOSVG_ALL_COLOR_KEYWORDS
+#define NANOSVG_IMPLEMENTATION
+#include "nanosvg.h"
+#define NANOSVGRAST_IMPLEMENTATION
+#include "nanosvgrast.h"
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+#endif /* ARCR_HAVE_MODERN_CODECS */
 
 /* =========================================================================
  * 1. Checksums: CRC-32 (IEEE 802.3) & Adler-32
@@ -27,6 +80,7 @@ static void init_crc32_table(void) {
 
 uint32_t arcr_crc32_update(uint32_t crc, const uint8_t *data, size_t len) {
     init_crc32_table();
+    if (!data || len == 0u) return crc;
     uint32_t c = ~crc;
     for (size_t i = 0u; i < len; ++i) {
         c = g_crc32_table[(c ^ data[i]) & 0xFFu] ^ (c >> 8);
@@ -42,6 +96,7 @@ uint32_t arcr_crc32(const uint8_t *data, size_t len) {
 uint32_t arcr_adler32(const uint8_t *data, size_t len) {
     uint32_t s1 = 1u;
     uint32_t s2 = 0u;
+    if (!data) return 1u;
     size_t i = 0u;
     while (i < len) {
         size_t chunk = ARCR_MIN(len - i, 5552u);
@@ -57,7 +112,7 @@ uint32_t arcr_adler32(const uint8_t *data, size_t len) {
 }
 
 /* =========================================================================
- * 2. RFC 1951 DEFLATE Inflate (Decompressor)
+ * 2. RFC 1951 DEFLATE, RFC 1950 ZLIB, RFC 1952 GZIP & RFC 7932 Brotli
  * ========================================================================= */
 typedef struct BitReader {
     const uint8_t *src;
@@ -151,17 +206,40 @@ typedef struct OutBuf {
 } OutBuf;
 
 static bool ob_reserve(OutBuf *ob, size_t extra) {
-    if (ob->len + extra > ob->max_cap) return false;
-    if (ob->len + extra <= ob->cap) return true;
+    if (extra > ob->max_cap || ob->len > ob->max_cap - extra) return false;
+    size_t needed = ob->len + extra;
+    if (needed <= ob->cap) return true;
+    if (needed == SIZE_MAX) return false;
     size_t ncap = (ob->cap == 0u) ? 4096u : ob->cap;
-    while (ncap < ob->len + extra) {
-        ncap = (ncap < ob->max_cap / 2u) ? (ncap * 2u) : ob->max_cap;
-        if (ncap < ob->len + extra) return false;
+    if (ncap > ob->max_cap) ncap = ob->max_cap;
+    while (ncap < needed) {
+        ncap = (ncap <= ob->max_cap / 2u) ? (ncap * 2u) : ob->max_cap;
+        if (ncap < needed) return false;
     }
-    uint8_t *grown = (uint8_t *)realloc(ob->data, ncap);
+    /* Allocate +1 sentinel byte so exact-capacity buffers can be NUL-terminated without OOB or overwrite */
+    size_t alloc_sz = (ncap < SIZE_MAX) ? (ncap + 1u) : ncap;
+    uint8_t *grown = (uint8_t *)realloc(ob->data, alloc_sz);
     if (!grown) return false;
     ob->data = grown;
     ob->cap  = ncap;
+    return true;
+}
+
+static bool ob_terminate_nul(OutBuf *ob) {
+    if (ob->len == SIZE_MAX) return false;
+    if (!ob->data) {
+        ob->data = (uint8_t *)malloc(1u);
+        if (!ob->data) return false;
+        ob->cap = 0u;
+        ob->data[0] = 0u;
+        return true;
+    }
+    if (ob->len >= ob->cap) {
+        uint8_t *grown = (uint8_t *)realloc(ob->data, ob->len + 1u);
+        if (!grown) return false;
+        ob->data = grown;
+    }
+    ob->data[ob->len] = 0u;
     return true;
 }
 
@@ -196,14 +274,18 @@ static bool inflate_stream(BitReader *br, OutBuf *ob) {
         if (!ok || btype == 3u) return false;
 
         if (btype == 0u) {
-            /* Stored uncompressed block */
+            /* Rewind any whole prefetched bytes before byte-aligning stored block */
+            size_t whole_unused = (size_t)(br->bitcnt / 8);
+            if (whole_unused <= br->pos) br->pos -= whole_unused;
             br->bitbuf = 0u;
             br->bitcnt = 0;
-            if (br->pos + 4u > br->len) return false;
+            if (br->len - br->pos < 4u) return false;
             uint16_t blen  = (uint16_t)(br->src[br->pos] | (br->src[br->pos + 1u] << 8));
             uint16_t bnlen = (uint16_t)(br->src[br->pos + 2u] | (br->src[br->pos + 3u] << 8));
             br->pos += 4u;
-            if (((uint32_t)blen ^ (uint32_t)bnlen) != 0xFFFFu || br->pos + blen > br->len) return false;
+            if (((uint32_t)blen ^ (uint32_t)bnlen) != 0xFFFFu || (size_t)blen > br->len - br->pos) {
+                return false;
+            }
             if (!ob_reserve(ob, blen)) return false;
             if (blen > 0u) {
                 memcpy(ob->data + ob->len, br->src + br->pos, blen);
@@ -303,14 +385,14 @@ bool arcr_deflate_decompress(const uint8_t *src, size_t src_len,
     if (!src || !out_buf || !out_len) return false;
     *out_buf = NULL;
     *out_len = 0u;
+    size_t cap_limit = (max_out_len > 0u) ? max_out_len : (64u * 1024u * 1024u);
     BitReader br = {src, src_len, 0u, 0u, 0};
-    OutBuf    ob = {NULL, 0u, 0u, (max_out_len > 0u) ? max_out_len : (64u * 1024u * 1024u)};
-    if (!ob_reserve(&ob, 64u)) return false;
-    if (!inflate_stream(&br, &ob)) {
+    OutBuf    ob = {NULL, 0u, 0u, cap_limit};
+    if (!ob_reserve(&ob, ARCR_MIN(cap_limit, 64u))) return false;
+    if (!inflate_stream(&br, &ob) || !ob_terminate_nul(&ob)) {
         free(ob.data);
         return false;
     }
-    ob.data[ob.len < ob.cap ? ob.len : (ob.cap - 1u)] = 0u;
     *out_buf = ob.data;
     *out_len = ob.len;
     return true;
@@ -318,33 +400,37 @@ bool arcr_deflate_decompress(const uint8_t *src, size_t src_len,
 
 bool arcr_zlib_decompress(const uint8_t *src, size_t src_len,
                           uint8_t **out_buf, size_t *out_len, size_t max_out_len) {
-    if (!src || src_len < 6u) return false;
+    if (!src || !out_buf || !out_len || src_len < 6u) return false;
+    *out_buf = NULL;
+    *out_len = 0u;
     uint8_t cmf = src[0];
     uint8_t flg = src[1];
     if ((cmf & 0x0Fu) != 8u || (cmf >> 4) > 7u) return false;
     if ((((uint32_t)cmf << 8) + flg) % 31u != 0u) return false;
     if (flg & 0x20u) return false; /* Preset dictionary not used in HTTP/PNG */
 
+    size_t cap_limit = (max_out_len > 0u) ? max_out_len : (64u * 1024u * 1024u);
     BitReader br = {src + 2u, src_len - 2u, 0u, 0u, 0};
-    OutBuf    ob = {NULL, 0u, 0u, (max_out_len > 0u) ? max_out_len : (64u * 1024u * 1024u)};
-    if (!ob_reserve(&ob, 64u)) return false;
+    OutBuf    ob = {NULL, 0u, 0u, cap_limit};
+    if (!ob_reserve(&ob, ARCR_MIN(cap_limit, 64u))) return false;
     if (!inflate_stream(&br, &ob)) {
         free(ob.data);
         return false;
     }
-    /* Verify trailing big-endian Adler-32 if 4 bytes remain */
+
     size_t consumed = 2u + br.pos - (size_t)(br.bitcnt / 8);
-    if (consumed + 4u <= src_len) {
-        uint32_t expected = ((uint32_t)src[consumed] << 24) |
-                            ((uint32_t)src[consumed + 1u] << 16) |
-                            ((uint32_t)src[consumed + 2u] << 8) |
-                            (uint32_t)src[consumed + 3u];
-        if (arcr_adler32(ob.data, ob.len) != expected) {
-            free(ob.data);
-            return false;
-        }
+    if (src_len < consumed || (src_len - consumed) < 4u) {
+        free(ob.data);
+        return false;
     }
-    if (ob_reserve(&ob, 1u)) ob.data[ob.len] = 0u;
+    uint32_t expected = ((uint32_t)src[consumed] << 24) |
+                        ((uint32_t)src[consumed + 1u] << 16) |
+                        ((uint32_t)src[consumed + 2u] << 8) |
+                        (uint32_t)src[consumed + 3u];
+    if (arcr_adler32(ob.data, ob.len) != expected || !ob_terminate_nul(&ob)) {
+        free(ob.data);
+        return false;
+    }
     *out_buf = ob.data;
     *out_len = ob.len;
     return true;
@@ -352,62 +438,222 @@ bool arcr_zlib_decompress(const uint8_t *src, size_t src_len,
 
 bool arcr_gzip_decompress(const uint8_t *src, size_t src_len,
                           uint8_t **out_buf, size_t *out_len, size_t max_out_len) {
-    if (!src || src_len < 18u) return false;
+    if (!src || !out_buf || !out_len || src_len < 18u) return false;
+    *out_buf = NULL;
+    *out_len = 0u;
     if (src[0] != 0x1Fu || src[1] != 0x8Bu || src[2] != 8u) return false;
-    uint8_t flg = src[3];
-    size_t pos = 10u;
 
-    if (flg & 0x04u) { /* FEXTRA */
-        if (pos + 2u > src_len) return false;
-        size_t xlen = (size_t)src[pos] | ((size_t)src[pos + 1u] << 8);
-        pos += 2u + xlen;
-    }
-    if (flg & 0x08u) { /* FNAME */
-        while (pos < src_len && src[pos] != 0u) ++pos;
-        ++pos;
-    }
-    if (flg & 0x10u) { /* FCOMMENT */
-        while (pos < src_len && src[pos] != 0u) ++pos;
-        ++pos;
-    }
-    if (flg & 0x02u) { /* FHCRC */
-        pos += 2u;
-    }
-    if (pos + 8u > src_len) return false;
+    size_t cap_limit = (max_out_len > 0u) ? max_out_len : (64u * 1024u * 1024u);
+    OutBuf ob = {NULL, 0u, 0u, cap_limit};
+    if (!ob_reserve(&ob, ARCR_MIN(cap_limit, 64u))) return false;
 
-    BitReader br = {src + pos, src_len - pos, 0u, 0u, 0};
-    OutBuf    ob = {NULL, 0u, 0u, (max_out_len > 0u) ? max_out_len : (64u * 1024u * 1024u)};
-    if (!ob_reserve(&ob, 64u)) return false;
-    if (!inflate_stream(&br, &ob)) {
-        free(ob.data);
-        return false;
-    }
+    size_t pos = 0u;
+    while (pos < src_len) {
+        if (src_len - pos < 18u || src[pos] != 0x1Fu || src[pos + 1u] != 0x8Bu || src[pos + 2u] != 8u) {
+            free(ob.data);
+            return false;
+        }
+        uint8_t flg = src[pos + 3u];
+        if ((flg & 0xE0u) != 0u) {
+            free(ob.data);
+            return false;
+        }
+        pos += 10u;
 
-    size_t trailer = pos + br.pos - (size_t)(br.bitcnt / 8);
-    if (trailer + 4u <= src_len) {
+        if (flg & 0x04u) { /* FEXTRA */
+            if (src_len - pos < 2u) { free(ob.data); return false; }
+            size_t xlen = (size_t)src[pos] | ((size_t)src[pos + 1u] << 8);
+            pos += 2u;
+            if (xlen > src_len - pos) { free(ob.data); return false; }
+            pos += xlen;
+        }
+        if (flg & 0x08u) { /* FNAME */
+            while (pos < src_len && src[pos] != 0u) ++pos;
+            if (pos >= src_len) { free(ob.data); return false; }
+            ++pos;
+        }
+        if (flg & 0x10u) { /* FCOMMENT */
+            while (pos < src_len && src[pos] != 0u) ++pos;
+            if (pos >= src_len) { free(ob.data); return false; }
+            ++pos;
+        }
+        if (flg & 0x02u) { /* FHCRC */
+            if (src_len - pos < 2u) { free(ob.data); return false; }
+            pos += 2u;
+        }
+        if (src_len - pos < 8u) {
+            free(ob.data);
+            return false;
+        }
+
+        size_t member_out_start = ob.len;
+        BitReader br = {src + pos, src_len - pos, 0u, 0u, 0};
+        if (!inflate_stream(&br, &ob)) {
+            free(ob.data);
+            return false;
+        }
+
+        size_t consumed_deflate = br.pos - (size_t)(br.bitcnt / 8);
+        if (consumed_deflate > src_len - pos || (src_len - pos - consumed_deflate) < 8u) {
+            free(ob.data);
+            return false;
+        }
+        size_t trailer = pos + consumed_deflate;
         uint32_t expected_crc = (uint32_t)src[trailer] |
                                 ((uint32_t)src[trailer + 1u] << 8) |
                                 ((uint32_t)src[trailer + 2u] << 16) |
                                 ((uint32_t)src[trailer + 3u] << 24);
-        if (arcr_crc32(ob.data, ob.len) != expected_crc) {
+        uint32_t expected_isize = (uint32_t)src[trailer + 4u] |
+                                  ((uint32_t)src[trailer + 5u] << 8) |
+                                  ((uint32_t)src[trailer + 6u] << 16) |
+                                  ((uint32_t)src[trailer + 7u] << 24);
+        size_t member_out_len = ob.len - member_out_start;
+        if (arcr_crc32(ob.data + member_out_start, member_out_len) != expected_crc ||
+            (uint32_t)(member_out_len & 0xFFFFFFFFu) != expected_isize) {
             free(ob.data);
             return false;
         }
+
+        pos = trailer + 8u;
+        /* RFC 1952 multi-member GZIP: continue if trailing bytes begin another 0x1F 0x8B member */
+        while (pos < src_len && (src[pos] == 0u || src[pos] == '\r' || src[pos] == '\n')) {
+            ++pos;
+        }
+        if (pos < src_len && src[pos] == 0x1Fu) {
+            continue;
+        }
+        break;
     }
-    if (ob_reserve(&ob, 1u)) ob.data[ob.len] = 0u;
+
+    if (!ob_terminate_nul(&ob)) {
+        free(ob.data);
+        return false;
+    }
     *out_buf = ob.data;
     *out_len = ob.len;
     return true;
+}
+
+bool arcr_brotli_decompress(const uint8_t *src, size_t src_len,
+                            uint8_t **out_buf, size_t *out_len, size_t max_out_len) {
+    if (!src || !out_buf || !out_len) return false;
+    *out_buf = NULL;
+    *out_len = 0u;
+#if defined(ARCR_HAVE_MODERN_CODECS)
+    size_t cap_limit = (max_out_len > 0u) ? max_out_len : (64u * 1024u * 1024u);
+    BrotliDecoderState *st = BrotliDecoderCreateInstance(NULL, NULL, NULL);
+    if (!st) return false;
+    (void)BrotliDecoderSetParameter(st, BROTLI_DECODER_PARAM_LARGE_WINDOW, 1u);
+
+    OutBuf ob = {NULL, 0u, 0u, cap_limit};
+    if (!ob_reserve(&ob, ARCR_MIN(cap_limit, 4096u))) {
+        BrotliDecoderDestroyInstance(st);
+        return false;
+    }
+
+    size_t avail_in = src_len;
+    const uint8_t *next_in = src;
+    BrotliDecoderResult res = BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT;
+
+    while (res == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT) {
+        if (ob.len == ob.cap) {
+            size_t rem = ob.max_cap - ob.len;
+            if (rem == 0u) {
+                BrotliDecoderDestroyInstance(st);
+                free(ob.data);
+                return false;
+            }
+            size_t grow = (ob.cap == 0u) ? 4096u : ob.cap;
+            if (grow > rem) grow = rem;
+            if (!ob_reserve(&ob, grow)) {
+                BrotliDecoderDestroyInstance(st);
+                free(ob.data);
+                return false;
+            }
+        }
+        size_t avail_out = ob.cap - ob.len;
+        uint8_t *next_out = ob.data + ob.len;
+        res = BrotliDecoderDecompressStream(st, &avail_in, &next_in, &avail_out, &next_out, NULL);
+        ob.len = (size_t)(next_out - ob.data);
+    }
+
+    BrotliDecoderDestroyInstance(st);
+    if (res != BROTLI_DECODER_RESULT_SUCCESS || !ob_terminate_nul(&ob)) {
+        free(ob.data);
+        return false;
+    }
+    *out_buf = ob.data;
+    *out_len = ob.len;
+    return true;
+#else
+    (void)src_len;
+    (void)max_out_len;
+    return false;
+#endif
+}
+
+static bool has_encoding_token(const char *hdr, const char *tok) {
+    if (!hdr || !tok) return false;
+    size_t tok_len = strlen(tok);
+    if (tok_len == 0u) return false;
+    const char *p = hdr;
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') ++p;
+        if (*p == '\0') break;
+        const char *start = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && *p != ',' && *p != ';') {
+            ++p;
+        }
+        size_t len = (size_t)(p - start);
+        if (len == tok_len && arcr_str_eq_nocase_n(start, len, tok, tok_len)) {
+            return true;
+        }
+        while (*p != '\0' && *p != ',') ++p;
+    }
+    return false;
 }
 
 bool arcr_decompress_http_body(const uint8_t *src, size_t src_len,
                                const char *content_encoding,
                                uint8_t **out_buf, size_t *out_len, size_t max_out_len) {
     if (!src || !out_buf || !out_len) return false;
-    if (src_len >= 2u && src[0] == 0x1Fu && src[1] == 0x8Bu) {
-        return arcr_gzip_decompress(src, src_len, out_buf, out_len, max_out_len);
+    *out_buf = NULL;
+    *out_len = 0u;
+
+    const char *ce_ptr = content_encoding;
+    size_t ce_len = content_encoding ? strlen(content_encoding) : 0u;
+    if (ce_ptr) arcr_str_trim_view(&ce_ptr, &ce_len);
+
+    if (ce_len > 0u) {
+        if (has_encoding_token(content_encoding, "br")) {
+            return arcr_brotli_decompress(src, src_len, out_buf, out_len, max_out_len);
+        }
+        if (has_encoding_token(content_encoding, "gzip") ||
+            has_encoding_token(content_encoding, "x-gzip")) {
+            return arcr_gzip_decompress(src, src_len, out_buf, out_len, max_out_len);
+        }
+        if (has_encoding_token(content_encoding, "deflate")) {
+            if (arcr_zlib_decompress(src, src_len, out_buf, out_len, max_out_len)) {
+                return true;
+            }
+            return arcr_deflate_decompress(src, src_len, out_buf, out_len, max_out_len);
+        }
+        if (has_encoding_token(content_encoding, "identity")) {
+            size_t cap_limit = (max_out_len > 0u) ? max_out_len : (64u * 1024u * 1024u);
+            if (src_len > cap_limit || src_len == SIZE_MAX) return false;
+            uint8_t *copy = (uint8_t *)malloc(src_len + 1u);
+            if (!copy) return false;
+            if (src_len > 0u) memcpy(copy, src, src_len);
+            copy[src_len] = 0u;
+            *out_buf = copy;
+            *out_len = src_len;
+            return true;
+        }
+        return false;
     }
-    if (content_encoding && arcr_str_starts_with_nocase(content_encoding, "gzip")) {
+
+    /* Unspecified encoding: auto-detect magic / RFC 1952 / RFC 1950 / RFC 1951 */
+    if (src_len >= 2u && src[0] == 0x1Fu && src[1] == 0x8Bu) {
         return arcr_gzip_decompress(src, src_len, out_buf, out_len, max_out_len);
     }
     if (arcr_zlib_decompress(src, src_len, out_buf, out_len, max_out_len)) {
@@ -808,19 +1054,21 @@ size_t arcr_zip_list_entries(const uint8_t *zip_bytes, size_t zip_len,
 
     size_t pos = cd_off;
     size_t stored = 0u;
-    for (uint16_t i = 0u; i < cnt && pos + 46u <= zip_len; ++i) {
+    for (uint16_t i = 0u; i < cnt && zip_len - pos >= 46u; ++i) {
         if (get_u32le(zip_bytes + pos) != 0x02014B50u) break;
         uint16_t fn_len = get_u16le(zip_bytes + pos + 28u);
         uint16_t ex_len = get_u16le(zip_bytes + pos + 30u);
         uint16_t cm_len = get_u16le(zip_bytes + pos + 32u);
-        if (pos + 46u + fn_len > zip_len) break;
+        size_t   tail   = (size_t)fn_len + (size_t)ex_len + (size_t)cm_len;
+        if ((size_t)fn_len > zip_len - pos - 46u) break;
         if (out_names && stored < max_entries) {
             size_t copy_n = ARCR_MIN((size_t)fn_len, (size_t)127u);
             memcpy(out_names[stored], zip_bytes + pos + 46u, copy_n);
             out_names[stored][copy_n] = '\0';
         }
         ++stored;
-        pos += 46u + fn_len + ex_len + cm_len;
+        if (tail > zip_len - pos - 46u) break;
+        pos += 46u + tail;
     }
     return stored;
 }
@@ -835,7 +1083,7 @@ bool arcr_zip_extract_entry(const uint8_t *zip_bytes, size_t zip_len,
 
     size_t tlen = strlen(target_filename);
     size_t pos  = cd_off;
-    for (uint16_t i = 0u; i < cnt && pos + 46u <= zip_len; ++i) {
+    for (uint16_t i = 0u; i < cnt && zip_len - pos >= 46u; ++i) {
         if (get_u32le(zip_bytes + pos) != 0x02014B50u) break;
         uint16_t method     = get_u16le(zip_bytes + pos + 10u);
         uint32_t crc_expect = get_u32le(zip_bytes + pos + 16u);
@@ -845,29 +1093,35 @@ bool arcr_zip_extract_entry(const uint8_t *zip_bytes, size_t zip_len,
         uint16_t ex_len     = get_u16le(zip_bytes + pos + 30u);
         uint16_t cm_len     = get_u16le(zip_bytes + pos + 32u);
         uint32_t lhdr_off   = get_u32le(zip_bytes + pos + 42u);
-        if (pos + 46u + fn_len > zip_len) break;
+        size_t   tail       = (size_t)fn_len + (size_t)ex_len + (size_t)cm_len;
+        if ((size_t)fn_len > zip_len - pos - 46u) break;
 
         const char *fn_ptr = (const char *)(zip_bytes + pos + 46u);
         if (arcr_str_eq_nocase_n(fn_ptr, fn_len, target_filename, tlen)) {
-            if (lhdr_off + 30u > zip_len || get_u32le(zip_bytes + lhdr_off) != 0x04034B50u) {
+            if (lhdr_off > zip_len || zip_len - lhdr_off < 30u ||
+                get_u32le(zip_bytes + lhdr_off) != 0x04034B50u) {
                 return false;
             }
             uint16_t lfn = get_u16le(zip_bytes + lhdr_off + 26u);
             uint16_t lex = get_u16le(zip_bytes + lhdr_off + 28u);
-            size_t data_off = (size_t)lhdr_off + 30u + lfn + lex;
-            if (data_off + comp_sz > zip_len) return false;
+            size_t lskip = 30u + (size_t)lfn + (size_t)lex;
+            if (lskip > zip_len - (size_t)lhdr_off) return false;
+            size_t data_off = (size_t)lhdr_off + lskip;
+            if ((size_t)comp_sz > zip_len - data_off) return false;
 
             uint8_t *raw = NULL;
             size_t   rsz = 0u;
+            size_t   usz = (size_t)uncomp_sz;
             if (method == 0u) {
-                raw = (uint8_t *)malloc((size_t)uncomp_sz + 1u);
+                if (comp_sz < uncomp_sz || usz == SIZE_MAX) return false;
+                raw = (uint8_t *)malloc(usz + 1u);
                 if (!raw) return false;
-                if (uncomp_sz > 0u) memcpy(raw, zip_bytes + data_off, uncomp_sz);
-                raw[uncomp_sz] = 0u;
-                rsz = uncomp_sz;
+                if (usz > 0u) memcpy(raw, zip_bytes + data_off, usz);
+                raw[usz] = 0u;
+                rsz = usz;
             } else if (method == 8u) {
-                if (!arcr_deflate_decompress(zip_bytes + data_off, comp_sz, &raw, &rsz,
-                                             (size_t)uncomp_sz + 64u)) {
+                size_t cap_lim = (usz <= SIZE_MAX - 64u) ? (usz + 64u) : usz;
+                if (!arcr_deflate_decompress(zip_bytes + data_off, comp_sz, &raw, &rsz, cap_lim)) {
                     return false;
                 }
             } else {
@@ -882,14 +1136,18 @@ bool arcr_zip_extract_entry(const uint8_t *zip_bytes, size_t zip_len,
             *out_size = rsz;
             return true;
         }
-        pos += 46u + fn_len + ex_len + cm_len;
+        if (tail > zip_len - pos - 46u) break;
+        pos += 46u + tail;
     }
     return false;
 }
 
 /* =========================================================================
- * 6. Pure C PNG & BMP Image Decoder + Pure C PNG Encoder
+ * 6. Modern Image, ICO, Animated GIF, Vector SVG & Resize Codecs
  * ========================================================================= */
+#define ARCR_IMAGE_MAX_DIM    8192
+#define ARCR_IMAGE_MAX_PIXELS (64u * 1024u * 1024u)
+
 static uint32_t get_u32be(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8) | (uint32_t)p[3];
@@ -924,10 +1182,10 @@ static bool decode_png(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
     size_t   idat_len = 0u, idat_cap = 0u;
 
     size_t pos = 8u;
-    while (pos + 12u <= len) {
+    while (len - pos >= 12u) {
         uint32_t clen  = get_u32be(bytes + pos);
         uint32_t ctype = get_u32be(bytes + pos + 4u);
-        if (pos + 12u + clen > len) break;
+        if ((size_t)clen > len - pos - 12u) break;
         const uint8_t *cdata = bytes + pos + 8u;
 
         if (ctype == 0x49484452u && clen >= 13u) { /* IHDR */
@@ -952,8 +1210,13 @@ static bool decode_png(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
                 }
             }
         } else if (ctype == 0x49444154u && clen > 0u) { /* IDAT */
+            if ((size_t)clen > SIZE_MAX - idat_len - 1024u) {
+                free(idat_cat);
+                return false;
+            }
             if (idat_len + clen > idat_cap) {
-                size_t ncap = ARCR_MAX(idat_cap * 2u, idat_len + clen + 1024u);
+                size_t dbl  = (idat_cap <= SIZE_MAX / 2u) ? (idat_cap * 2u) : SIZE_MAX;
+                size_t ncap = ARCR_MAX(dbl, idat_len + (size_t)clen + 1024u);
                 uint8_t *grown = (uint8_t *)realloc(idat_cat, ncap);
                 if (!grown) { free(idat_cat); return false; }
                 idat_cat = grown;
@@ -964,10 +1227,12 @@ static bool decode_png(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
         } else if (ctype == 0x49454E44u) { /* IEND */
             break;
         }
-        pos += 12u + clen;
+        pos += 12u + (size_t)clen;
     }
 
-    if (w <= 0 || h <= 0 || w > 8192 || h > 8192 || bit_depth != 8u || interlace != 0u || !idat_cat) {
+    if (w <= 0 || h <= 0 || w > ARCR_IMAGE_MAX_DIM || h > ARCR_IMAGE_MAX_DIM ||
+        (uint64_t)w * (uint64_t)h > (uint64_t)ARCR_IMAGE_MAX_PIXELS ||
+        bit_depth != 8u || interlace != 0u || !idat_cat) {
         free(idat_cat);
         return false;
     }
@@ -1054,13 +1319,16 @@ static bool decode_bmp(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
     int32_t  raw_h   = (int32_t)get_u32le(bytes + 22u);
     uint16_t bpp     = get_u16le(bytes + 28u);
     uint32_t comp    = get_u32le(bytes + 30u);
+    if (raw_h == INT32_MIN || pix_off > len) return false;
     bool top_down    = (raw_h < 0);
     int32_t h        = top_down ? -raw_h : raw_h;
-    if (w <= 0 || h <= 0 || w > 8192 || h > 8192 || (bpp != 24u && bpp != 32u) || comp != 0u) {
+    if (w <= 0 || h <= 0 || w > ARCR_IMAGE_MAX_DIM || h > ARCR_IMAGE_MAX_DIM ||
+        (uint64_t)w * (uint64_t)h > (uint64_t)ARCR_IMAGE_MAX_PIXELS ||
+        (bpp != 24u && bpp != 32u) || comp != 0u) {
         return false;
     }
     size_t row_stride = (((size_t)w * (bpp / 8u)) + 3u) & ~(size_t)3u;
-    if (pix_off + row_stride * (size_t)h > len) return false;
+    if (row_stride > (len - (size_t)pix_off) / (size_t)h) return false;
 
     uint32_t *px = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
     if (!px) return false;
@@ -1086,38 +1354,464 @@ static bool decode_bmp(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
     return true;
 }
 
-bool arcr_image_decode_mem(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
-    if (!bytes || len < 16u || !out_img) return false;
-    memset(out_img, 0, sizeof(*out_img));
+#if defined(ARCR_HAVE_MODERN_CODECS)
+static bool decode_via_stbi(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
+    if (!bytes || len == 0u || len > (size_t)INT_MAX) return false;
+    int w = 0, h = 0, comp = 0;
+    stbi_uc *rgba = stbi_load_from_memory(bytes, (int)len, &w, &h, &comp, 4);
+    if (!rgba) return false;
+    if (w <= 0 || h <= 0 || w > ARCR_IMAGE_MAX_DIM || h > ARCR_IMAGE_MAX_DIM ||
+        (uint64_t)w * (uint64_t)h > (uint64_t)ARCR_IMAGE_MAX_PIXELS) {
+        stbi_image_free(rgba);
+        return false;
+    }
+    size_t count = (size_t)w * (size_t)h;
+    uint32_t *px = (uint32_t *)malloc(count * sizeof(uint32_t));
+    if (!px) {
+        stbi_image_free(rgba);
+        return false;
+    }
+    for (size_t i = 0u; i < count; ++i) {
+        uint32_t r = rgba[i * 4u + 0u];
+        uint32_t g = rgba[i * 4u + 1u];
+        uint32_t b = rgba[i * 4u + 2u];
+        uint32_t a = rgba[i * 4u + 3u];
+        px[i] = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+    stbi_image_free(rgba);
+    out_img->width  = (int32_t)w;
+    out_img->height = (int32_t)h;
+    out_img->pixels = px;
+    return true;
+}
+#endif
+
+static bool decode_ico(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
+    if (!bytes || len < 22u || !out_img) return false;
+    if (bytes[0] != 0u || bytes[1] != 0u || (bytes[2] != 1u && bytes[2] != 2u) || bytes[3] != 0u) {
+        return false;
+    }
+    uint16_t count = get_u16le(bytes + 4u);
+    if (count == 0u) return false;
+
+    bool     found     = false;
+    uint64_t best_rank = 0u;
+    uint32_t best_off  = 0u;
+    uint32_t best_size = 0u;
+
+    for (uint16_t i = 0u; i < count; ++i) {
+        size_t eoff = 6u + (size_t)i * 16u;
+        if (len < eoff || len - eoff < 16u) break;
+        uint32_t ew   = (bytes[eoff + 0u] == 0u) ? 256u : (uint32_t)bytes[eoff + 0u];
+        uint32_t eh   = (bytes[eoff + 1u] == 0u) ? 256u : (uint32_t)bytes[eoff + 1u];
+        uint16_t ebpp = get_u16le(bytes + eoff + 6u);
+        uint32_t esz  = get_u32le(bytes + eoff + 8u);
+        uint32_t edat = get_u32le(bytes + eoff + 12u);
+        if (esz < 16u || edat > len || esz > len - (size_t)edat) continue;
+        uint64_t rank = ((uint64_t)ew * (uint64_t)eh) * 64u + (uint64_t)ARCR_MIN(ebpp, 64u);
+        if (!found || rank > best_rank) {
+            found     = true;
+            best_rank = rank;
+            best_off  = edat;
+            best_size = esz;
+        }
+    }
+    if (!found) return false;
+
+    const uint8_t *edata = bytes + best_off;
+    size_t         esize = best_size;
     static const uint8_t kPngSig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
-    if (memcmp(bytes, kPngSig, 8u) == 0) {
+    if (esize >= 8u && memcmp(edata, kPngSig, 8u) == 0) {
+#if defined(ARCR_HAVE_MODERN_CODECS)
+        if (decode_via_stbi(edata, esize, out_img)) return true;
+#endif
+        return decode_png(edata, esize, out_img);
+    }
+
+    /* DIB BITMAPINFOHEADER inside ICO/CUR (height is 2x for XOR + AND masks) */
+    if (esize < 40u) return false;
+    uint32_t hdr_sz = get_u32le(edata + 0u);
+    if (hdr_sz < 40u || hdr_sz > esize) return false;
+    int32_t  w        = (int32_t)get_u32le(edata + 4u);
+    int32_t  raw_h    = (int32_t)get_u32le(edata + 8u);
+    uint16_t bpp      = get_u16le(edata + 14u);
+    uint32_t comp     = get_u32le(edata + 16u);
+    uint32_t clr_used = get_u32le(edata + 32u);
+    if (raw_h == INT32_MIN || comp != 0u) return false;
+
+    bool    top_down = (raw_h < 0);
+    int32_t abs_h    = top_down ? -raw_h : raw_h;
+    int32_t h        = abs_h / 2;
+    if (w <= 0 || h <= 0 || w > 1024 || h > 1024) return false;
+    if (bpp != 1u && bpp != 4u && bpp != 8u && bpp != 24u && bpp != 32u) return false;
+
+    uint32_t palette[256];
+    for (int i = 0; i < 256; ++i) palette[i] = 0xFF000000u;
+
+    size_t pal_cnt = 0u;
+    if (bpp <= 8u) {
+        size_t max_pal = (size_t)1u << bpp;
+        pal_cnt = (clr_used > 0u && clr_used <= max_pal) ? (size_t)clr_used : max_pal;
+        if (pal_cnt * 4u > esize - (size_t)hdr_sz) return false;
+        const uint8_t *pptr = edata + hdr_sz;
+        for (size_t i = 0u; i < pal_cnt; ++i) {
+            uint32_t b = pptr[i * 4u + 0u];
+            uint32_t g = pptr[i * 4u + 1u];
+            uint32_t r = pptr[i * 4u + 2u];
+            palette[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+
+    size_t xor_off    = (size_t)hdr_sz + pal_cnt * 4u;
+    size_t xor_stride = ((((size_t)w * (size_t)bpp) + 31u) / 32u) * 4u;
+    if (xor_stride > (esize - xor_off) / (size_t)h) return false;
+    size_t xor_bytes  = xor_stride * (size_t)h;
+    size_t and_off    = xor_off + xor_bytes;
+    size_t and_stride = (((size_t)w + 31u) / 32u) * 4u;
+    bool   has_and    = (esize - and_off >= and_stride * (size_t)h);
+
+    uint32_t *px = (uint32_t *)malloc((size_t)w * (size_t)h * sizeof(uint32_t));
+    if (!px) return false;
+
+    bool any_alpha = false;
+    for (int32_t y = 0; y < h; ++y) {
+        int32_t src_y = top_down ? y : (h - 1 - y);
+        const uint8_t *xrow = edata + xor_off + (size_t)src_y * xor_stride;
+        const uint8_t *arow = has_and ? (edata + and_off + (size_t)src_y * and_stride) : NULL;
+        uint32_t      *drow = px + (size_t)y * (size_t)w;
+
+        for (int32_t x = 0; x < w; ++x) {
+            bool and_transparent = arow ? (((arow[x >> 3] >> (7 - (x & 7))) & 1u) != 0u) : false;
+            uint32_t argb = 0xFF000000u;
+            if (bpp == 32u) {
+                uint32_t b = xrow[x * 4 + 0];
+                uint32_t g = xrow[x * 4 + 1];
+                uint32_t r = xrow[x * 4 + 2];
+                uint32_t a = xrow[x * 4 + 3];
+                if (a != 0u) any_alpha = true;
+                argb = (a << 24) | (r << 16) | (g << 8) | b;
+            } else if (bpp == 24u) {
+                uint32_t b = xrow[x * 3 + 0];
+                uint32_t g = xrow[x * 3 + 1];
+                uint32_t r = xrow[x * 3 + 2];
+                argb = (and_transparent ? 0x00000000u : 0xFF000000u) | (r << 16) | (g << 8) | b;
+            } else if (bpp == 8u) {
+                uint32_t c = palette[xrow[x]];
+                argb = and_transparent ? (c & 0x00FFFFFFu) : c;
+            } else if (bpp == 4u) {
+                uint8_t idx = (x & 1) ? (xrow[x >> 1] & 0x0Fu) : (uint8_t)(xrow[x >> 1] >> 4);
+                uint32_t c  = palette[idx];
+                argb = and_transparent ? (c & 0x00FFFFFFu) : c;
+            } else {
+                uint8_t idx = (uint8_t)((xrow[x >> 3] >> (7 - (x & 7))) & 1u);
+                uint32_t c  = palette[idx];
+                argb = and_transparent ? (c & 0x00FFFFFFu) : c;
+            }
+            drow[x] = argb;
+        }
+    }
+
+    /* Legacy 32bpp icons with all-zero alpha channel rely on the 1-bit AND mask */
+    if (bpp == 32u && !any_alpha) {
+        for (int32_t y = 0; y < h; ++y) {
+            int32_t src_y = top_down ? y : (h - 1 - y);
+            const uint8_t *arow = has_and ? (edata + and_off + (size_t)src_y * and_stride) : NULL;
+            uint32_t      *drow = px + (size_t)y * (size_t)w;
+            for (int32_t x = 0; x < w; ++x) {
+                bool and_transparent = arow ? (((arow[x >> 3] >> (7 - (x & 7))) & 1u) != 0u) : false;
+                drow[x] = (drow[x] & 0x00FFFFFFu) | (and_transparent ? 0x00000000u : 0xFF000000u);
+            }
+        }
+    }
+
+    out_img->width  = w;
+    out_img->height = h;
+    out_img->pixels = px;
+    return true;
+}
+
+#if defined(ARCR_HAVE_MODERN_CODECS)
+static bool looks_like_svg_mem(const uint8_t *bytes, size_t len) {
+    if (!bytes || len < 4u) return false;
+    size_t i = 0u;
+    if (len >= 3u && bytes[0] == 0xEFu && bytes[1] == 0xBBu && bytes[2] == 0xBFu) {
+        i = 3u;
+    }
+    while (i < len && (bytes[i] == ' ' || bytes[i] == '\t' || bytes[i] == '\r' || bytes[i] == '\n')) {
+        ++i;
+    }
+    if (i >= len || bytes[i] != '<') return false;
+    size_t rem = len - i;
+    const char *s = (const char *)(bytes + i);
+    if (rem >= 4u && arcr_str_eq_nocase_n(s, 4u, "<svg", 4u)) return true;
+    if ((rem >= 5u && arcr_str_eq_nocase_n(s, 5u, "<?xml", 5u)) ||
+        (rem >= 9u && arcr_str_eq_nocase_n(s, 9u, "<!doctype", 9u)) ||
+        (rem >= 4u && memcmp(s, "<!--", 4u) == 0)) {
+        size_t scan_lim = ARCR_MIN(rem, (size_t)4096u);
+        for (size_t k = 0u; k + 4u <= scan_lim; ++k) {
+            if (s[k] == '<' && arcr_str_eq_nocase_n(s + k, 4u, "<svg", 4u)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
+bool arcr_svg_rasterize_mem(const char *svg_utf8, size_t svg_len,
+                            int32_t target_w, int32_t target_h,
+                            uint32_t current_color_argb, ArcrImage *out_img) {
+    if (!out_img) return false;
+    memset(out_img, 0, sizeof(*out_img));
+    if (!svg_utf8 || svg_len == 0u) return false;
+#if defined(ARCR_HAVE_MODERN_CODECS)
+    if (svg_len > 16u * 1024u * 1024u) return false;
+    size_t start = 0u;
+    if (svg_len >= 3u &&
+        (uint8_t)svg_utf8[0] == 0xEFu &&
+        (uint8_t)svg_utf8[1] == 0xBBu &&
+        (uint8_t)svg_utf8[2] == 0xBFu) {
+        start = 3u;
+    }
+    size_t clean_len = svg_len - start;
+    char *mutable_svg = (char *)malloc(clean_len + 1u);
+    if (!mutable_svg) return false;
+
+    uint32_t eff_color = (current_color_argb == 0u) ? 0xFF1E293Bu : current_color_argb;
+    char hex_color[8];
+    snprintf(hex_color, sizeof(hex_color), "#%02X%02X%02X",
+             (unsigned)((eff_color >> 16) & 0xFFu),
+             (unsigned)((eff_color >> 8) & 0xFFu),
+             (unsigned)(eff_color & 0xFFu));
+
+    /* Copy into mutable buffer while substituting CSS `currentColor` -> `#RRGGBB` */
+    size_t wpos = 0u;
+    size_t rpos = start;
+    while (rpos < svg_len) {
+        if (svg_len - rpos >= 12u &&
+            (svg_utf8[rpos] == 'c' || svg_utf8[rpos] == 'C') &&
+            arcr_str_eq_nocase_n(svg_utf8 + rpos, 12u, "currentColor", 12u)) {
+            memcpy(mutable_svg + wpos, hex_color, 7u);
+            wpos += 7u;
+            rpos += 12u;
+        } else {
+            mutable_svg[wpos++] = svg_utf8[rpos++];
+        }
+    }
+    mutable_svg[wpos] = '\0';
+
+    NSVGimage *svg = nsvgParse(mutable_svg, "px", 96.0f);
+    free(mutable_svg);
+    if (!svg) return false;
+
+    float svg_w = (svg->width > 0.0f) ? svg->width : 24.0f;
+    float svg_h = (svg->height > 0.0f) ? svg->height : 24.0f;
+
+    int32_t dst_w = target_w;
+    int32_t dst_h = target_h;
+    if (dst_w <= 0 && dst_h <= 0) {
+        dst_w = (int32_t)(svg_w + 0.5f);
+        dst_h = (int32_t)(svg_h + 0.5f);
+        if (dst_w <= 0) dst_w = 24;
+        if (dst_h <= 0) dst_h = 24;
+    } else if (dst_w > 0 && dst_h <= 0) {
+        dst_h = (int32_t)((float)dst_w * (svg_h / svg_w) + 0.5f);
+    } else if (dst_h > 0 && dst_w <= 0) {
+        dst_w = (int32_t)((float)dst_h * (svg_w / svg_h) + 0.5f);
+    }
+    dst_w = ARCR_CLAMP(dst_w, 1, 2048);
+    dst_h = ARCR_CLAMP(dst_h, 1, 2048);
+
+    float scale = fminf((float)dst_w / svg_w, (float)dst_h / svg_h);
+    if (!(scale > 0.0f)) scale = 1.0f;
+    float tx = ((float)dst_w - svg_w * scale) * 0.5f;
+    float ty = ((float)dst_h - svg_h * scale) * 0.5f;
+
+    NSVGrasterizer *rast = nsvgCreateRasterizer();
+    if (!rast) {
+        nsvgDelete(svg);
+        return false;
+    }
+
+    size_t px_count = (size_t)dst_w * (size_t)dst_h;
+    uint8_t  *rgba = (uint8_t *)calloc(px_count, 4u);
+    uint32_t *argb = (uint32_t *)malloc(px_count * sizeof(uint32_t));
+    if (!rgba || !argb) {
+        free(rgba);
+        free(argb);
+        nsvgDeleteRasterizer(rast);
+        nsvgDelete(svg);
+        return false;
+    }
+
+    nsvgRasterize(rast, svg, tx, ty, scale, rgba, (int)dst_w, (int)dst_h, (int)dst_w * 4);
+    nsvgDeleteRasterizer(rast);
+    nsvgDelete(svg);
+
+    for (size_t i = 0u; i < px_count; ++i) {
+        uint32_t r = rgba[i * 4u + 0u];
+        uint32_t g = rgba[i * 4u + 1u];
+        uint32_t b = rgba[i * 4u + 2u];
+        uint32_t a = rgba[i * 4u + 3u];
+        argb[i] = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+    free(rgba);
+
+    out_img->width  = dst_w;
+    out_img->height = dst_h;
+    out_img->pixels = argb;
+    return true;
+#else
+    (void)target_w;
+    (void)target_h;
+    (void)current_color_argb;
+    return false;
+#endif
+}
+
+bool arcr_image_decode_mem(const uint8_t *bytes, size_t len, ArcrImage *out_img) {
+    if (!bytes || len < 4u || !out_img) return false;
+    memset(out_img, 0, sizeof(*out_img));
+
+#if defined(ARCR_HAVE_MODERN_CODECS)
+    /* 1. WebP (VP8 / VP8L / VP8X + Alpha) */
+    if (len >= 12u && memcmp(bytes, "RIFF", 4u) == 0 && memcmp(bytes + 8u, "WEBP", 4u) == 0) {
+        int w = 0, h = 0;
+        if (!WebPGetInfo(bytes, len, &w, &h)) return false;
+        if (w <= 0 || h <= 0 || w > ARCR_IMAGE_MAX_DIM || h > ARCR_IMAGE_MAX_DIM ||
+            (uint64_t)w * (uint64_t)h > (uint64_t)ARCR_IMAGE_MAX_PIXELS) {
+            return false;
+        }
+        uint8_t *bgra = WebPDecodeBGRA(bytes, len, &w, &h);
+        if (!bgra || w <= 0 || h <= 0) {
+            if (bgra) WebPFree(bgra);
+            return false;
+        }
+        size_t count = (size_t)w * (size_t)h;
+        uint32_t *px = (uint32_t *)malloc(count * sizeof(uint32_t));
+        if (!px) {
+            WebPFree(bgra);
+            return false;
+        }
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+        for (size_t i = 0u; i < count; ++i) {
+            uint32_t b = bgra[i * 4u + 0u];
+            uint32_t g = bgra[i * 4u + 1u];
+            uint32_t r = bgra[i * 4u + 2u];
+            uint32_t a = bgra[i * 4u + 3u];
+            px[i] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+#else
+        /* Little-endian x86/x64: BGRA bytes [B, G, R, A] ARE exact uint32_t 0xAARRGGBB */
+        memcpy(px, bgra, count * sizeof(uint32_t));
+#endif
+        WebPFree(bgra);
+        out_img->width  = (int32_t)w;
+        out_img->height = (int32_t)h;
+        out_img->pixels = px;
+        return true;
+    }
+
+    /* 2. Vector SVG */
+    if (looks_like_svg_mem(bytes, len)) {
+        return arcr_svg_rasterize_mem((const char *)bytes, len, 0, 0, 0xFF1E293Bu, out_img);
+    }
+#endif
+
+    /* 3. ICO / CUR multi-entry icon directory */
+    if (len >= 6u && bytes[0] == 0u && bytes[1] == 0u &&
+        (bytes[2] == 1u || bytes[2] == 2u) && bytes[3] == 0u) {
+        if (decode_ico(bytes, len, out_img)) return true;
+    }
+
+#if defined(ARCR_HAVE_MODERN_CODECS)
+    /* 4. JPEG (baseline + progressive), PNG (1/2/4/8/16-bit + Adam7 + tRNS), GIF, BMP, TGA */
+    if (decode_via_stbi(bytes, len, out_img)) {
+        return true;
+    }
+#endif
+
+    /* Built-in pure C PNG & BMP decoders (host tools + fallback) */
+    static const uint8_t kPngSig[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    if (len >= 8u && memcmp(bytes, kPngSig, 8u) == 0) {
         return decode_png(bytes, len, out_img);
     }
-    if (bytes[0] == 'B' && bytes[1] == 'M') {
+    if (len >= 2u && bytes[0] == 'B' && bytes[1] == 'M') {
         return decode_bmp(bytes, len, out_img);
     }
     return false;
 }
 
+static int hex_nibble_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
 bool arcr_image_decode_data_uri(const char *uri, size_t uri_len, ArcrImage *out_img) {
-    if (!uri || !out_img || !arcr_str_starts_with_nocase(uri, "data:image/")) return false;
+    if (!uri || !out_img || uri_len < 12u) return false;
+    memset(out_img, 0, sizeof(*out_img));
+    if (!arcr_str_eq_nocase_n(uri, 11u, "data:image/", 11u)) return false;
+
     const char *comma = NULL;
-    for (size_t i = 0u; i < uri_len; ++i) {
+    for (size_t i = 11u; i < uri_len; ++i) {
         if (uri[i] == ',') { comma = uri + i; break; }
     }
     if (!comma) return false;
-    size_t hdr_len = (size_t)(comma - uri);
-    bool is_b64 = false;
-    for (size_t i = 0u; i + 7u <= hdr_len; ++i) {
-        if (arcr_str_eq_nocase_n(uri + i, 7u, ";base64", 7u)) { is_b64 = true; break; }
-    }
-    if (!is_b64) return false;
 
-    uint8_t *raw = NULL;
-    size_t   rlen = 0u;
-    if (!arcr_base64_decode(comma + 1u, uri_len - hdr_len - 1u, &raw, &rlen)) return false;
-    bool ok = arcr_image_decode_mem(raw, rlen, out_img);
-    free(raw);
+    size_t hdr_len     = (size_t)(comma - uri);
+    size_t payload_len = uri_len - hdr_len - 1u;
+    const char *payload = comma + 1u;
+
+    bool is_b64 = false;
+    for (size_t i = 11u; i + 7u <= hdr_len; ++i) {
+        if (arcr_str_eq_nocase_n(uri + i, 7u, ";base64", 7u)) {
+            is_b64 = true;
+            break;
+        }
+    }
+    bool is_svg_mime = (hdr_len >= 18u && arcr_str_eq_nocase_n(uri, 18u, "data:image/svg+xml", 18u));
+
+    if (is_b64) {
+        uint8_t *raw = NULL;
+        size_t   rlen = 0u;
+        if (!arcr_base64_decode(payload, payload_len, &raw, &rlen)) return false;
+        bool ok = is_svg_mime
+                      ? arcr_svg_rasterize_mem((const char *)raw, rlen, 0, 0, 0xFF1E293Bu, out_img)
+                      : arcr_image_decode_mem(raw, rlen, out_img);
+        free(raw);
+        return ok;
+    }
+
+    /* Percent-encoded / plain UTF-8 data URI (e.g. data:image/svg+xml,<svg...>) */
+    if (payload_len > 16u * 1024u * 1024u) return false;
+    uint8_t *decoded = (uint8_t *)malloc(payload_len + 1u);
+    if (!decoded) return false;
+
+    size_t dlen = 0u;
+    for (size_t i = 0u; i < payload_len; ++i) {
+        if (payload[i] == '%' && i + 2u < payload_len) {
+            int hi = hex_nibble_val(payload[i + 1u]);
+            int lo = hex_nibble_val(payload[i + 2u]);
+            if (hi >= 0 && lo >= 0) {
+                decoded[dlen++] = (uint8_t)((hi << 4) | lo);
+                i += 2u;
+                continue;
+            }
+        }
+        decoded[dlen++] = (uint8_t)payload[i];
+    }
+    decoded[dlen] = 0u;
+
+    bool ok = false;
+    if (is_svg_mime) {
+        ok = arcr_svg_rasterize_mem((const char *)decoded, dlen, 0, 0, 0xFF1E293Bu, out_img);
+    }
+    if (!ok) {
+        ok = arcr_image_decode_mem(decoded, dlen, out_img);
+    }
+    free(decoded);
     return ok;
 }
 
@@ -1127,6 +1821,169 @@ void arcr_image_free(ArcrImage *img) {
     img->pixels = NULL;
     img->width  = 0;
     img->height = 0;
+}
+
+bool arcr_image_decode_anim_mem(const uint8_t *bytes, size_t len, ArcrAnimImage *out_anim) {
+    if (!out_anim) return false;
+    memset(out_anim, 0, sizeof(*out_anim));
+    if (!bytes || len < 6u) return false;
+#if defined(ARCR_HAVE_MODERN_CODECS)
+    if (len > (size_t)INT_MAX) return false;
+    if (memcmp(bytes, "GIF87a", 6u) != 0 && memcmp(bytes, "GIF89a", 6u) != 0) {
+        return false;
+    }
+
+    int *raw_delays = NULL;
+    int  w = 0, h = 0, z = 0, comp = 0;
+    stbi_uc *rgba = stbi_load_gif_from_memory(bytes, (int)len, &raw_delays, &w, &h, &z, &comp, 4);
+    if (!rgba || w <= 0 || h <= 0 || z <= 0 ||
+        w > ARCR_IMAGE_MAX_DIM || h > ARCR_IMAGE_MAX_DIM) {
+        if (rgba) stbi_image_free(rgba);
+        if (raw_delays) stbi_image_free(raw_delays);
+        return false;
+    }
+
+    int32_t frame_cnt = (z > 120) ? 120 : (int32_t)z;
+    uint64_t frame_px = (uint64_t)w * (uint64_t)h;
+    if (frame_px == 0u || frame_px * (uint64_t)frame_cnt > (uint64_t)ARCR_IMAGE_MAX_PIXELS) {
+        if (frame_px > (uint64_t)ARCR_IMAGE_MAX_PIXELS) {
+            stbi_image_free(rgba);
+            if (raw_delays) stbi_image_free(raw_delays);
+            return false;
+        }
+        frame_cnt = (int32_t)((uint64_t)ARCR_IMAGE_MAX_PIXELS / frame_px);
+        if (frame_cnt <= 0) frame_cnt = 1;
+    }
+
+    size_t total_px = (size_t)frame_px * (size_t)frame_cnt;
+    uint32_t *frames_argb = (uint32_t *)malloc(total_px * sizeof(uint32_t));
+    int32_t  *delays_ms   = (int32_t *)malloc((size_t)frame_cnt * sizeof(int32_t));
+    if (!frames_argb || !delays_ms) {
+        free(frames_argb);
+        free(delays_ms);
+        stbi_image_free(rgba);
+        if (raw_delays) stbi_image_free(raw_delays);
+        return false;
+    }
+
+    for (size_t i = 0u; i < total_px; ++i) {
+        uint32_t r = rgba[i * 4u + 0u];
+        uint32_t g = rgba[i * 4u + 1u];
+        uint32_t b = rgba[i * 4u + 2u];
+        uint32_t a = rgba[i * 4u + 3u];
+        frames_argb[i] = (a << 24) | (r << 16) | (g << 8) | b;
+    }
+    for (int32_t f = 0; f < frame_cnt; ++f) {
+        int32_t d = raw_delays ? (int32_t)raw_delays[f] : 100;
+        delays_ms[f] = (d <= 10) ? 100 : d;
+    }
+
+    stbi_image_free(rgba);
+    if (raw_delays) stbi_image_free(raw_delays);
+
+    out_anim->width       = (int32_t)w;
+    out_anim->height      = (int32_t)h;
+    out_anim->frame_count = frame_cnt;
+    out_anim->frames_argb = frames_argb;
+    out_anim->delays_ms   = delays_ms;
+    return true;
+#else
+    return false;
+#endif
+}
+
+void arcr_image_free_anim(ArcrAnimImage *anim) {
+    if (!anim) return;
+    free(anim->frames_argb);
+    free(anim->delays_ms);
+    anim->frames_argb = NULL;
+    anim->delays_ms   = NULL;
+    anim->width       = 0;
+    anim->height      = 0;
+    anim->frame_count = 0;
+}
+
+bool arcr_image_resize_argb(const uint32_t *src_argb, int32_t src_w, int32_t src_h,
+                            int32_t dst_w, int32_t dst_h, ArcrImage *out_img) {
+    if (!out_img) return false;
+    memset(out_img, 0, sizeof(*out_img));
+    if (!src_argb || src_w <= 0 || src_h <= 0 || dst_w <= 0 || dst_h <= 0) return false;
+    if (src_w > ARCR_IMAGE_MAX_DIM || src_h > ARCR_IMAGE_MAX_DIM ||
+        dst_w > ARCR_IMAGE_MAX_DIM || dst_h > ARCR_IMAGE_MAX_DIM ||
+        (uint64_t)dst_w * (uint64_t)dst_h > (uint64_t)ARCR_IMAGE_MAX_PIXELS) {
+        return false;
+    }
+
+    size_t dst_count = (size_t)dst_w * (size_t)dst_h;
+    uint32_t *dst_px = (uint32_t *)malloc(dst_count * sizeof(uint32_t));
+    if (!dst_px) return false;
+
+    if (src_w == dst_w && src_h == dst_h) {
+        memcpy(dst_px, src_argb, dst_count * sizeof(uint32_t));
+        out_img->width  = dst_w;
+        out_img->height = dst_h;
+        out_img->pixels = dst_px;
+        return true;
+    }
+
+#if defined(ARCR_HAVE_MODERN_CODECS)
+#if defined(__BYTE_ORDER__) && defined(__ORDER_BIG_ENDIAN__) && (__BYTE_ORDER__ == __ORDER_BIG_ENDIAN__)
+    const stbir_pixel_layout layout = STBIR_ARGB;
+#else
+    const stbir_pixel_layout layout = STBIR_BGRA;
+#endif
+    unsigned char *res = stbir_resize_uint8_srgb(
+        (const unsigned char *)src_argb, (int)src_w, (int)src_h, (int)src_w * 4,
+        (unsigned char *)dst_px, (int)dst_w, (int)dst_h, (int)dst_w * 4,
+        layout
+    );
+    if (!res) {
+        free(dst_px);
+        return false;
+    }
+#else
+    /* Pure integer bilinear fallback for host CLI tools built without libm */
+    for (int32_t y = 0; y < dst_h; ++y) {
+        int64_t sy_fp = (((int64_t)y * 2 + 1) * (int64_t)src_h * 128) / (int64_t)dst_h - 128;
+        if (sy_fp < 0) sy_fp = 0;
+        int32_t y0 = (int32_t)(sy_fp >> 8);
+        uint32_t fy = (uint32_t)(sy_fp & 255);
+        if (y0 >= src_h - 1) { y0 = src_h - 1; fy = 0u; }
+        int32_t y1 = (y0 + 1 < src_h) ? (y0 + 1) : y0;
+        const uint32_t *r0 = src_argb + (size_t)y0 * (size_t)src_w;
+        const uint32_t *r1 = src_argb + (size_t)y1 * (size_t)src_w;
+
+        for (int32_t x = 0; x < dst_w; ++x) {
+            int64_t sx_fp = (((int64_t)x * 2 + 1) * (int64_t)src_w * 128) / (int64_t)dst_w - 128;
+            if (sx_fp < 0) sx_fp = 0;
+            int32_t x0 = (int32_t)(sx_fp >> 8);
+            uint32_t fx = (uint32_t)(sx_fp & 255);
+            if (x0 >= src_w - 1) { x0 = src_w - 1; fx = 0u; }
+            int32_t x1 = (x0 + 1 < src_w) ? (x0 + 1) : x0;
+
+            uint32_t p00 = r0[x0], p10 = r0[x1], p01 = r1[x0], p11 = r1[x1];
+            uint32_t w00 = (256u - fx) * (256u - fy);
+            uint32_t w10 = fx * (256u - fy);
+            uint32_t w01 = (256u - fx) * fy;
+            uint32_t w11 = fx * fy;
+
+            uint32_t a = (((p00 >> 24) & 0xFFu) * w00 + ((p10 >> 24) & 0xFFu) * w10 +
+                          ((p01 >> 24) & 0xFFu) * w01 + ((p11 >> 24) & 0xFFu) * w11 + 32768u) >> 16;
+            uint32_t r = (((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 +
+                          ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11 + 32768u) >> 16;
+            uint32_t g = (((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 +
+                          ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11 + 32768u) >> 16;
+            uint32_t b = ((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 +
+                          (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11 + 32768u) >> 16;
+            dst_px[(size_t)y * (size_t)dst_w + (size_t)x] = (a << 24) | (r << 16) | (g << 8) | b;
+        }
+    }
+#endif
+
+    out_img->width  = dst_w;
+    out_img->height = dst_h;
+    out_img->pixels = dst_px;
+    return true;
 }
 
 static void write_png_chunk(uint8_t **p, const char type[4], const uint8_t *data, uint32_t len) {

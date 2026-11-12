@@ -42,6 +42,12 @@ typedef struct WaterscapeWindowOptions {
 const char *waterscape_present_backend_name(WaterscapePresentBackend backend);
 
 /*
+ * Returns true if browser chrome hover/focus/overlay state or the active tab's
+ * viewport framebuffer has been dirtied since the last `arcr_shell_render_frame`.
+ */
+bool waterscape_shell_needs_repaint(const ArcrBrowserShell *shell);
+
+/*
  * Opens a native OS desktop window for `shell` and runs the interactive event +
  * hardware presentation loop until the user closes the window (or `auto_close_ms` elapses).
  * Returns 0 on clean exit, non-zero if a display/window cannot be opened.

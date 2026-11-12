@@ -1,15 +1,21 @@
 /*
- * Waterscape Browser 1.0 / Arcradient Engine (MSHTML-Next)
+ * Waterscape Browser 2.0 / Arcradient Engine (MSHTML-Next)
  * shell/waterscape_x11.c - Linux X11 + MIT-SHM Zero-Copy Desktop Window Presenter
  *
  * Uses MIT-SHM (`XShmCreateImage` + `shmget`/`shmat` + `XShmPutImage`) so the
  * multi-core 64x64 tile + SIMD framebuffer is presented directly from shared RAM
  * to the X11 server with zero socket copies (automatically falling back to
  * `XPutImage` over remote/networked X11 connections).
+ * Includes 60 FPS non-blocking `select()` tick loop, X11 `CLIPBOARD` (`UTF8_STRING` /
+ * `XA_STRING`) sync, full keyboard/mouse modifiers, and `_NET_WM_STATE_FULLSCREEN`.
  */
 #if !defined(_WIN32)
-#  define _POSIX_C_SOURCE 200809L
-#  define _XOPEN_SOURCE   700
+#  ifndef _POSIX_C_SOURCE
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+#  ifndef _XOPEN_SOURCE
+#    define _XOPEN_SOURCE 700
+#  endif
 #endif
 
 #include "waterscape_presenter.h"
@@ -55,6 +61,7 @@ typedef struct X11PresenterSurface {
     GC                       gc;
     WaterscapePresentBackend backend;
     bool                     allow_shm;
+    bool                     os_fullscreen;
 
     XImage                  *ximg;
     XShmSegmentInfo          shminfo;
@@ -68,6 +75,21 @@ typedef struct X11PresenterSurface {
     Cursor                   cur_pointer;
     Cursor                   cur_text;
     ArcrCursorKind           active_cursor;
+
+    /* X11 Selection / Clipboard & EWMH Fullscreen Atoms */
+    Atom                     atom_clipboard;
+    Atom                     atom_targets;
+    Atom                     atom_utf8;
+    Atom                     atom_text;
+    Atom                     atom_incr;
+    Atom                     atom_clip_prop;
+    Atom                     atom_wm_state;
+    Atom                     atom_wm_fullscreen;
+
+    char                    *owned_clip;
+    size_t                   owned_clip_len;
+    bool                     owns_clipboard;
+    char                     last_synced_clip[8192];
 } X11PresenterSurface;
 
 static volatile int g_x11_shm_err_trapped = 0;
@@ -211,6 +233,192 @@ static void x11_set_utf8_title(Display *dpy, Window win, const char *utf8_title)
     }
 }
 
+/* EWMH `_NET_WM_STATE_FULLSCREEN` window state synchronization */
+static void x11_sync_os_fullscreen(X11PresenterSurface *s, bool want_fs) {
+    if (!s || !s->dpy || s->os_fullscreen == want_fs) return;
+    s->os_fullscreen = want_fs;
+    if (s->atom_wm_state == None || s->atom_wm_fullscreen == None) return;
+
+    XEvent xev;
+    memset(&xev, 0, sizeof(xev));
+    xev.type                 = ClientMessage;
+    xev.xclient.window       = s->win;
+    xev.xclient.message_type = s->atom_wm_state;
+    xev.xclient.format       = 32;
+    xev.xclient.data.l[0]    = want_fs ? 1L : 0L; /* 1 = _NET_WM_STATE_ADD, 0 = REMOVE */
+    xev.xclient.data.l[1]    = (long)s->atom_wm_fullscreen;
+    xev.xclient.data.l[2]    = 0L;
+    xev.xclient.data.l[3]    = 1L; /* Normal application source indication */
+    XSendEvent(s->dpy, RootWindow(s->dpy, s->screen), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &xev);
+    XFlush(s->dpy);
+}
+
+/* Claim X11 `CLIPBOARD` + `PRIMARY` ownership when `arcr_platform_clipboard_*` changes */
+static void x11_push_clipboard_if_changed(X11PresenterSurface *s) {
+    if (!s || !s->dpy || s->atom_clipboard == None) return;
+    char buf[8192];
+    buf[0] = '\0';
+    if (!arcr_platform_clipboard_get_utf8(buf, sizeof(buf)) || buf[0] == '\0') {
+        return;
+    }
+    if (strcmp(buf, s->last_synced_clip) == 0 && s->owns_clipboard) {
+        return;
+    }
+
+    size_t len = strlen(buf);
+    char *copy = (char *)malloc(len + 1u);
+    if (!copy) return;
+    memcpy(copy, buf, len + 1u);
+
+    free(s->owned_clip);
+    s->owned_clip     = copy;
+    s->owned_clip_len = len;
+    snprintf(s->last_synced_clip, sizeof(s->last_synced_clip), "%s", buf);
+
+    XSetSelectionOwner(s->dpy, s->atom_clipboard, s->win, CurrentTime);
+    XSetSelectionOwner(s->dpy, XA_PRIMARY, s->win, CurrentTime);
+    s->owns_clipboard = (XGetSelectionOwner(s->dpy, s->atom_clipboard) == s->win);
+    XFlush(s->dpy);
+}
+
+static bool x11_request_selection_target(X11PresenterSurface *s,
+                                         Atom selection_atom,
+                                         Atom target_atom,
+                                         char *out_buf,
+                                         size_t out_cap) {
+    if (!s || !s->dpy || selection_atom == None || target_atom == None ||
+        !out_buf || out_cap == 0u) {
+        return false;
+    }
+
+    XDeleteProperty(s->dpy, s->win, s->atom_clip_prop);
+    XConvertSelection(s->dpy, selection_atom, target_atom,
+                      s->atom_clip_prop, s->win, CurrentTime);
+    XFlush(s->dpy);
+
+    int x11_fd = ConnectionNumber(s->dpy);
+    uint64_t deadline = arcr_platform_monotonic_usec() + 40000ULL; /* Max 40 ms wait */
+
+    while (arcr_platform_monotonic_usec() < deadline) {
+        XEvent sev;
+        if (XCheckTypedWindowEvent(s->dpy, s->win, SelectionNotify, &sev)) {
+            if (sev.xselection.property == None) {
+                return false;
+            }
+            Atom actual_type = None;
+            int actual_fmt = 0;
+            unsigned long nitems = 0UL;
+            unsigned long bytes_after = 0UL;
+            unsigned char *prop_data = NULL;
+            int rc = XGetWindowProperty(s->dpy, s->win, s->atom_clip_prop,
+                                        0L, 65536L, True, AnyPropertyType,
+                                        &actual_type, &actual_fmt,
+                                        &nitems, &bytes_after, &prop_data);
+            if (rc != Success || !prop_data) {
+                if (prop_data) XFree(prop_data);
+                return false;
+            }
+            if ((s->atom_incr != None && actual_type == s->atom_incr) ||
+                actual_fmt != 8 || nitems == 0UL) {
+                XFree(prop_data);
+                return false;
+            }
+            size_t copy_len = (size_t)nitems;
+            if (copy_len >= out_cap) copy_len = out_cap - 1u;
+            memcpy(out_buf, prop_data, copy_len);
+            out_buf[copy_len] = '\0';
+            XFree(prop_data);
+            return copy_len > 0u;
+        }
+
+        uint64_t now = arcr_platform_monotonic_usec();
+        if (now >= deadline) break;
+        uint64_t rem = deadline - now;
+        if (rem > 5000ULL) rem = 5000ULL;
+        struct timeval tv;
+        tv.tv_sec  = 0;
+        tv.tv_usec = (long)rem;
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(x11_fd, &rfds);
+        (void)select(x11_fd + 1, &rfds, NULL, NULL, &tv);
+    }
+    return false;
+}
+
+/* Pull external X11 `CLIPBOARD` (`UTF8_STRING` -> `XA_STRING`) into platform clipboard */
+static void x11_pull_clipboard(X11PresenterSurface *s) {
+    if (!s || !s->dpy || s->atom_clipboard == None) return;
+
+    Atom sel_atom = s->atom_clipboard;
+    Window owner = XGetSelectionOwner(s->dpy, sel_atom);
+    if (owner == s->win) return; /* Already synced in-process */
+    if (owner == None) {
+        sel_atom = XA_PRIMARY;
+        owner = XGetSelectionOwner(s->dpy, sel_atom);
+        if (owner == None || owner == s->win) return;
+    }
+
+    char buf[8192];
+    buf[0] = '\0';
+    bool ok = false;
+    if (s->atom_utf8 != None) {
+        ok = x11_request_selection_target(s, sel_atom, s->atom_utf8, buf, sizeof(buf));
+    }
+    if (!ok) {
+        ok = x11_request_selection_target(s, sel_atom, XA_STRING, buf, sizeof(buf));
+    }
+    if (ok && buf[0] != '\0') {
+        snprintf(s->last_synced_clip, sizeof(s->last_synced_clip), "%s", buf);
+        (void)arcr_platform_clipboard_set_utf8(buf);
+    }
+}
+
+static void x11_handle_selection_request(X11PresenterSurface *s, const XSelectionRequestEvent *req) {
+    if (!s || !s->dpy || !req) return;
+
+    XSelectionEvent reply;
+    memset(&reply, 0, sizeof(reply));
+    reply.type      = SelectionNotify;
+    reply.display   = req->display;
+    reply.requestor = req->requestor;
+    reply.selection = req->selection;
+    reply.target    = req->target;
+    reply.time      = req->time;
+    reply.property  = None;
+
+    Atom dst_prop = (req->property != None) ? req->property : req->target;
+
+    if (s->owned_clip && s->owned_clip_len > 0u) {
+        if (s->atom_targets != None && req->target == s->atom_targets) {
+            Atom supported[4];
+            int count = 0;
+            supported[count++] = s->atom_targets;
+            if (s->atom_utf8 != None) supported[count++] = s->atom_utf8;
+            supported[count++] = XA_STRING;
+            if (s->atom_text != None) supported[count++] = s->atom_text;
+            XChangeProperty(s->dpy, req->requestor, dst_prop, XA_ATOM, 32,
+                            PropModeReplace, (const unsigned char *)supported, count);
+            reply.property = dst_prop;
+        } else if (req->target == XA_STRING ||
+                   (s->atom_utf8 != None && req->target == s->atom_utf8) ||
+                   (s->atom_text != None && req->target == s->atom_text)) {
+            Atom prop_type = (req->target == s->atom_text && s->atom_utf8 != None)
+                                 ? s->atom_utf8
+                                 : req->target;
+            XChangeProperty(s->dpy, req->requestor, dst_prop, prop_type, 8,
+                            PropModeReplace,
+                            (const unsigned char *)s->owned_clip,
+                            (int)s->owned_clip_len);
+            reply.property = dst_prop;
+        }
+    }
+
+    XSendEvent(s->dpy, req->requestor, False, 0L, (XEvent *)&reply);
+    XFlush(s->dpy);
+}
+
 int waterscape_run_desktop_window(ArcrEngine *engine,
                                   ArcrBrowserShell *shell,
                                   const WaterscapeWindowOptions *opts) {
@@ -232,8 +440,21 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
     surf.depth     = DefaultDepth(dpy, surf.screen);
     surf.allow_shm = !(opts && opts->force_cpu_presenter);
 
+    surf.atom_clipboard     = XInternAtom(dpy, "CLIPBOARD", False);
+    surf.atom_targets       = XInternAtom(dpy, "TARGETS", False);
+    surf.atom_utf8          = XInternAtom(dpy, "UTF8_STRING", False);
+    surf.atom_text          = XInternAtom(dpy, "TEXT", False);
+    surf.atom_incr          = XInternAtom(dpy, "INCR", False);
+    surf.atom_clip_prop     = XInternAtom(dpy, "WATERSCAPE_CLIP_PROP", False);
+    surf.atom_wm_state      = XInternAtom(dpy, "_NET_WM_STATE", False);
+    surf.atom_wm_fullscreen = XInternAtom(dpy, "_NET_WM_STATE_FULLSCREEN", False);
+
+    (void)arcr_platform_clipboard_get_utf8(surf.last_synced_clip, sizeof(surf.last_synced_clip));
+
     int32_t init_w = (opts && opts->initial_width > 0)  ? opts->initial_width  : 1080;
     int32_t init_h = (opts && opts->initial_height > 0) ? opts->initial_height : 720;
+
+    arcr_shell_resize(shell, init_w, init_h);
 
     surf.win = XCreateSimpleWindow(
         dpy, RootWindow(dpy, surf.screen),
@@ -260,6 +481,9 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
     XDefineCursor(dpy, surf.win, surf.cur_arrow);
 
     if (!x11_create_surface(&surf, init_w, init_h)) {
+        XFreeCursor(dpy, surf.cur_arrow);
+        XFreeCursor(dpy, surf.cur_pointer);
+        XFreeCursor(dpy, surf.cur_text);
         XDestroyWindow(dpy, surf.win);
         XCloseDisplay(dpy);
         return 1;
@@ -270,6 +494,9 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
            (int)init_w, (int)init_h, surf.depth);
 
     XMapWindow(dpy, surf.win);
+    if (arcr_shell_is_fullscreen(shell)) {
+        x11_sync_os_fullscreen(&surf, true);
+    }
     XFlush(dpy);
 
     uint64_t start_usec    = arcr_platform_monotonic_usec();
@@ -282,24 +509,30 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
     int  x11_fd      = ConnectionNumber(dpy);
 
     while (running) {
-        if (deadline_usec > 0ULL) {
-            uint64_t now = arcr_platform_monotonic_usec();
-            if (now >= deadline_usec) {
-                break;
-            }
-            if (XPending(dpy) == 0 && !needs_paint) {
-                uint64_t rem_usec = deadline_usec - now;
-                struct timeval tv;
-                tv.tv_sec  = (long)(rem_usec / 1000000ULL);
-                tv.tv_usec = (long)(rem_usec % 1000000ULL);
-                fd_set rfds;
-                FD_ZERO(&rfds);
-                FD_SET(x11_fd, &rfds);
-                (void)select(x11_fd + 1, &rfds, NULL, NULL, &tv);
-            }
+        uint64_t now = arcr_platform_monotonic_usec();
+        if (deadline_usec > 0ULL && now >= deadline_usec) {
+            break;
         }
 
-        while (XPending(dpy) > 0 || (deadline_usec == 0ULL && !needs_paint)) {
+        /* 16 ms (~60 FPS) non-blocking select() timeout when idle between frames */
+        if (XPending(dpy) == 0 && !needs_paint) {
+            uint64_t wait_usec = 16000ULL;
+            if (deadline_usec > 0ULL) {
+                uint64_t rem_usec = deadline_usec - now;
+                if (rem_usec < wait_usec) {
+                    wait_usec = rem_usec;
+                }
+            }
+            struct timeval tv;
+            tv.tv_sec  = (long)(wait_usec / 1000000ULL);
+            tv.tv_usec = (long)(wait_usec % 1000000ULL);
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            FD_SET(x11_fd, &rfds);
+            (void)select(x11_fd + 1, &rfds, NULL, NULL, &tv);
+        }
+
+        while (XPending(dpy) > 0 && running) {
             XEvent ev;
             XNextEvent(dpy, &ev);
 
@@ -309,6 +542,7 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
                     needs_paint = true;
                 }
                 break;
+
             case ConfigureNotify: {
                 int32_t nw = (int32_t)ev.xconfigure.width;
                 int32_t nh = (int32_t)ev.xconfigure.height;
@@ -318,11 +552,13 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
                     nh = (int32_t)ev.xconfigure.height;
                 }
                 if (nw > 0 && nh > 0 && (nw != surf.width || nh != surf.height)) {
+                    arcr_shell_resize(shell, nw, nh);
                     x11_create_surface(&surf, nw, nh);
                     needs_paint = true;
                 }
                 break;
             }
+
             case MotionNotify: {
                 int32_t mx = ev.xmotion.x;
                 int32_t my = ev.xmotion.y;
@@ -332,34 +568,60 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
                 }
                 ArcrCursorKind ck = arcr_shell_on_mouse_move(shell, mx, my);
                 x11_apply_cursor(&surf, ck);
-                needs_paint = true;
-                break;
-            }
-            case ButtonPress: {
-                bool ctrl = (ev.xbutton.state & ControlMask) != 0;
-                if (ev.xbutton.button == Button4) {
-                    if (arcr_shell_on_mouse_wheel(shell, 1, ctrl)) needs_paint = true;
-                } else if (ev.xbutton.button == Button5) {
-                    if (arcr_shell_on_mouse_wheel(shell, -1, ctrl)) needs_paint = true;
-                } else {
-                    int btn = 0;
-                    if (ev.xbutton.button == Button2) btn = 1;
-                    else if (ev.xbutton.button == Button3) btn = 2;
-                    arcr_shell_on_mouse_down(shell, ev.xbutton.x, ev.xbutton.y, btn);
+                if (waterscape_shell_needs_repaint(shell)) {
                     needs_paint = true;
                 }
                 break;
             }
-            case ButtonRelease:
-                if (ev.xbutton.button == Button1) {
-                    if (arcr_shell_on_mouse_up(shell, ev.xbutton.x, ev.xbutton.y, 0)) {
+
+            case ButtonPress: {
+                bool ctrl  = (ev.xbutton.state & ControlMask) != 0;
+                bool shift = (ev.xbutton.state & ShiftMask) != 0;
+                if (ev.xbutton.button == Button4) {
+                    if (arcr_shell_on_mouse_wheel(shell, 1, ctrl)) needs_paint = true;
+                } else if (ev.xbutton.button == Button5) {
+                    if (arcr_shell_on_mouse_wheel(shell, -1, ctrl)) needs_paint = true;
+                } else if (ev.xbutton.button == Button1 ||
+                           ev.xbutton.button == Button2 ||
+                           ev.xbutton.button == Button3) {
+                    int btn = 0;
+                    if (ev.xbutton.button == Button2) btn = 1;
+                    else if (ev.xbutton.button == Button3) {
+                        btn = 2;
+                        /* Sync external clipboard before opening Context Menu (Paste & Go) */
+                        x11_pull_clipboard(&surf);
+                    }
+                    if (arcr_shell_on_mouse_down_ex(shell, ev.xbutton.x, ev.xbutton.y,
+                                                    btn, ctrl, shift) ||
+                        waterscape_shell_needs_repaint(shell)) {
                         needs_paint = true;
                     }
+                    x11_push_clipboard_if_changed(&surf);
+                    x11_sync_os_fullscreen(&surf, arcr_shell_is_fullscreen(shell));
                 }
                 break;
+            }
+
+            case ButtonRelease: {
+                int btn = -1;
+                if (ev.xbutton.button == Button1) btn = 0;
+                else if (ev.xbutton.button == Button2) btn = 1;
+                else if (ev.xbutton.button == Button3) btn = 2;
+                if (btn >= 0) {
+                    if (arcr_shell_on_mouse_up(shell, ev.xbutton.x, ev.xbutton.y, btn) ||
+                        waterscape_shell_needs_repaint(shell)) {
+                        needs_paint = true;
+                    }
+                    x11_push_clipboard_if_changed(&surf);
+                    x11_sync_os_fullscreen(&surf, arcr_shell_is_fullscreen(shell));
+                }
+                break;
+            }
+
             case KeyPress: {
-                bool ctrl = (ev.xkey.state & ControlMask) != 0;
-                bool alt  = (ev.xkey.state & Mod1Mask) != 0;
+                bool ctrl  = (ev.xkey.state & ControlMask) != 0;
+                bool alt   = (ev.xkey.state & Mod1Mask) != 0;
+                bool shift = (ev.xkey.state & ShiftMask) != 0;
                 char buf[32];
                 KeySym ks = NoSymbol;
                 int n = XLookupString(&ev.xkey, buf, (int)sizeof(buf) - 1, &ks, NULL);
@@ -368,79 +630,123 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
 
                 if (ks >= XK_F1 && ks <= XK_F12) {
                     int fn_num = (int)(ks - XK_F1) + 1;
-                    if (arcr_shell_on_key(shell, NULL, ARCR_KEY_NONE, ctrl, alt, fn_num)) {
+                    if (arcr_shell_on_key_ex(shell, NULL, ARCR_KEY_NONE,
+                                             ctrl, alt, shift, fn_num)) {
                         needs_paint = true;
                     }
+                    x11_sync_os_fullscreen(&surf, arcr_shell_is_fullscreen(shell));
                     break;
                 }
 
                 ArcrSpecialKey sk = ARCR_KEY_NONE;
-                if (ks == XK_BackSpace)                        sk = ARCR_KEY_BACKSPACE;
-                else if (ks == XK_Delete || ks == XK_KP_Delete) sk = ARCR_KEY_DELETE;
-                else if (ks == XK_Return || ks == XK_KP_Enter)  sk = ARCR_KEY_ENTER;
-                else if (ks == XK_Tab)                         sk = ARCR_KEY_TAB;
-                else if (ks == XK_Left)                        sk = ARCR_KEY_LEFT;
-                else if (ks == XK_Right)                       sk = ARCR_KEY_RIGHT;
-                else if (ks == XK_Home)                        sk = ARCR_KEY_HOME;
-                else if (ks == XK_End)                         sk = ARCR_KEY_END;
-                else if (ks == XK_Escape)                      sk = ARCR_KEY_ESCAPE;
+                if (ks == XK_BackSpace)                               sk = ARCR_KEY_BACKSPACE;
+                else if (ks == XK_Delete || ks == XK_KP_Delete)       sk = ARCR_KEY_DELETE;
+                else if (ks == XK_Return || ks == XK_KP_Enter)        sk = ARCR_KEY_ENTER;
+                else if (ks == XK_Tab)                                sk = ARCR_KEY_TAB;
+                else if (ks == XK_ISO_Left_Tab) {
+                    sk    = ARCR_KEY_TAB;
+                    shift = true;
+                }
+                else if (ks == XK_Left || ks == XK_KP_Left)           sk = ARCR_KEY_LEFT;
+                else if (ks == XK_Right || ks == XK_KP_Right)         sk = ARCR_KEY_RIGHT;
+                else if (ks == XK_Home || ks == XK_KP_Home)           sk = ARCR_KEY_HOME;
+                else if (ks == XK_End || ks == XK_KP_End)             sk = ARCR_KEY_END;
+                else if (ks == XK_Escape)                             sk = ARCR_KEY_ESCAPE;
+                else if (ks == XK_Up || ks == XK_KP_Up)               sk = ARCR_KEY_UP;
+                else if (ks == XK_Down || ks == XK_KP_Down)           sk = ARCR_KEY_DOWN;
+                else if (ks == XK_Page_Up || ks == XK_KP_Page_Up)     sk = ARCR_KEY_PAGE_UP;
+                else if (ks == XK_Page_Down || ks == XK_KP_Page_Down) sk = ARCR_KEY_PAGE_DOWN;
 
                 if (sk != ARCR_KEY_NONE) {
-                    if (arcr_shell_on_key(shell, NULL, sk, ctrl, alt, 0)) {
+                    if (arcr_shell_on_key_ex(shell, NULL, sk, ctrl, alt, shift, 0)) {
                         needs_paint = true;
                     }
+                    x11_push_clipboard_if_changed(&surf);
+                    x11_sync_os_fullscreen(&surf, arcr_shell_is_fullscreen(shell));
                     break;
                 }
 
-                if (!ctrl && !alt &&
-                    (ks == XK_Up || ks == XK_Down || ks == XK_Page_Up || ks == XK_Page_Down)) {
-                    int32_t steps = (ks == XK_Page_Up || ks == XK_Page_Down) ? 4 : 1;
-                    if (ks == XK_Down || ks == XK_Page_Down) steps = -steps;
-                    if (arcr_shell_on_mouse_wheel(shell, steps, false)) {
-                        needs_paint = true;
-                    }
-                    break;
-                }
-
-                if (ctrl) {
+                if (ctrl || alt) {
                     KeySym base_ks = XLookupKeysym(&ev.xkey, 0);
+                    if (ctrl && !alt && !shift) {
+                        ArcrSpecialKey clip_sk = ARCR_KEY_NONE;
+                        if (base_ks == XK_a || base_ks == XK_A)      clip_sk = ARCR_KEY_SELECT_ALL;
+                        else if (base_ks == XK_c || base_ks == XK_C) clip_sk = ARCR_KEY_COPY;
+                        else if (base_ks == XK_x || base_ks == XK_X) clip_sk = ARCR_KEY_CUT;
+                        else if (base_ks == XK_v || base_ks == XK_V) {
+                            x11_pull_clipboard(&surf);
+                            clip_sk = ARCR_KEY_PASTE;
+                        }
+                        if (clip_sk != ARCR_KEY_NONE) {
+                            if (arcr_shell_on_key_ex(shell, NULL, clip_sk, true, false, false, 0)) {
+                                needs_paint = true;
+                            }
+                            x11_push_clipboard_if_changed(&surf);
+                            break;
+                        }
+                    }
+
                     if (base_ks >= 0x20u && base_ks <= 0x7Eu) {
                         char kstr[2];
                         kstr[0] = (char)base_ks;
                         kstr[1] = '\0';
-                        if (arcr_shell_on_key(shell, kstr, ARCR_KEY_NONE, true, alt, 0)) {
+                        if (arcr_shell_on_key_ex(shell, kstr, ARCR_KEY_NONE,
+                                                 ctrl, alt, shift, 0)) {
                             needs_paint = true;
                         }
+                        x11_push_clipboard_if_changed(&surf);
+                        x11_sync_os_fullscreen(&surf, arcr_shell_is_fullscreen(shell));
                     }
                     break;
                 }
 
-                if (n > 0 && (unsigned char)buf[0] >= 0x20u) {
-                    if (arcr_shell_on_key(shell, buf, ARCR_KEY_NONE, false, alt, 0)) {
+                if (n > 0 && (unsigned char)buf[0] >= 0x20u && (unsigned char)buf[0] != 0x7Fu) {
+                    if (arcr_shell_on_key_ex(shell, buf, ARCR_KEY_NONE,
+                                             false, false, shift, 0)) {
                         needs_paint = true;
                     }
                 }
                 break;
             }
+
+            case SelectionRequest:
+                x11_handle_selection_request(&surf, &ev.xselectionrequest);
+                break;
+
+            case SelectionClear:
+                if (ev.xselectionclear.selection == surf.atom_clipboard) {
+                    surf.owns_clipboard = false;
+                }
+                break;
+
             case ClientMessage:
                 if ((Atom)ev.xclient.data.l[0] == wm_delete) {
                     running = false;
                 }
                 break;
+
             default:
                 break;
             }
-
-            if (!running) break;
-            if (XPending(dpy) == 0) break;
         }
 
-        if (running && needs_paint) {
+        if (!running) break;
+
+        /* Drive 60 FPS async network load progress, CSS @keyframes, JS timers, GIFs & <video> */
+        if (arcr_shell_tick(shell, arcr_platform_monotonic_usec()) ||
+            waterscape_shell_needs_repaint(shell)) {
+            needs_paint = true;
+        }
+        x11_sync_os_fullscreen(&surf, arcr_shell_is_fullscreen(shell));
+
+        if (needs_paint) {
             x11_present(&surf, shell);
             needs_paint = false;
         }
     }
 
+    free(surf.owned_clip);
+    surf.owned_clip = NULL;
     x11_destroy_surface(&surf);
     XFreeCursor(dpy, surf.cur_arrow);
     XFreeCursor(dpy, surf.cur_pointer);

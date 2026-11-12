@@ -27,6 +27,12 @@
 #  include <windows.h>
 #  include <process.h>
 
+#  ifndef STACK_SIZE_PARAM_IS_A_RESERVATION
+#    define STACK_SIZE_PARAM_IS_A_RESERVATION 0x00010000u
+#  endif
+
+#  define ARCR_WORKER_STACK_BYTES (2u * 1024u * 1024u)
+
 uint32_t arcr_hardware_cpu_threads(void) {
     SYSTEM_INFO si;
     ZeroMemory(&si, sizeof(si));
@@ -43,7 +49,7 @@ typedef struct WorkerArg {
 
 struct ArcrThreadPool {
     uint32_t           total_workers; /* Includes caller thread (worker 0) */
-    uint32_t           bg_count;      /* total_workers - 1 */
+    uint32_t           bg_count;      /* Successfully spawned background workers */
     HANDLE             threads[16];
     WorkerArg          args[16];
     CRITICAL_SECTION   cs;
@@ -80,7 +86,7 @@ static unsigned __stdcall win32_worker_proc(void *param) {
         }
         if (pool->generation == seen_gen) {
             LeaveCriticalSection(&pool->cs);
-            WaitForSingleObject(pool->wake_event, 2);
+            WaitForSingleObject(pool->wake_event, 50);
             continue;
         }
         seen_gen = pool->generation;
@@ -106,19 +112,44 @@ ArcrThreadPool *arcr_threadpool_create(uint32_t desired_threads) {
 
     uint32_t hw = (desired_threads == 0u) ? arcr_hardware_cpu_threads() : desired_threads;
     hw = ARCR_CLAMP(hw, 1u, 16u);
-    pool->total_workers = hw;
-    pool->bg_count      = hw - 1u;
+    uint32_t desired_bg = hw - 1u;
+    pool->total_workers = 1u;
+    pool->bg_count      = 0u;
 
-    if (pool->bg_count > 0u) {
+    if (desired_bg > 0u) {
         InitializeCriticalSection(&pool->cs);
         pool->wake_event = CreateEventW(NULL, TRUE, FALSE, NULL);
         pool->done_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-        for (uint32_t i = 0u; i < pool->bg_count; ++i) {
-            pool->args[i].pool      = pool;
-            pool->args[i].worker_id = i + 1u;
-            unsigned tid = 0u;
-            uintptr_t th = _beginthreadex(NULL, 0u, win32_worker_proc, &pool->args[i], 0u, &tid);
-            pool->threads[i] = (HANDLE)th;
+        if (pool->wake_event && pool->done_event) {
+            for (uint32_t i = 0u; i < desired_bg; ++i) {
+                uint32_t slot = pool->bg_count;
+                pool->args[slot].pool      = pool;
+                pool->args[slot].worker_id = slot + 1u;
+                unsigned tid = 0u;
+                /* XP+ reservation flag; fallback to 0 on Windows 2000 SP4 */
+                uintptr_t th = _beginthreadex(NULL, ARCR_WORKER_STACK_BYTES,
+                                              win32_worker_proc, &pool->args[slot],
+                                              STACK_SIZE_PARAM_IS_A_RESERVATION, &tid);
+                if (th == 0u) {
+                    tid = 0u;
+                    th  = _beginthreadex(NULL, ARCR_WORKER_STACK_BYTES,
+                                         win32_worker_proc, &pool->args[slot], 0u, &tid);
+                }
+                if (th == 0u) {
+                    tid = 0u;
+                    th  = _beginthreadex(NULL, 0u, win32_worker_proc, &pool->args[slot], 0u, &tid);
+                }
+                if (th != 0u) {
+                    pool->threads[slot] = (HANDLE)th;
+                    pool->bg_count++;
+                }
+            }
+        }
+        pool->total_workers = 1u + pool->bg_count;
+        if (pool->bg_count == 0u) {
+            if (pool->wake_event) { CloseHandle(pool->wake_event); pool->wake_event = NULL; }
+            if (pool->done_event) { CloseHandle(pool->done_event); pool->done_event = NULL; }
+            DeleteCriticalSection(&pool->cs);
         }
     }
     return pool;
@@ -132,12 +163,12 @@ void arcr_threadpool_destroy(ArcrThreadPool *pool) {
         SetEvent(pool->wake_event);
         LeaveCriticalSection(&pool->cs);
 
-        WaitForMultipleObjects(pool->bg_count, pool->threads, TRUE, 5000);
+        WaitForMultipleObjects(pool->bg_count, pool->threads, TRUE, INFINITE);
         for (uint32_t i = 0u; i < pool->bg_count; ++i) {
             if (pool->threads[i]) CloseHandle(pool->threads[i]);
         }
-        CloseHandle(pool->wake_event);
-        CloseHandle(pool->done_event);
+        if (pool->wake_event) CloseHandle(pool->wake_event);
+        if (pool->done_event) CloseHandle(pool->done_event);
         DeleteCriticalSection(&pool->cs);
     }
     free(pool);
@@ -177,6 +208,8 @@ void arcr_threadpool_parallel_for(ArcrThreadPool *pool, uint32_t item_count,
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
+
+#define ARCR_WORKER_STACK_BYTES ((size_t)(2u * 1024u * 1024u))
 
 uint32_t arcr_hardware_cpu_threads(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
@@ -250,17 +283,54 @@ ArcrThreadPool *arcr_threadpool_create(uint32_t desired_threads) {
 
     uint32_t hw = (desired_threads == 0u) ? arcr_hardware_cpu_threads() : desired_threads;
     hw = ARCR_CLAMP(hw, 1u, 16u);
-    pool->total_workers = hw;
-    pool->bg_count      = hw - 1u;
+    uint32_t desired_bg = hw - 1u;
+    pool->total_workers = 1u;
+    pool->bg_count      = 0u;
 
-    if (pool->bg_count > 0u) {
-        pthread_mutex_init(&pool->mtx, NULL);
-        pthread_cond_init(&pool->cv_start, NULL);
-        pthread_cond_init(&pool->cv_done, NULL);
-        for (uint32_t i = 0u; i < pool->bg_count; ++i) {
-            pool->args[i].pool      = pool;
-            pool->args[i].worker_id = i + 1u;
-            pthread_create(&pool->threads[i], NULL, posix_worker_proc, &pool->args[i]);
+    if (desired_bg > 0u) {
+        if (pthread_mutex_init(&pool->mtx, NULL) != 0) {
+            return pool;
+        }
+        if (pthread_cond_init(&pool->cv_start, NULL) != 0) {
+            pthread_mutex_destroy(&pool->mtx);
+            return pool;
+        }
+        if (pthread_cond_init(&pool->cv_done, NULL) != 0) {
+            pthread_cond_destroy(&pool->cv_start);
+            pthread_mutex_destroy(&pool->mtx);
+            return pool;
+        }
+
+        pthread_attr_t attr;
+        bool has_attr = (pthread_attr_init(&attr) == 0);
+        if (has_attr) {
+            (void)pthread_attr_setstacksize(&attr, ARCR_WORKER_STACK_BYTES);
+        }
+
+        for (uint32_t i = 0u; i < desired_bg; ++i) {
+            uint32_t slot = pool->bg_count;
+            pool->args[slot].pool      = pool;
+            pool->args[slot].worker_id = slot + 1u;
+            int rc = pthread_create(&pool->threads[slot], has_attr ? &attr : NULL,
+                                    posix_worker_proc, &pool->args[slot]);
+            if (rc != 0 && has_attr) {
+                rc = pthread_create(&pool->threads[slot], NULL,
+                                    posix_worker_proc, &pool->args[slot]);
+            }
+            if (rc == 0) {
+                pool->bg_count++;
+            }
+        }
+
+        if (has_attr) {
+            pthread_attr_destroy(&attr);
+        }
+
+        pool->total_workers = 1u + pool->bg_count;
+        if (pool->bg_count == 0u) {
+            pthread_cond_destroy(&pool->cv_done);
+            pthread_cond_destroy(&pool->cv_start);
+            pthread_mutex_destroy(&pool->mtx);
         }
     }
     return pool;

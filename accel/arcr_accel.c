@@ -13,11 +13,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__SSE__) || defined(_M_IX86) || defined(__x86_64__) || defined(_M_X64)
+#if defined(__SSE__) || (defined(_MSC_VER) && (defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 1)))
+#  define ARCR_HAVE_SSE1_INTRINSICS 1
 #  include <xmmintrin.h> /* SSE1 (<xmmintrin.h> works on Pentium III / Win2000 x86) */
 #endif
 
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+#if defined(__SSE2__) || (defined(_MSC_VER) && (defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)))
+#  define ARCR_HAVE_SSE2_INTRINSICS 1
 #  include <emmintrin.h> /* SSE2 128-bit integer XMM */
 #endif
 
@@ -49,15 +51,15 @@ static inline uint32_t div255_exact(uint32_t x) {
     return (t + (t >> 8)) >> 8;
 }
 
-/* Fast exact integer square root for 32-bit unsigned values */
-static uint32_t isqrt_u32(uint32_t n) {
-    if (n == 0u) return 0u;
-    uint32_t res = 0u;
-    uint32_t bit = 1u << 30;
+/* Fast exact integer square root for 64-bit unsigned values (overflow-safe for wide layouts) */
+static uint64_t isqrt_u64(uint64_t n) {
+    if (n == 0ULL) return 0ULL;
+    uint64_t res = 0ULL;
+    uint64_t bit = 1ULL << 62;
     while (bit > n) {
         bit >>= 2;
     }
-    while (bit != 0u) {
+    while (bit != 0ULL) {
         if (n >= res + bit) {
             n -= res + bit;
             res = (res >> 1) + bit;
@@ -105,7 +107,7 @@ void arcr_scanline_fill_u32_scalar(uint32_t *dst, size_t count, uint32_t argb) {
 
 static void arcr_scanline_fill_u32_sse2(uint32_t *dst, size_t count, uint32_t argb) {
     if (!dst || count == 0u) return;
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+#if defined(ARCR_HAVE_SSE2_INTRINSICS)
     __m128i v_fill = _mm_set1_epi32((int)argb);
     size_t  i      = 0u;
     for (; i + 8u <= count; i += 8u) {
@@ -181,7 +183,7 @@ void arcr_scanline_blend_sse1_swar(uint32_t *dst, size_t count, uint32_t src_arg
     uint64_t src_ag = (((uint64_t)(255u * sa + 128u)) << 32) | (uint64_t)(sg * sa + 128u);
 
     for (size_t i = 0u; i < count; ++i) {
-#if defined(__SSE__) || defined(_M_IX86) || defined(__x86_64__)
+#if defined(ARCR_HAVE_SSE1_INTRINSICS)
         if ((i & 15u) == 0u && i + 16u < count) {
             _mm_prefetch((const char *)(dst + i + 16u), _MM_HINT_T0);
         }
@@ -210,7 +212,7 @@ void arcr_scanline_blend_sse1_swar(uint32_t *dst, size_t count, uint32_t src_arg
  */
 void arcr_scanline_blend_sse2(uint32_t *dst, size_t count, uint32_t src_argb) {
     if (!dst || count == 0u) return;
-#if defined(__SSE2__) || defined(__x86_64__) || defined(_M_X64)
+#if defined(ARCR_HAVE_SSE2_INTRINSICS)
     uint32_t sa = (src_argb >> 24) & 0xFFu;
     if (sa == 0u) return;
     if (sa == 255u) {
@@ -1181,7 +1183,10 @@ void arcr_accel_draw_box_shadow(ArcrAccelContext *ctx, uint32_t *dst_argb,
     uint32_t base_a = (shadow_argb >> 24) & 0xFFu;
     if (base_a == 0u) return;
 
-    ArcrRect srect = {rect.x, rect.y + offset_y, rect.width, rect.height};
+    int64_t sy_64 = (int64_t)rect.y + (int64_t)offset_y;
+    int32_t sy_32 = (sy_64 < -100000000LL) ? -100000000
+                  : ((sy_64 > 100000000LL) ? 100000000 : (int32_t)sy_64);
+    ArcrRect srect = {rect.x, sy_32, rect.width, rect.height};
     if (blur_px <= 0) {
         arcr_accel_fill_rounded_rect(ctx, dst_argb, fb_w, fb_h, stride_px,
                                      srect, radius_px, shadow_argb);
@@ -1192,11 +1197,18 @@ void arcr_accel_draw_box_shadow(ArcrAccelContext *ctx, uint32_t *dst_argb,
     int32_t max_r = ARCR_MIN(srect.width / 2, srect.height / 2);
     int32_t r     = ARCR_CLAMP(radius_px, 0, max_r);
 
+    int64_t bx_64 = (int64_t)srect.x - (int64_t)blur;
+    int64_t by_64 = (int64_t)srect.y - (int64_t)blur;
+    int64_t bw_64 = (int64_t)srect.width + 2LL * (int64_t)blur;
+    int64_t bh_64 = (int64_t)srect.height + 2LL * (int64_t)blur;
+    if (bw_64 > 0x3FFFFFFFLL) bw_64 = 0x3FFFFFFFLL;
+    if (bh_64 > 0x3FFFFFFFLL) bh_64 = 0x3FFFFFFFLL;
+
     ArcrRect bounds = {
-        srect.x - blur,
-        srect.y - blur,
-        srect.width + 2 * blur,
-        srect.height + 2 * blur
+        (int32_t)ARCR_CLAMP(bx_64, -100000000LL, 100000000LL),
+        (int32_t)ARCR_CLAMP(by_64, -100000000LL, 100000000LL),
+        (int32_t)bw_64,
+        (int32_t)bh_64
     };
     int32_t x0, y0, x1, y1;
     if (!clip_rect(fb_w, fb_h, bounds, &x0, &y0, &x1, &y1)) return;
@@ -1205,29 +1217,29 @@ void arcr_accel_draw_box_shadow(ArcrAccelContext *ctx, uint32_t *dst_argb,
     uint32_t sg = (shadow_argb >> 8) & 0xFFu;
     uint32_t sb = shadow_argb & 0xFFu;
 
-    /* Half-pixel (2x) coordinates for smooth integer signed-distance evaluation */
-    int32_t ix0   = 2 * (srect.x + r);
-    int32_t ix1   = 2 * (srect.x + srect.width - r);
-    int32_t iy0   = 2 * (srect.y + r);
-    int32_t iy1   = 2 * (srect.y + srect.height - r);
-    int32_t r2    = 2 * r;
-    int32_t blur2 = 2 * blur;
+    /* 64-bit half-pixel (2x) coordinates prevent overflow on wide (>1200px) cards */
+    int64_t ix0   = 2LL * ((int64_t)srect.x + (int64_t)r);
+    int64_t ix1   = 2LL * ((int64_t)srect.x + (int64_t)srect.width - (int64_t)r);
+    int64_t iy0   = 2LL * ((int64_t)srect.y + (int64_t)r);
+    int64_t iy1   = 2LL * ((int64_t)srect.y + (int64_t)srect.height - (int64_t)r);
+    int64_t r2    = 2LL * (int64_t)r;
+    int64_t blur2 = 2LL * (int64_t)blur;
 
     /* Deep interior span where signed distance <= -blur receives full shadow_argb via SIMD */
-    int32_t full_x0 = srect.x + r + blur;
-    int32_t full_x1 = srect.x + srect.width - r - blur;
-    int32_t full_y0 = srect.y + r + blur;
-    int32_t full_y1 = srect.y + srect.height - r - blur;
+    int64_t full_x0 = (int64_t)srect.x + (int64_t)r + (int64_t)blur;
+    int64_t full_x1 = (int64_t)srect.x + (int64_t)srect.width - (int64_t)r - (int64_t)blur;
+    int64_t full_y0 = (int64_t)srect.y + (int64_t)r + (int64_t)blur;
+    int64_t full_y1 = (int64_t)srect.y + (int64_t)srect.height - (int64_t)r - (int64_t)blur;
     ArcrScanlineBlendFn blend_fn = get_blend_fn(ctx);
 
     for (int32_t py = y0; py < y1; ++py) {
         uint32_t *row = dst_argb + (size_t)py * (size_t)stride_px;
-        int32_t   cy  = 2 * py + 1;
-        int32_t   qy  = (cy < iy0) ? (iy0 - cy) : ((cy > iy1) ? (cy - iy1) : 0);
+        int64_t   cy  = 2LL * (int64_t)py + 1LL;
+        int64_t   qy  = (cy < iy0) ? (iy0 - cy) : ((cy > iy1) ? (cy - iy1) : 0LL);
 
-        bool has_full_span = (py >= full_y0 && py < full_y1 && full_x0 < full_x1);
-        int32_t fx0 = has_full_span ? ARCR_MAX(x0, full_x0) : x1;
-        int32_t fx1 = has_full_span ? ARCR_MIN(x1, full_x1) : x0;
+        bool has_full_span = ((int64_t)py >= full_y0 && (int64_t)py < full_y1 && full_x0 < full_x1);
+        int32_t fx0 = has_full_span ? (int32_t)ARCR_MAX((int64_t)x0, full_x0) : x1;
+        int32_t fx1 = has_full_span ? (int32_t)ARCR_MIN((int64_t)x1, full_x1) : x0;
 
         int32_t px = x0;
         while (px < x1) {
@@ -1237,21 +1249,21 @@ void arcr_accel_draw_box_shadow(ArcrAccelContext *ctx, uint32_t *dst_argb,
                 continue;
             }
 
-            int32_t cx = 2 * px + 1;
-            int32_t qx = (cx < ix0) ? (ix0 - cx) : ((cx > ix1) ? (cx - ix1) : 0);
-            int32_t sd2;
-            if (qx == 0 && qy == 0) {
+            int64_t cx = 2LL * (int64_t)px + 1LL;
+            int64_t qx = (cx < ix0) ? (ix0 - cx) : ((cx > ix1) ? (cx - ix1) : 0LL);
+            int64_t sd2;
+            if (qx == 0LL && qy == 0LL) {
                 /* Inside inner core: negative signed distance to nearest edge */
-                int32_t dx_in = ARCR_MIN(cx - ix0, ix1 - cx);
-                int32_t dy_in = ARCR_MIN(cy - iy0, iy1 - cy);
+                int64_t dx_in = ARCR_MIN(cx - ix0, ix1 - cx);
+                int64_t dy_in = ARCR_MIN(cy - iy0, iy1 - cy);
                 sd2 = -(ARCR_MIN(dx_in, dy_in) + r2);
-            } else if (qx == 0) {
+            } else if (qx == 0LL) {
                 sd2 = qy - r2;
-            } else if (qy == 0) {
+            } else if (qy == 0LL) {
                 sd2 = qx - r2;
             } else {
-                uint32_t d2_sq = (uint32_t)(qx * qx + qy * qy);
-                sd2 = (int32_t)isqrt_u32(d2_sq) - r2;
+                uint64_t d2_sq = (uint64_t)qx * (uint64_t)qx + (uint64_t)qy * (uint64_t)qy;
+                sd2 = (int64_t)isqrt_u64(d2_sq) - r2;
             }
 
             if (sd2 < blur2) {
@@ -1260,7 +1272,7 @@ void arcr_accel_draw_box_shadow(ArcrAccelContext *ctx, uint32_t *dst_argb,
                     sa = base_a;
                 } else {
                     /* Smooth cubic Hermite falloff: t in [0..256] */
-                    uint32_t u  = (uint32_t)(((blur2 - sd2) * 256) / (2 * blur2));
+                    uint32_t u  = (uint32_t)(((blur2 - sd2) * 256LL) / (2LL * blur2));
                     if (u > 256u) u = 256u;
                     uint32_t sm = (u * u * (768u - 2u * u)) >> 16;
                     sa = (base_a * sm + 128u) >> 8;
@@ -1372,13 +1384,128 @@ void arcr_accel_blit_image_argb(ArcrAccelContext *ctx, uint32_t *dst_argb,
         return;
     }
 
-    /* Path 3: 16.16 fixed-point Smooth Bilinear Filtering (exact 256-sum weights) */
+    /* Path 3: 16.16 Bilinear + Premultiplied Multi-Tap Supersampled Downscaling */
+    int32_t taps_x = (src_w > dst_rect.width * 6 && dst_rect.width <= 128) ? 8
+                   : ((src_w > dst_rect.width * 3) ? 4
+                   : ((src_w * 2 > dst_rect.width * 3) ? 2 : 1));
+    int32_t taps_y = (src_h > dst_rect.height * 6 && dst_rect.height <= 128) ? 8
+                   : ((src_h > dst_rect.height * 3) ? 4
+                   : ((src_h * 2 > dst_rect.height * 3) ? 2 : 1));
+
     int64_t step_x = ((int64_t)src_w << 16) / (int64_t)dst_rect.width;
     int64_t step_y = ((int64_t)src_h << 16) / (int64_t)dst_rect.height;
+    int64_t max_fx = (int64_t)(src_w - 1) << 16;
+    int64_t max_fy = (int64_t)(src_h - 1) << 16;
+
+    if (taps_x > 1 || taps_y > 1) {
+        int64_t  sub_x      = step_x / (int64_t)taps_x;
+        int64_t  sub_y      = step_y / (int64_t)taps_y;
+        int64_t  fx_row0    = (int64_t)(x0 - dst_rect.x) * step_x + (sub_x >> 1) - 32768LL;
+        int64_t  fy_cur     = (int64_t)(y0 - dst_rect.y) * step_y + (sub_y >> 1) - 32768LL;
+        uint32_t total_taps = (uint32_t)(taps_x * taps_y);
+
+        for (int32_t py = y0; py < y1; ++py, fy_cur += step_y) {
+            uint32_t *drow   = dst_argb + (size_t)py * (size_t)stride_px;
+            int64_t   fx_cur = fx_row0;
+
+            for (int32_t px = x0; px < x1; ++px, fx_cur += step_x) {
+                uint64_t acc_a  = 0ULL;
+                uint64_t acc_pr = 0ULL;
+                uint64_t acc_pg = 0ULL;
+                uint64_t acc_pb = 0ULL;
+
+                int64_t fy_tap = fy_cur;
+                for (int32_t ty = 0; ty < taps_y; ++ty, fy_tap += sub_y) {
+                    int64_t fy_c = (fy_tap < 0LL) ? 0LL : ((fy_tap > max_fy) ? max_fy : fy_tap);
+                    int32_t sy0  = (int32_t)(fy_c >> 16);
+                    int32_t sy1  = (sy0 + 1 < src_h) ? (sy0 + 1) : sy0;
+                    uint32_t wy1 = ((uint32_t)(fy_c & 0xFFFF) + 128u) >> 8;
+                    uint32_t wy0 = 256u - wy1;
+
+                    const uint32_t *srow0 = src_argb + (size_t)sy0 * (size_t)src_w;
+                    const uint32_t *srow1 = src_argb + (size_t)sy1 * (size_t)src_w;
+
+                    int64_t fx_tap = fx_cur;
+                    for (int32_t tx = 0; tx < taps_x; ++tx, fx_tap += sub_x) {
+                        int64_t fx_c = (fx_tap < 0LL) ? 0LL : ((fx_tap > max_fx) ? max_fx : fx_tap);
+                        int32_t sx0  = (int32_t)(fx_c >> 16);
+                        int32_t sx1  = (sx0 + 1 < src_w) ? (sx0 + 1) : sx0;
+                        uint32_t wx1 = ((uint32_t)(fx_c & 0xFFFF) + 128u) >> 8;
+                        uint32_t wx0 = 256u - wx1;
+
+                        uint32_t p00 = srow0[sx0];
+                        uint32_t p10 = srow0[sx1];
+                        uint32_t p01 = srow1[sx0];
+                        uint32_t p11 = srow1[sx1];
+
+                        uint32_t w00 = wx0 * wy0;
+                        uint32_t w10 = wx1 * wy0;
+                        uint32_t w01 = wx0 * wy1;
+                        uint32_t w11 = wx1 * wy1;
+
+                        if (((p00 & p10 & p01 & p11) & 0xFF000000u) == 0xFF000000u) {
+                            uint32_t tr = (((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 +
+                                           ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11 + 32768u) >> 16;
+                            uint32_t tg = (((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 +
+                                           ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11 + 32768u) >> 16;
+                            uint32_t tb = ((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 +
+                                           (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11 + 32768u) >> 16;
+                            acc_a  += 255ULL;
+                            acc_pr += (uint64_t)tr * 255ULL;
+                            acc_pg += (uint64_t)tg * 255ULL;
+                            acc_pb += (uint64_t)tb * 255ULL;
+                        } else {
+                            uint32_t a00 = (p00 >> 24) & 0xFFu;
+                            uint32_t a10 = (p10 >> 24) & 0xFFu;
+                            uint32_t a01 = (p01 >> 24) & 0xFFu;
+                            uint32_t a11 = (p11 >> 24) & 0xFFu;
+                            uint64_t sum_a = (uint64_t)a00 * w00 + (uint64_t)a10 * w10 +
+                                             (uint64_t)a01 * w01 + (uint64_t)a11 * w11;
+                            if (sum_a > 0ULL) {
+                                uint64_t sum_pr = (uint64_t)(((p00 >> 16) & 0xFFu) * a00) * w00 +
+                                                  (uint64_t)(((p10 >> 16) & 0xFFu) * a10) * w10 +
+                                                  (uint64_t)(((p01 >> 16) & 0xFFu) * a01) * w01 +
+                                                  (uint64_t)(((p11 >> 16) & 0xFFu) * a11) * w11;
+                                uint64_t sum_pg = (uint64_t)(((p00 >> 8) & 0xFFu) * a00) * w00 +
+                                                  (uint64_t)(((p10 >> 8) & 0xFFu) * a10) * w10 +
+                                                  (uint64_t)(((p01 >> 8) & 0xFFu) * a01) * w01 +
+                                                  (uint64_t)(((p11 >> 8) & 0xFFu) * a11) * w11;
+                                uint64_t sum_pb = (uint64_t)((p00 & 0xFFu) * a00) * w00 +
+                                                  (uint64_t)((p10 & 0xFFu) * a10) * w10 +
+                                                  (uint64_t)((p01 & 0xFFu) * a01) * w01 +
+                                                  (uint64_t)((p11 & 0xFFu) * a11) * w11;
+                                acc_a  += (sum_a  + 32768ULL) >> 16;
+                                acc_pr += (sum_pr + 32768ULL) >> 16;
+                                acc_pg += (sum_pg + 32768ULL) >> 16;
+                                acc_pb += (sum_pb + 32768ULL) >> 16;
+                            }
+                        }
+                    }
+                }
+
+                if (acc_a == 0ULL) continue;
+                uint32_t sa = (uint32_t)((acc_a + (uint64_t)(total_taps >> 1)) / (uint64_t)total_taps);
+                if (sa == 0u) continue;
+
+                uint32_t sr = (uint32_t)((acc_pr + (acc_a >> 1)) / acc_a);
+                uint32_t sg = (uint32_t)((acc_pg + (acc_a >> 1)) / acc_a);
+                uint32_t sb = (uint32_t)((acc_pb + (acc_a >> 1)) / acc_a);
+                if (sr > 255u) sr = 255u;
+                if (sg > 255u) sg = 255u;
+                if (sb > 255u) sb = 255u;
+
+                if (sa >= 255u) {
+                    drow[px] = 0xFF000000u | (sr << 16) | (sg << 8) | sb;
+                } else {
+                    blend_pixel_argb(&drow[px], sr, sg, sb, sa);
+                }
+            }
+        }
+        return;
+    }
+
     int64_t fx_init = ((int64_t)(x0 - dst_rect.x) * 2 + 1) * (step_x >> 1) - 32768;
     int64_t fy_cur  = ((int64_t)(y0 - dst_rect.y) * 2 + 1) * (step_y >> 1) - 32768;
-    int64_t max_fx  = (int64_t)(src_w - 1) << 16;
-    int64_t max_fy  = (int64_t)(src_h - 1) << 16;
 
     for (int32_t py = y0; py < y1; ++py, fy_cur += step_y) {
         int64_t fy_clamped = (fy_cur < 0) ? 0 : ((fy_cur > max_fy) ? max_fy : fy_cur);
@@ -1421,21 +1548,198 @@ void arcr_accel_blit_image_argb(ArcrAccelContext *ctx, uint32_t *dst_argb,
             uint32_t w01 = wx0 * wy1;
             uint32_t w11 = wx1 * wy1;
 
-            uint32_t sa = (((p00 >> 24) & 0xFFu) * w00 + ((p10 >> 24) & 0xFFu) * w10 +
-                           ((p01 >> 24) & 0xFFu) * w01 + ((p11 >> 24) & 0xFFu) * w11 + 32768u) >> 16;
-            if (sa == 0u) continue;
-
-            uint32_t sr = (((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 +
-                           ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11 + 32768u) >> 16;
-            uint32_t sg = (((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 +
-                           ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11 + 32768u) >> 16;
-            uint32_t sb = ((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 +
-                           (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11 + 32768u) >> 16;
-
-            if (sa >= 255u) {
+            if (((p00 & p10 & p01 & p11) & 0xFF000000u) == 0xFF000000u) {
+                uint32_t sr = (((p00 >> 16) & 0xFFu) * w00 + ((p10 >> 16) & 0xFFu) * w10 +
+                               ((p01 >> 16) & 0xFFu) * w01 + ((p11 >> 16) & 0xFFu) * w11 + 32768u) >> 16;
+                uint32_t sg = (((p00 >> 8) & 0xFFu) * w00 + ((p10 >> 8) & 0xFFu) * w10 +
+                               ((p01 >> 8) & 0xFFu) * w01 + ((p11 >> 8) & 0xFFu) * w11 + 32768u) >> 16;
+                uint32_t sb = ((p00 & 0xFFu) * w00 + (p10 & 0xFFu) * w10 +
+                               (p01 & 0xFFu) * w01 + (p11 & 0xFFu) * w11 + 32768u) >> 16;
                 drow[px] = 0xFF000000u | (sr << 16) | (sg << 8) | sb;
             } else {
+                uint32_t a00 = (p00 >> 24) & 0xFFu;
+                uint32_t a10 = (p10 >> 24) & 0xFFu;
+                uint32_t a01 = (p01 >> 24) & 0xFFu;
+                uint32_t a11 = (p11 >> 24) & 0xFFu;
+                uint64_t sum_a = (uint64_t)a00 * w00 + (uint64_t)a10 * w10 +
+                                 (uint64_t)a01 * w01 + (uint64_t)a11 * w11;
+                uint32_t sa = (uint32_t)((sum_a + 32768ULL) >> 16);
+                if (sa == 0u) continue;
+
+                uint64_t sum_pr = (uint64_t)(((p00 >> 16) & 0xFFu) * a00) * w00 +
+                                  (uint64_t)(((p10 >> 16) & 0xFFu) * a10) * w10 +
+                                  (uint64_t)(((p01 >> 16) & 0xFFu) * a01) * w01 +
+                                  (uint64_t)(((p11 >> 16) & 0xFFu) * a11) * w11;
+                uint64_t sum_pg = (uint64_t)(((p00 >> 8) & 0xFFu) * a00) * w00 +
+                                  (uint64_t)(((p10 >> 8) & 0xFFu) * a10) * w10 +
+                                  (uint64_t)(((p01 >> 8) & 0xFFu) * a01) * w01 +
+                                  (uint64_t)(((p11 >> 8) & 0xFFu) * a11) * w11;
+                uint64_t sum_pb = (uint64_t)((p00 & 0xFFu) * a00) * w00 +
+                                  (uint64_t)((p10 & 0xFFu) * a10) * w10 +
+                                  (uint64_t)((p01 & 0xFFu) * a01) * w01 +
+                                  (uint64_t)((p11 & 0xFFu) * a11) * w11;
+
+                uint32_t sr = (uint32_t)((sum_pr + (sum_a >> 1)) / sum_a);
+                uint32_t sg = (uint32_t)((sum_pg + (sum_a >> 1)) / sum_a);
+                uint32_t sb = (uint32_t)((sum_pb + (sum_a >> 1)) / sum_a);
+                if (sr > 255u) sr = 255u;
+                if (sg > 255u) sg = 255u;
+                if (sb > 255u) sb = 255u;
                 blend_pixel_argb(&drow[px], sr, sg, sb, sa);
+            }
+        }
+    }
+}
+
+/* Quarter-wave Q15 (32768 = 1.0) sine LUT for deterministic libm-free CSS gradient angles */
+static const int32_t kSinDegQ15[91] = {
+        0,   572,  1144,  1715,  2286,  2856,  3425,  3993,  4560,  5126,
+     5690,  6252,  6813,  7371,  7927,  8481,  9032,  9580, 10126, 10668,
+    11207, 11743, 12275, 12803, 13328, 13848, 14365, 14876, 15384, 15886,
+    16384, 16877, 17364, 17847, 18324, 18795, 19261, 19720, 20174, 20622,
+    21063, 21498, 21926, 22348, 22763, 23170, 23571, 23965, 24351, 24730,
+    25102, 25466, 25822, 26170, 26510, 26842, 27166, 27482, 27789, 28088,
+    28378, 28660, 28932, 29197, 29452, 29698, 29935, 30163, 30382, 30592,
+    30792, 30983, 31164, 31336, 31499, 31651, 31795, 31928, 32052, 32166,
+    32270, 32365, 32449, 32524, 32588, 32643, 32688, 32723, 32748, 32763,
+    32768
+};
+
+static inline int32_t sin_deg_q15(int32_t deg) {
+    int32_t a = ((deg % 360) + 360) % 360;
+    if (a <= 90)  return  kSinDegQ15[a];
+    if (a <= 180) return  kSinDegQ15[180 - a];
+    if (a <= 270) return -kSinDegQ15[a - 180];
+    return -kSinDegQ15[360 - a];
+}
+
+void arcr_accel_fill_linear_gradient(ArcrAccelContext *ctx, uint32_t *dst_argb,
+                                     int32_t fb_w, int32_t fb_h, int32_t stride_px,
+                                     ArcrRect rect, int32_t radius_px,
+                                     uint32_t start_argb, uint32_t end_argb,
+                                     int32_t angle_deg) {
+    if (!dst_argb || rect.width <= 0 || rect.height <= 0) return;
+
+    if (start_argb == end_argb) {
+        arcr_accel_fill_rounded_rect(ctx, dst_argb, fb_w, fb_h, stride_px,
+                                     rect, radius_px, start_argb);
+        return;
+    }
+
+    uint32_t a0 = (start_argb >> 24) & 0xFFu;
+    uint32_t r0 = (start_argb >> 16) & 0xFFu;
+    uint32_t g0 = (start_argb >> 8)  & 0xFFu;
+    uint32_t b0 =  start_argb        & 0xFFu;
+
+    uint32_t a1 = (end_argb >> 24) & 0xFFu;
+    uint32_t r1 = (end_argb >> 16) & 0xFFu;
+    uint32_t g1 = (end_argb >> 8)  & 0xFFu;
+    uint32_t b1 =  end_argb        & 0xFFu;
+
+    if (a0 == 0u && a1 == 0u) return;
+
+    int32_t x0, y0, x1, y1;
+    if (!clip_rect(fb_w, fb_h, rect, &x0, &y0, &x1, &y1)) return;
+
+    int32_t max_r = ARCR_MIN(rect.width / 2, rect.height / 2);
+    int32_t r     = ARCR_CLAMP(radius_px, 0, max_r);
+
+    /* CSS gradient vector: 0deg = to top (0,-1), 90deg = to right (+1,0), 180deg = to bottom (0,+1) */
+    int64_t dx_q15 = (int64_t)sin_deg_q15(angle_deg);
+    int64_t dy_q15 = -(int64_t)sin_deg_q15(angle_deg + 90);
+
+    int64_t abs_dx    = (dx_q15 < 0LL) ? -dx_q15 : dx_q15;
+    int64_t abs_dy    = (dy_q15 < 0LL) ? -dy_q15 : dy_q15;
+    int64_t half_span = abs_dx * (int64_t)rect.width + abs_dy * (int64_t)rect.height;
+    if (half_span <= 0LL) half_span = 1LL;
+    int64_t denom = 2LL * half_span;
+
+    int32_t core_x0 = rect.x + r;
+    int32_t core_x1 = rect.x + rect.width - r;
+    int32_t core_y0 = rect.y + r;
+    int32_t core_y1 = rect.y + rect.height - r;
+
+    ArcrScanlineFillFn  fill_fn  = get_fill_fn(ctx);
+    ArcrScanlineBlendFn blend_fn = get_blend_fn(ctx);
+    bool is_vertical_only = (dx_q15 == 0LL);
+
+    static const int32_t kBayer2x2[4] = {-3, 1, 3, -1}; /* Subtle anti-banding dither in Q10 */
+
+    for (int32_t py = y0; py < y1; ++py) {
+        uint32_t *row      = dst_argb + (size_t)py * (size_t)stride_px;
+        int64_t   rel_y2   = 2LL * (int64_t)(py - rect.y) + 1LL - (int64_t)rect.height;
+        int64_t   base_prj = rel_y2 * dy_q15 + half_span;
+        bool      in_y_core = (r <= 0) || (py >= core_y0 && py < core_y1);
+
+        /* Fast SIMD scanline path for pure vertical (0deg / 180deg) CSS gradients */
+        if (is_vertical_only) {
+            int64_t p_clamped = ARCR_CLAMP(base_prj, 0LL, denom);
+            uint32_t t = (uint32_t)((p_clamped * 1024LL + (denom >> 1)) / denom);
+            uint32_t inv_t = 1024u - t;
+            uint32_t ca = (a0 * inv_t + a1 * t + 512u) >> 10;
+            uint32_t cr = (r0 * inv_t + r1 * t + 512u) >> 10;
+            uint32_t cg = (g0 * inv_t + g1 * t + 512u) >> 10;
+            uint32_t cb = (b0 * inv_t + b1 * t + 512u) >> 10;
+            uint32_t row_argb = (ca << 24) | (cr << 16) | (cg << 8) | cb;
+
+            if (in_y_core) {
+                size_t span = (size_t)(x1 - x0);
+                if (ca == 255u) fill_fn(row + x0, span, row_argb);
+                else if (ca > 0u) blend_fn(row + x0, span, row_argb);
+                continue;
+            }
+
+            int32_t mid_x0 = ARCR_MAX(x0, core_x0);
+            int32_t mid_x1 = ARCR_MIN(x1, core_x1);
+            if (mid_x0 < mid_x1 && ca > 0u) {
+                size_t span = (size_t)(mid_x1 - mid_x0);
+                if (ca == 255u) fill_fn(row + mid_x0, span, row_argb);
+                else blend_fn(row + mid_x0, span, row_argb);
+            }
+        }
+
+        int64_t rel_x2_cur = 2LL * (int64_t)(x0 - rect.x) + 1LL - (int64_t)rect.width;
+        int64_t proj_cur   = base_prj + rel_x2_cur * dx_q15;
+        int64_t step_proj  = 2LL * dx_q15;
+
+        for (int32_t px = x0; px < x1; ++px, proj_cur += step_proj) {
+            if (is_vertical_only && !in_y_core && px >= core_x0 && px < core_x1) {
+                continue; /* Already filled by SIMD center span above */
+            }
+
+            uint32_t cov = 255u;
+            if (!in_y_core && (px < core_x0 || px >= core_x1)) {
+                uint32_t hits = 0u;
+                for (int32_t sy = 1; sy <= 7; sy += 2) {
+                    int64_t sy8 = (int64_t)py * 8LL + sy;
+                    for (int32_t sx = 1; sx <= 7; sx += 2) {
+                        if (subpixel_in_rrect_8x((int64_t)px * 8LL + sx, sy8, rect, r)) {
+                            ++hits;
+                        }
+                    }
+                }
+                if (hits == 0u) continue;
+                cov = (hits * 255u + 8u) >> 4;
+            }
+
+            int64_t p_clamped = ARCR_CLAMP(proj_cur, 0LL, denom);
+            int32_t t_raw = (int32_t)((p_clamped * 1024LL + (denom >> 1)) / denom);
+            int32_t dither = kBayer2x2[((py & 1) << 1) | (px & 1)];
+            uint32_t t = (uint32_t)ARCR_CLAMP(t_raw + dither, 0, 1024);
+            uint32_t inv_t = 1024u - t;
+
+            uint32_t ca = (a0 * inv_t + a1 * t + 512u) >> 10;
+            uint32_t sa = (cov == 255u) ? ca : div255_exact(ca * cov);
+            if (sa == 0u) continue;
+
+            uint32_t cr = (r0 * inv_t + r1 * t + 512u) >> 10;
+            uint32_t cg = (g0 * inv_t + g1 * t + 512u) >> 10;
+            uint32_t cb = (b0 * inv_t + b1 * t + 512u) >> 10;
+
+            if (sa >= 255u) {
+                row[px] = 0xFF000000u | (cr << 16) | (cg << 8) | cb;
+            } else {
+                blend_pixel_argb(&row[px], cr, cg, cb, sa);
             }
         }
     }

@@ -147,7 +147,7 @@ DEB_ARCH="${DEB_ARCH:-amd64}"
 
 cat > "${STAGE_DIR}/DEBIAN/control" <<EOF
 Package: waterscape
-Version: 1.0.0
+Version: 2.0.0
 Section: web
 Priority: optional
 Architecture: ${DEB_ARCH}
@@ -155,10 +155,10 @@ Installed-Size: ${INSTALLED_KB}
 Maintainer: Arcradient Project <maintainers@arcradient.org>
 Homepage: https://arcradient.org
 Depends: libc6, libfreetype6, libpng16-16, libssl3 | libssl1.1, libx11-6, libxext6
-Description: Waterscape lightweight hardware-accelerated Pure C11 web browser
- Waterscape 1.0 is a clean-room, zero-telemetry web browser powered by the
- Arcradient (MSHTML-Next) Pure C11 engine with on-demand dynamic modules,
- native Korean/CJK line-breaking rules, and multi-core SIMD tile rendering.
+Description: Waterscape 2.0 hardware-accelerated Pure C11 modern web browser
+ Waterscape 2.0 is a lightweight modern 2026 web browser powered by the
+ Arcradient (MSHTML-Next) Pure C11 engine with QuickJS-NG ES2026, Brotli/WebP/SVG,
+ Tailwind v4/oklch/60FPS CSS animations, anti-aliased CJK typography, and multi-core SIMD tiles.
 EOF
 chmod 0644 "${STAGE_DIR}/DEBIAN/control"
 

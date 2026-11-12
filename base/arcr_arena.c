@@ -27,20 +27,27 @@ void *arcr_arena_alloc(ArcrArena *arena, size_t size, size_t align) {
 
     ArcrArenaBlock *blk = arena->head;
     if (blk) {
-        uintptr_t base    = (uintptr_t)blk->data;
-        uintptr_t cur     = base + blk->used;
+        uintptr_t base   = (uintptr_t)blk->data;
+        uintptr_t cur    = base + blk->used;
         uintptr_t aligned = align_up_uintptr(cur, align);
-        size_t    new_used = (size_t)(aligned - base) + size;
-        if (new_used <= blk->capacity) {
+        size_t    pad_off = (size_t)(aligned - base);
+        if (pad_off <= blk->capacity && size <= blk->capacity - pad_off) {
+            size_t new_used = pad_off + size;
             arena->total_used += (new_used - blk->used);
             blk->used = new_used;
             return (void *)aligned;
         }
     }
 
+    if (size > SIZE_MAX - align - sizeof(ArcrArenaBlock)) {
+        return NULL;
+    }
     size_t cap = arena->default_block_size;
     if (size + align > cap) {
         cap = size + align;
+    }
+    if (cap > SIZE_MAX - sizeof(ArcrArenaBlock)) {
+        return NULL;
     }
     ArcrArenaBlock *new_blk = (ArcrArenaBlock *)malloc(sizeof(ArcrArenaBlock) + cap);
     if (!new_blk) return NULL;
@@ -69,7 +76,7 @@ void *arcr_arena_calloc(ArcrArena *arena, size_t count, size_t elem_size, size_t
 }
 
 char *arcr_arena_strdup(ArcrArena *arena, const char *str, size_t len) {
-    if (!arena) return NULL;
+    if (!arena || len == SIZE_MAX) return NULL;
     char *copy = (char *)arcr_arena_alloc(arena, len + 1u, 1u);
     if (!copy) return NULL;
     if (str && len > 0u) {
@@ -80,7 +87,12 @@ char *arcr_arena_strdup(ArcrArena *arena, const char *str, size_t len) {
 }
 
 void arcr_arena_reset(ArcrArena *arena) {
-    if (!arena || !arena->head) return;
+    if (!arena) return;
+    if (!arena->head) {
+        arena->total_allocated = 0u;
+        arena->total_used      = 0u;
+        return;
+    }
     /* Free all blocks except the head block so quick reuse avoids malloc */
     ArcrArenaBlock *keep = arena->head;
     ArcrArenaBlock *curr = keep->next;

@@ -1,5 +1,5 @@
 /*
- * Waterscape Browser / Arcradient Engine (MSHTML-Next)
+ * Waterscape Browser 2.0 / Arcradient Engine (MSHTML-Next)
  * include/arcradient_embed.h - Public Pure C Engine Embedding API
  *
  * Strictly decouples Waterscape Browser Shell (and external host apps)
@@ -16,8 +16,8 @@
 extern "C" {
 #endif
 
-#define WATERSCAPE_VERSION_STR "1.0.0"
-#define ARCRADIENT_VERSION_STR "1.0.0"
+#define WATERSCAPE_VERSION_STR "2.0.0"
+#define ARCRADIENT_VERSION_STR "2.0.0"
 
 typedef struct ArcrEngine  ArcrEngine;
 typedef struct ArcrWebView ArcrWebView;
@@ -49,16 +49,24 @@ typedef enum ArcrCursorKind {
 } ArcrCursorKind;
 
 typedef enum ArcrSpecialKey {
-    ARCR_KEY_NONE      = 0,
-    ARCR_KEY_BACKSPACE = 1,
-    ARCR_KEY_DELETE    = 2,
-    ARCR_KEY_ENTER     = 3,
-    ARCR_KEY_TAB       = 4,
-    ARCR_KEY_LEFT      = 5,
-    ARCR_KEY_RIGHT     = 6,
-    ARCR_KEY_HOME      = 7,
-    ARCR_KEY_END       = 8,
-    ARCR_KEY_ESCAPE    = 9
+    ARCR_KEY_NONE       = 0,
+    ARCR_KEY_BACKSPACE  = 1,
+    ARCR_KEY_DELETE     = 2,
+    ARCR_KEY_ENTER      = 3,
+    ARCR_KEY_TAB        = 4,
+    ARCR_KEY_LEFT       = 5,
+    ARCR_KEY_RIGHT      = 6,
+    ARCR_KEY_HOME       = 7,
+    ARCR_KEY_END        = 8,
+    ARCR_KEY_ESCAPE     = 9,
+    ARCR_KEY_UP         = 10,
+    ARCR_KEY_DOWN       = 11,
+    ARCR_KEY_PAGE_UP    = 12,
+    ARCR_KEY_PAGE_DOWN  = 13,
+    ARCR_KEY_SELECT_ALL = 14,
+    ARCR_KEY_COPY       = 15,
+    ARCR_KEY_CUT        = 16,
+    ARCR_KEY_PASTE      = 17
 } ArcrSpecialKey;
 
 typedef struct ArcrRect {
@@ -131,6 +139,7 @@ const char *arcr_engine_gpu_backend_summary(const ArcrEngine *engine);
 ArcrWebView *arcr_webview_create(ArcrEngine *engine, int32_t width, int32_t height,
                                  const ArcrWebViewCallbacks *callbacks);
 void         arcr_webview_destroy(ArcrWebView *view);
+void         arcr_webview_set_callbacks(ArcrWebView *view, const ArcrWebViewCallbacks *callbacks);
 void         arcr_webview_resize(ArcrWebView *view, int32_t width, int32_t height);
 void         arcr_webview_set_scroll(ArcrWebView *view, int32_t scroll_y);
 int32_t      arcr_webview_get_scroll(const ArcrWebView *view);
@@ -143,6 +152,21 @@ bool arcr_webview_load_html(ArcrWebView *view, const char *base_url,
 bool arcr_webview_navigate_url(ArcrWebView *view, const char *utf8_url);
 bool arcr_webview_post_url(ArcrWebView *view, const char *utf8_url,
                            const char *form_urlencoded_body, size_t body_len);
+
+/* Multi-core Non-Blocking Async Navigation, Animation Tick & Inspection */
+bool    arcr_webview_navigate_async(ArcrWebView *view, const char *utf8_url);
+bool    arcr_webview_post_async(ArcrWebView *view, const char *utf8_url,
+                                const char *form_urlencoded_body, size_t body_len);
+void    arcr_webview_stop_loading(ArcrWebView *view);
+bool    arcr_webview_is_loading(const ArcrWebView *view);
+int32_t arcr_webview_get_load_progress(const ArcrWebView *view);
+bool    arcr_webview_tick(ArcrWebView *view, uint64_t now_usec);
+bool    arcr_webview_has_active_animations(const ArcrWebView *view);
+const char *arcr_webview_get_html_source(const ArcrWebView *view, size_t *out_len);
+void    arcr_webview_query_context_at(const ArcrWebView *view, int32_t x, int32_t y,
+                                      char *out_link_url, size_t link_cap,
+                                      char *out_media_url, size_t media_cap,
+                                      bool *out_is_editable);
 
 /* Extension / Reader / DevTools live injection */
 bool arcr_webview_inject_user_css(ArcrWebView *view, const char *utf8_css, size_t css_len);

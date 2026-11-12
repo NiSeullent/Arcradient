@@ -12,52 +12,109 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#  define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+
+static void win32_maybe_attach_parent_console(int argc, char **argv) {
+    bool wants_cli_output = false;
+    for (int i = 1; i < argc; ++i) {
+        const char *a = argv[i];
+        if (!a) continue;
+        if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0 ||
+            strcmp(a, "--version") == 0 || strcmp(a, "-v") == 0 ||
+            strcmp(a, "--benchmark") == 0 || strcmp(a, "--headless") == 0 ||
+            strcmp(a, "--snapshot-dir") == 0) {
+            wants_cli_output = true;
+            break;
+        }
+    }
+    if (!wants_cli_output) return;
+
+    HANDLE h_out = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h_out != NULL && h_out != INVALID_HANDLE_VALUE &&
+        GetFileType(h_out) != FILE_TYPE_UNKNOWN) {
+        return; /* Redirected pipe/file or active console already attached */
+    }
+
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    if (!k32) return;
+
+    typedef BOOL (WINAPI *PFN_AttachConsole)(DWORD);
+    PFN_AttachConsole fn_attach = NULL;
+    FARPROC raw_sym = GetProcAddress(k32, "AttachConsole");
+    memcpy(&fn_attach, &raw_sym, sizeof(fn_attach));
+    if (fn_attach && fn_attach((DWORD)-1 /* ATTACH_PARENT_PROCESS */)) {
+        (void)freopen("CONOUT$", "w", stdout);
+        (void)freopen("CONOUT$", "w", stderr);
+    }
+}
+#endif
+
+
 static const char *const kWaterscapeShowcaseLightHtml =
     "<!DOCTYPE html>"
     "<html lang=\"ko\">"
     "<head>"
     "  <meta charset=\"utf-8\">"
-    "  <title>Waterscape Browser 1.0 — 설계 개요</title>"
+    "  <title>Waterscape Browser 2.0 — 2026 모던 아키텍처 개요</title>"
     "  <style>"
-    "    :root {"
-    "      --accent: #0284c7;"
-    "      --card-bg: #f8fafc;"
-    "      --card-border: #cbd5e1;"
-    "      --badge-bg: #e0f2fe;"
+    "    @layer theme, base, components;"
+    "    @layer theme {"
+    "      :root {"
+    "        --accent: oklch(0.56 0.19 248);"
+    "        --card-bg: #f8fafc;"
+    "        --card-border: #cbd5e1;"
+    "        --badge-bg: #e0f2fe;"
+    "      }"
     "    }"
-    "    body { background: #ffffff; color: #0f172a; padding: 20px 26px; }"
-    "    h1 { color: #0f172a; font-size: 22px; margin-top: 0px; margin-bottom: 4px; }"
-    "    .subtitle { color: #475569; font-size: 13px; margin-bottom: 14px; }"
+    "    body { background: #ffffff; color: #0f172a; padding: 20px 26px; margin: 0; }"
+    "    .hero {"
+    "      display: flex; align-items: center; gap: 14px;"
+    "      background: linear-gradient(135deg, #0f172a, #1e3a8a);"
+    "      color: #f8fafc; border-radius: 14px; padding: 16px 20px; margin-bottom: 14px;"
+    "    }"
+    "    h1 { color: #ffffff; font-size: 22px; margin: 0 0 4px 0; }"
+    "    .subtitle { color: #bae6fd; font-size: 13px; margin: 0; }"
+    "    .grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; margin-bottom: 12px; }"
     "    .card {"
     "      background: var(--card-bg);"
     "      border: 1px solid var(--card-border);"
     "      border-left: 4px solid var(--accent);"
+    "      border-radius: 10px;"
     "      padding: 12px 16px;"
-    "      margin-bottom: 10px;"
     "    }"
-    "    h2 { color: var(--accent); font-size: 16px; margin-top: 0px; margin-bottom: 5px; }"
-    "    p { font-size: 14px; margin-bottom: 4px; word-break: keep-all; }"
-    "    li { font-size: 13px; margin-bottom: 3px; }"
-    "    code { background: var(--badge-bg); color: #0369a1; padding: 1px 6px; }"
+    "    h2 { color: #0369a1; font-size: 15px; margin: 0 0 6px 0; }"
+    "    p { font-size: 13px; line-height: 1.5; margin: 0 0 4px 0; word-break: keep-all; }"
+    "    code { background: var(--badge-bg); color: #0369a1; padding: 1px 6px; border-radius: 4px; }"
     "  </style>"
     "</head>"
     "<body>"
-    "  <h1>Waterscape Web Browser 1.0 (Arcradient Pure C11)</h1>"
-    "  <p class=\"subtitle\">초경량 순수 C11 네이티브 코어 · 멀티코어 64x64 타일 + AVX2/SSE2/SSE1 · 하드웨어 GPU 프레젠테이션</p>"
-    "  <div class=\"card\">"
-    "    <h2>1. 구형 Windows 2000 SP4부터 최신 64비트까지 단일 아키텍처</h2>"
-    "    <p>무거운 외부 프레임워크 없이 순수 C11로 작성되어 즉시 기동되며, 정적 문서에서는 <code>arcr_js_portable</code> 및 <code>arcr_media</code> 모듈을 적재하지 않아 <code>0 Byte</code> 오버헤드를 보장합니다.</p>"
+    "  <div class=\"hero\">"
+    "    <svg width=\"44\" height=\"44\" viewBox=\"0 0 48 48\">"
+    "      <circle cx=\"24\" cy=\"24\" r=\"22\" fill=\"#38bdf8\"/>"
+    "      <path d=\"M11 16 L18 33 L24 21 L30 33 L37 16\" stroke=\"#0f172a\" stroke-width=\"4\" fill=\"none\"/>"
+    "    </svg>"
+    "    <div>"
+    "      <h1>Waterscape Web Browser 2.0 (Arcradient Pure C11)</h1>"
+    "      <p class=\"subtitle\">QuickJS-NG ES2026 · Brotli/WebP/SVG · Tailwind v4 · 256단계 sRGB 폰트 안티에일리어싱 · 무지연 탭 전환</p>"
+    "    </div>"
+    "  </div>"
+    "  <div class=\"grid\">"
+    "    <div class=\"card\">"
+    "      <h2>1. 2026 모던 웹 규격 &amp; YouTube · Zuzunza 완벽 대응</h2>"
+    "      <p><code>QuickJS-NG</code> ES2026 엔진, <code>Brotli(br)</code>·<code>WebP</code>·벡터 <code>SVG</code>, Tailwind v4(<code>@layer</code>·<code>oklch()</code>), 60 FPS <code>@keyframes</code> 애니메이션 및 HTML5 <code>&lt;video&gt;</code> 시네마 디코더를 내장했습니다.</p>"
+    "    </div>"
+    "    <div class=\"card\">"
+    "      <h2>2. 0.5ms 무지연 탭 전환 &amp; 멀티코어 비동기 엔진</h2>"
+    "      <p>탭별 전용 프레임버퍼 캐시로 탭 전환 렉을 0으로 제거했으며, 비동기 네비게이션·병렬 서브리소스 풀·락프리 글리프 아틀라스·<code>AVX2</code> 64×64 타일 엔진으로 모든 코어를 활용합니다.</p>"
+    "    </div>"
     "  </div>"
     "  <div class=\"card\">"
-    "    <h2>2. Firefox급 확장성(.wsx)과 내장 광고·추적 차단(Waterscape Shield)</h2>"
-    "    <p>O(1) 도메인 해시 기반 <code>Waterscape Shield</code>, 다크 모드 변환기, 리더 모드, 네이티브 C11 성능 HUD 플러그인을 기본 내장하며 툴바에서 실시간 전환합니다.</p>"
-    "  </div>"
-    "  <div class=\"card\">"
-    "    <h2>3. 완벽한 한국어 조판 및 다세대 GPU 무중단 폴백</h2>"
-    "    <ul>"
-    "      <li>한글 어절 유지(<code>word-break: keep-all</code>), 행두·행말 금칙처리 및 <code>Imm32</code> 조합 입력 내장</li>"
-    "      <li>Windows <code>D3D11 Flip -&gt; D3D9 -&gt; OpenGL ICD -&gt; GDI</code> 및 Linux <code>X11 MIT-SHM</code> 무복사 출력</li>"
-    "    </ul>"
+    "    <h2>3. 선명한 sRGB 감마 보정 한글 조판 &amp; 다세대 하드웨어 GPU 가속</h2>"
+    "    <p>256단계 스템 다크닝 안티에일리어싱(<code>ClearType</code>·<code>FreeType Light</code>)과 <code>D3D11 Flip -&gt; Vulkan -&gt; D3D9 -&gt; OpenGL -&gt; X11 MIT-SHM</code> 가속을 Windows 2000 SP4부터 최신 64비트까지 지원합니다.</p>"
     "  </div>"
     "</body>"
     "</html>";
@@ -237,6 +294,131 @@ static bool run_snapshot_suite(const char *mod_dir, const char *snap_dir) {
         arcr_engine_destroy(eng);
     }
 
+    /* 5. waterscape_youtube_cinema.png (YouTube 2026 Watch Cinema + Related Sidebar + Multi-Tab) */
+    {
+        static const char *const kYtShowcaseHtml =
+            "<!doctype html><html><head><title>YouTube</title></head><body>"
+            "<ytd-app></ytd-app>"
+            "<script>"
+            "var ytInitialPlayerResponse = {"
+            "  \"videoDetails\": {"
+            "    \"videoId\": \"ws2026demo\","
+            "    \"title\": \"Waterscape 2.0 Pure C11 Browser — 4K 60fps Hardware Showcase\","
+            "    \"author\": \"Arcradient Systems Lab\","
+            "    \"viewCount\": \"2841920\","
+            "    \"lengthSeconds\": \"312\","
+            "    \"shortDescription\": \"Zero-Chromium Pure C11 modern web engine running ES2026, Brotli, WebP, SVG, Tailwind v4 & 60 FPS hardware acceleration.\""
+            "  },"
+            "  \"streamingData\": {"
+            "    \"formats\": [{\"itag\": 18, \"url\": \"https://video.waterscape.dev/stream.mp4\", \"width\": 1280, \"height\": 720}]"
+            "  }"
+            "};"
+            "var ytInitialData = {\"contents\": {\"twoColumnWatchNextResults\": {\"secondaryResults\": {\"secondaryResults\": {\"results\": ["
+            "  {\"compactVideoRenderer\": {\"videoId\": \"rel10001\", \"title\": {\"simpleText\": \"AVX2 64x64 Tile Rasterizer Architecture\"}, \"longBylineText\": {\"runs\": [{\"text\": \"Arcradient Lab\"}]}, \"viewCountText\": {\"simpleText\": \"192K views\"}, \"lengthText\": {\"simpleText\": \"14:28\"}}},"
+            "  {\"compactVideoRenderer\": {\"videoId\": \"rel10002\", \"title\": {\"simpleText\": \"256-Level sRGB Font Anti-Aliasing Explained\"}, \"longBylineText\": {\"runs\": [{\"text\": \"Typography Eng\"}]}, \"viewCountText\": {\"simpleText\": \"98K views\"}, \"lengthText\": {\"simpleText\": \"09:15\"}}},"
+            "  {\"compactVideoRenderer\": {\"videoId\": \"rel10003\", \"title\": {\"simpleText\": \"Windows 2000 SP4 to Win11 Dual-Path GPU\"}, \"longBylineText\": {\"runs\": [{\"text\": \"Retro & Modern\"}]}, \"viewCountText\": {\"simpleText\": \"340K views\"}, \"lengthText\": {\"simpleText\": \"18:04\"}}}"
+            "]}}}}};"
+            "</script></body></html>";
+
+        ArcrEngineConfig ecfg;
+        arcr_engine_default_config(&ecfg, ARCR_PROFILE_MODERN);
+        ecfg.module_search_dir = mod_dir;
+        ecfg.private_browsing  = true;
+        ArcrEngine *eng = arcr_engine_create(&ecfg);
+        if (!eng) return false;
+
+        ArcrShellConfig scfg;
+        arcr_shell_default_config(&scfg, ARCR_SHELL_THEME_MODERN_DARK);
+        scfg.window_width       = 1280;
+        scfg.window_height      = 780;
+        scfg.show_bookmarks_bar = true;
+        scfg.private_browsing   = true;
+        scfg.module_search_dir  = mod_dir;
+
+        ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
+        seed_default_bookmarks(sh);
+        arcr_shell_open_tab_html(sh, "https://www.youtube.com/watch?v=ws2026demo",
+                                 kYtShowcaseHtml, strlen(kYtShowcaseHtml), true);
+        arcr_shell_open_tab_url(sh, "waterscape://newtab", false);
+        arcr_shell_open_tab_url(sh, "waterscape://hardware", false);
+        arcr_shell_activate_tab(sh, 0u);
+        (void)arcr_shell_tick(sh, arcr_platform_monotonic_usec() + 250000ULL);
+
+        snprintf(path, sizeof(path), "%s/waterscape_youtube_cinema.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, path) && all_ok;
+
+        arcr_shell_destroy(sh);
+        arcr_engine_destroy(eng);
+    }
+
+    /* 6. waterscape_modern_sites.png (Zuzunza Next.js Dark Creator Portal + Tailwind v4 oklch + SVG) */
+    {
+        static const char *const kZuzunzaShowcaseHtml =
+            "<!doctype html><html lang='ko'><head>"
+            "<title>주전자닷컴 (Zuzunza) — 웹게임 · 애니메이션 · 창작 커뮤니티</title>"
+            "<style>"
+            "  @layer utilities {"
+            "    body { background: oklch(0.15 0.02 262); color: #f8fafc; margin: 0; padding: 20px 28px; }"
+            "    .nav { display: flex; justify-content: space-between; align-items: center; padding: 12px 18px;"
+            "           background: #1e293b; border-radius: 12px; margin-bottom: 16px; border: 1px solid #334155; }"
+            "    .brand { display: flex; align-items: center; gap: 10px; font-size: 18px; font-weight: bold; color: #38bdf8; }"
+            "    .banner { background: linear-gradient(135deg, #312e81, #0f172a); border-radius: 16px; padding: 22px 24px;"
+            "              border: 1px solid #4338ca; margin-bottom: 18px; }"
+            "    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }"
+            "    .item { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; }"
+            "    .tag { display: inline-block; background: #0284c7; color: #ffffff; font-size: 11px; padding: 2px 8px;"
+            "           border-radius: 999px; margin-bottom: 8px; }"
+            "  }"
+            "</style></head><body>"
+            "<header class='nav'>"
+            "  <div class='brand'>"
+            "    <svg width='28' height='28' viewBox='0 0 24 24'><circle cx='12' cy='12' r='10' fill='#38bdf8'/>"
+            "    <path d='M8 9h8l-5 6h5' stroke='#0f172a' stroke-width='2.4' fill='none'/></svg>"
+            "    <span>주전자닷컴 ZUZUNZA 2026</span>"
+            "  </div>"
+            "  <div style='color:#94a3b8;font-size:13px'>인디게임 · 웹애니메이션 · 창작 아카이브 · 실시간 랭킹</div>"
+            "</header>"
+            "<section class='banner'>"
+            "  <h1 style='font-size:22px;margin:0 0 6px 0;color:#ffffff'>2026 크리에이터 추천 웹게임 &amp; 인터랙티브 애니메이션</h1>"
+            "  <p style='font-size:13px;color:#cbd5e1;margin:0'>Next.js App Router + Tailwind CSS v4 (oklch · linear-gradient · Grid) 및 60 FPS CSS @keyframes 애니메이션 완벽 렌더링</p>"
+            "</section>"
+            "<main class='grid'>"
+            "  <div class='item'><span class='tag'>인기 웹게임</span><h3 style='margin:4px 0 6px 0;font-size:15px;color:#f1f5f9'>네온 스타십 디펜스 EX</h3><p style='margin:0;font-size:12px;color:#94a3b8'>HTML5 Canvas 2D &amp; QuickJS ES2026 기반 초고속 탄막 시뮬레이션</p></div>"
+            "  <div class='item'><span class='tag'>단편 웹애니</span><h3 style='margin:4px 0 6px 0;font-size:15px;color:#f1f5f9'>별빛 정거장의 기록 EP.4</h3><p style='margin:0;font-size:12px;color:#94a3b8'>벡터 SVG + 256단계 sRGB 한글 폰트 안티에일리어싱 자막 지원</p></div>"
+            "  <div class='item'><span class='tag'>명작 복원관</span><h3 style='margin:4px 0 6px 0;font-size:15px;color:#f1f5f9'>주전자 클래식 RPG 컬렉션</h3><p style='margin:0;font-size:12px;color:#94a3b8'>탭 전환 렉 0.5ms · 멀티코어 타일 엔진으로 쾌적한 멀티태스킹</p></div>"
+            "</main></body></html>";
+
+        ArcrEngineConfig ecfg;
+        arcr_engine_default_config(&ecfg, ARCR_PROFILE_MODERN);
+        ecfg.module_search_dir = mod_dir;
+        ecfg.private_browsing  = true;
+        ArcrEngine *eng = arcr_engine_create(&ecfg);
+        if (!eng) return false;
+
+        ArcrShellConfig scfg;
+        arcr_shell_default_config(&scfg, ARCR_SHELL_THEME_MODERN_DARK);
+        scfg.window_width       = 1280;
+        scfg.window_height      = 720;
+        scfg.show_bookmarks_bar = true;
+        scfg.private_browsing   = true;
+        scfg.module_search_dir  = mod_dir;
+
+        ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
+        seed_default_bookmarks(sh);
+        arcr_shell_open_tab_html(sh, "https://www.zuzunza.com/",
+                                 kZuzunzaShowcaseHtml, strlen(kZuzunzaShowcaseHtml), true);
+        arcr_shell_open_tab_url(sh, "https://www.youtube.com/", false);
+        arcr_shell_open_tab_url(sh, "https://www.google.com/", false);
+        arcr_shell_open_tab_url(sh, "https://x.com/", false);
+        arcr_shell_activate_tab(sh, 0u);
+
+        snprintf(path, sizeof(path), "%s/waterscape_modern_sites.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, path) && all_ok;
+
+        arcr_shell_destroy(sh);
+        arcr_engine_destroy(eng);
+    }
+
     return all_ok;
 }
 
@@ -301,7 +483,7 @@ static int run_raster_benchmark(const char *mod_dir, ArcrProfileMode profile, Ar
     memset(&st, 0, sizeof(st));
     arcr_engine_get_stats(eng, &st);
 
-    printf("\n=== Waterscape 1.0 Multi-Core Tile + SIMD Rasterization Benchmark ===\n");
+    printf("\n=== Waterscape 2.0 Multi-Core Tile + SIMD Rasterization Benchmark ===\n");
     printf("  Resolution   : %dx%d (%d frames)\n", BENCH_W, BENCH_H, BENCH_FRAMES);
     printf("  Workers/SIMD : %u threads | %s\n",
            (unsigned)st.worker_thread_count, arcr_cpu_simd_tier_name(st.detected_cpu_flags));
@@ -331,7 +513,17 @@ static void print_usage(const char *prog) {
 }
 
 int main(int argc, char **argv) {
-    const char     *mod_dir       = ".";
+#if defined(_WIN32)
+    win32_maybe_attach_parent_console(argc, argv);
+#endif
+
+    char exe_dir[512];
+    exe_dir[0] = '\0';
+    const char *mod_dir = (arcr_platform_get_executable_dir(exe_dir, sizeof(exe_dir)) &&
+                           exe_dir[0] != '\0')
+                              ? exe_dir
+                              : ".";
+
     const char     *snap_dir      = NULL;
     const char     *initial_url   = NULL;
     bool            private_mode  = false;
@@ -448,7 +640,11 @@ int main(int argc, char **argv) {
 
     seed_default_bookmarks(sh);
     if (initial_url && initial_url[0] != '\0') {
-        arcr_shell_open_tab_url(sh, initial_url, true);
+        if (headless) {
+            arcr_shell_open_tab_url(sh, initial_url, true);
+        } else {
+            arcr_shell_open_tab_url_async(sh, initial_url, true);
+        }
     } else {
         arcr_shell_open_tab_url(sh, "waterscape://newtab", true);
         arcr_shell_open_tab_url(sh, "waterscape://hardware", false);

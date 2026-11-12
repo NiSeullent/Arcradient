@@ -1,6 +1,6 @@
 /*
- * Waterscape Browser / Arcradient Engine (MSHTML-Next)
- * layout/arcr_layout.h - Block, Flexbox, CSS Grid, Table, Form & Korean Inline Layout
+ * Waterscape Browser 2.0 / Arcradient Engine (MSHTML-Next)
+ * layout/arcr_layout.h - Block, Flexbox, CSS Grid, Positioned/Sticky, Table, Form & CJK Inline Layout
  */
 #ifndef ARCR_LAYOUT_H
 #define ARCR_LAYOUT_H
@@ -13,10 +13,11 @@
 #include <stdint.h>
 
 typedef enum ArcrControlKind {
-    ARCR_CTRL_NONE       = 0,
-    ARCR_CTRL_TEXT_INPUT = 1,
-    ARCR_CTRL_CHECKBOX   = 2,
-    ARCR_CTRL_BUTTON     = 3
+    ARCR_CTRL_NONE        = 0,
+    ARCR_CTRL_TEXT_INPUT  = 1,
+    ARCR_CTRL_CHECKBOX    = 2,
+    ARCR_CTRL_BUTTON      = 3,
+    ARCR_CTRL_VIDEO_MEDIA = 4
 } ArcrControlKind;
 
 typedef struct ArcrPositionedGlyph {
@@ -28,6 +29,7 @@ typedef struct ArcrPositionedGlyph {
     bool     bold;
     bool     monospace;
     bool     underline;
+    bool     line_through;
     uint32_t color_argb;
 } ArcrPositionedGlyph;
 
@@ -48,8 +50,13 @@ typedef struct ArcrInlineLinkSpan {
 typedef struct ArcrLayoutBox {
     const ArcrDomNode       *dom_node;
     const ArcrComputedStyle *style;
-    ArcrRect                 border_rect;  /* Document-space border box */
+    ArcrRect                 border_rect;  /* Document-space border box (or viewport-space if is_fixed) */
     ArcrRect                 content_rect; /* Document-space content box */
+    ArcrRect                 clip_rect;    /* Active overflow:hidden/auto clip rect when has_clip */
+    bool                     has_clip;
+    bool                     is_fixed;     /* position: fixed (does not scroll with document!) */
+    int32_t                  z_index;
+    uint8_t                  effective_opacity; /* 0..255 */
     bool                     is_list_item;
     int32_t                  list_ordinal; /* 0 = bullet <ul>, >=1 = numbered <ol> */
     bool                     is_hr;
@@ -67,7 +74,7 @@ typedef struct ArcrLayoutBox {
 
 typedef struct ArcrHitTestResult {
     const ArcrDomNode *hit_node;
-    const ArcrDomNode *clickable_ancestor; /* Nearest <a>, <button>, <input> */
+    const ArcrDomNode *clickable_ancestor; /* Nearest <a>, <button>, <input>, <video> */
     const char        *link_href;          /* Non-NULL if over <a href="..."> */
     ArcrCursorKind     cursor;
 } ArcrHitTestResult;
@@ -76,6 +83,7 @@ typedef struct ArcrLayoutTree {
     ArcrArena      arena;
     ArcrLayoutBox *root_box;
     int32_t        viewport_width;
+    int32_t        viewport_height;
     int32_t        zoom_percent;
     int32_t        total_height;
     uint32_t       box_count;
@@ -85,10 +93,16 @@ ArcrLayoutTree *arcr_layout_build(const ArcrDocument *doc, ArcrFontSystem *fonts
                                   int32_t viewport_width);
 ArcrLayoutTree *arcr_layout_build_zoomed(const ArcrDocument *doc, ArcrFontSystem *fonts,
                                          int32_t viewport_width, int32_t zoom_percent);
+ArcrLayoutTree *arcr_layout_build_ex(const ArcrDocument *doc, ArcrFontSystem *fonts,
+                                     int32_t viewport_width, int32_t viewport_height,
+                                     int32_t zoom_percent);
 void            arcr_layout_destroy(ArcrLayoutTree *tree);
 
-/* Spatial hit-test in document coordinates (doc_x = view_x, doc_y = view_y + scroll_y) */
+/* Spatial hit-test in document coordinates (with scroll_y for fixed-element support) */
 void arcr_layout_hit_test(const ArcrLayoutTree *tree, const ArcrDocument *doc,
                           int32_t doc_x, int32_t doc_y, ArcrHitTestResult *out_hit);
+void arcr_layout_hit_test_ex(const ArcrLayoutTree *tree, const ArcrDocument *doc,
+                             int32_t view_x, int32_t view_y, int32_t scroll_y,
+                             ArcrHitTestResult *out_hit);
 
 #endif /* ARCR_LAYOUT_H */

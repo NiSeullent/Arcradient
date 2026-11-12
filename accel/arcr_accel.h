@@ -121,6 +121,12 @@ void arcr_accel_blit_image_argb(ArcrAccelContext *ctx, uint32_t *dst_argb,
                                 const uint32_t *src_argb, int32_t src_w, int32_t src_h,
                                 bool bilinear_smooth);
 
+void arcr_accel_fill_linear_gradient(ArcrAccelContext *ctx, uint32_t *dst_argb,
+                                     int32_t fb_w, int32_t fb_h, int32_t stride_px,
+                                     ArcrRect rect, int32_t radius_px,
+                                     uint32_t start_argb, uint32_t end_argb,
+                                     int32_t angle_deg);
+
 /* Direct exposure of reference vs SIMD kernels for bit-exact verification & benchmarks */
 void arcr_scanline_fill_u32_scalar(uint32_t *dst, size_t count, uint32_t argb);
 void arcr_scanline_fill_u32_avx2(uint32_t *dst, size_t count, uint32_t argb);

@@ -1,8 +1,9 @@
-name: Waterscape 1.0 CI, Cross-Platform Installers & Runtime Verification
+name: Waterscape 2.0 CI, Cross-Platform Installers & Runtime Verification
 
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -25,12 +26,12 @@ jobs:
             ninja-build pkg-config libfreetype-dev libpng-dev libssl-dev \
             libx11-dev libxext-dev xvfb fonts-noto-cjk dpkg-dev
 
-      - name: Configure & Build Waterscape 1.0 (Strict Pure C11)
+      - name: Configure & Build Waterscape 2.0 (Strict Pure C11)
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
-      - name: Run 22-Test Full Verification Suite (CTest)
+      - name: Run Full Verification Suite (CTest)
         run: ctest --test-dir build --output-on-failure -V
 
       - name: Run Multi-Core + AVX2 Browser Rendering Benchmark & Live X11 SHM Window Test
@@ -44,10 +45,10 @@ jobs:
       - name: Build & Verify Linux Installers (.deb + Self-Extracting .run + Uninstaller)
         run: |
           mkdir -p dist-linux
-          bash installer/linux/build_deb.sh ./build dist-linux/waterscape_1.0.0_amd64.deb
-          bash installer/linux/build_run_installer.sh ./build dist-linux/Waterscape-1.0.0-linux-x86_64.run
-          ./dist-linux/Waterscape-1.0.0-linux-x86_64.run --check
-          ./dist-linux/Waterscape-1.0.0-linux-x86_64.run --prefix /tmp/ws-ci-inst --no-xdg --yes
+          bash installer/linux/build_deb.sh ./build dist-linux/waterscape_2.0.0_amd64.deb
+          bash installer/linux/build_run_installer.sh ./build dist-linux/Waterscape-2.0.0-linux-x86_64.run
+          ./dist-linux/Waterscape-2.0.0-linux-x86_64.run --check
+          ./dist-linux/Waterscape-2.0.0-linux-x86_64.run --prefix /tmp/ws-ci-inst --no-xdg --yes
           /tmp/ws-ci-inst/bin/waterscape --headless
           /tmp/ws-ci-inst/uninstall.sh
           test ! -e /tmp/ws-ci-inst/bin/waterscape
@@ -78,7 +79,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ninja-build gcc-mingw-w64-i686 binutils-mingw-w64-i686
 
-      - name: Cross-Build Waterscape 1.0 + SFX Installer (Win2000 x86 SSE1)
+      - name: Cross-Build Waterscape 2.0 + SFX Installer (Win2000 x86 SSE1)
         run: |
           cmake -B build-win2k -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -93,7 +94,7 @@ jobs:
           i686-w64-mingw32-objdump -p build-win2k/WaterscapeSetup.exe | grep -q "MajorSubsystemVersion.*5"
           ! i686-w64-mingw32-objdump -p build-win2k/waterscape.exe build-win2k/WaterscapeSetup.exe build-win2k/uninstall.exe build-win2k/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread|vcruntime|api-ms-win)"
           mkdir -p dist-win2k/addons
-          cp build-win2k/WaterscapeSetup.exe dist-win2k/WaterscapeSetup-1.0.0-win2000-x86.exe
+          cp build-win2k/WaterscapeSetup.exe dist-win2k/WaterscapeSetup-2.0.0-win2000-x86.exe
           cp build-win2k/*.exe build-win2k/*.dll dist-win2k/
           cp build-win2k/addons/*.wsx dist-win2k/addons/
           ls -lh dist-win2k/ dist-win2k/addons/
@@ -117,7 +118,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ninja-build gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 
-      - name: Cross-Build Waterscape 1.0 + SFX Installer (Windows x64)
+      - name: Cross-Build Waterscape 2.0 + SFX Installer (Windows x64)
         run: |
           cmake -B build-win64 -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -129,7 +130,7 @@ jobs:
           x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe | grep -E "DLL Name:"
           ! x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe build-win64/WaterscapeSetup.exe build-win64/uninstall.exe build-win64/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread)"
           mkdir -p dist-win64/addons
-          cp build-win64/WaterscapeSetup.exe dist-win64/WaterscapeSetup-1.0.0-x64.exe
+          cp build-win64/WaterscapeSetup.exe dist-win64/WaterscapeSetup-2.0.0-x64.exe
           cp build-win64/*.exe build-win64/*.dll dist-win64/
           cp build-win64/addons/*.wsx dist-win64/addons/
           ls -lh dist-win64/ dist-win64/addons/
@@ -141,7 +142,7 @@ jobs:
           path: dist-win64/**
 
   windows-runtime-verify:
-    name: Windows Native Execution (22-Test Suite + SFX Setup & Uninstall)
+    name: Windows Native Execution (Full Test Suite + SFX Setup & Uninstall)
     runs-on: windows-latest
     needs: [win2000-x86-sse1, win-x64-sse3]
     steps:
@@ -163,12 +164,12 @@ jobs:
           Push-Location run-win2k
           ./arcr_tests.exe .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./WaterscapeSetup-1.0.0-win2000-x86.exe --verify-stub
+          ./WaterscapeSetup-2.0.0-win2000-x86.exe --verify-stub
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $inst32 = Join-Path $env:RUNNER_TEMP "ws_inst_x86"
-          ./WaterscapeSetup-1.0.0-win2000-x86.exe --silent --dir "$inst32" --no-shortcuts --no-registry
+          ./WaterscapeSetup-2.0.0-win2000-x86.exe --silent --dir "$inst32" --no-shortcuts --no-registry
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$inst32\waterscape.exe" --module-dir "$inst32" --headless
+          & "$inst32\waterscape.exe" --module-dir "$inst32" --headless | Out-Host
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$inst32\uninstall.exe" --silent --dir "$inst32"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -180,15 +181,80 @@ jobs:
           Push-Location run-win64
           ./arcr_tests.exe .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./waterscape.exe --module-dir . --benchmark
+          ./arcradient.exe --module-dir . --benchmark
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./WaterscapeSetup-1.0.0-x64.exe --verify-stub
+          ./WaterscapeSetup-2.0.0-x64.exe --verify-stub
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $inst64 = Join-Path $env:RUNNER_TEMP "ws_inst_x64"
-          ./WaterscapeSetup-1.0.0-x64.exe --silent --dir "$inst64" --no-shortcuts --no-registry
+          ./WaterscapeSetup-2.0.0-x64.exe --silent --dir "$inst64" --no-shortcuts --no-registry
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$inst64\waterscape.exe" --module-dir "$inst64" --headless
+          & "$inst64\waterscape.exe" --module-dir "$inst64" --headless | Out-Host
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$inst64\uninstall.exe" --silent --dir "$inst64"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
+
+  publish-release:
+    name: Publish GitHub Release Installers (Windows x86/x64 & Linux .deb/.run)
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [linux-c11, win2000-x86-sse1, win-x64-sse3, windows-runtime-verify]
+    permissions:
+      contents: write
+    steps:
+      - name: Download Verified Linux Installers
+        uses: actions/download-artifact@v4
+        with:
+          name: waterscape-linux-x64-installers
+          path: dl-linux
+
+      - name: Download Verified Windows 2000 x86 Build
+        uses: actions/download-artifact@v4
+        with:
+          name: waterscape-win2000-x86-sse1
+          path: dl-win2k
+
+      - name: Download Verified Windows x64 Build
+        uses: actions/download-artifact@v4
+        with:
+          name: waterscape-win-x64-sse3
+          path: dl-win64
+
+      - name: Generate SHA256SUMS.txt & Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p release-assets
+          cp dl-linux/waterscape_*_amd64.deb dl-linux/Waterscape-*-linux-x86_64.run release-assets/
+          cp dl-win2k/WaterscapeSetup-*-win2000-x86.exe release-assets/
+          cp dl-win64/WaterscapeSetup-*-x64.exe release-assets/
+          cd release-assets
+          sha256sum WaterscapeSetup-*-x64.exe WaterscapeSetup-*-win2000-x86.exe waterscape_*_amd64.deb Waterscape-*-linux-x86_64.run > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          cat <<'EOF' > ../RELEASE_NOTES.md
+          # Waterscape Browser 2.0.0 (`Arcradient` / `MSHTML-Next` Pure C11 Modern Web Engine)
+
+          **Waterscape 2.0**은 **Windows 2000 SP4 (`PE 5.0` · Pentium III `SSE1`)** 구형 PC부터 최신 **멀티코어 64비트 Windows 10/11 및 Linux X11** 데스크톱까지 단일 **순수 C11 (Zero-Chromium)** 아키텍처로 구동되는 초경량·초고속 2026년 모던 웹 브라우저입니다.
+
+          ## 공식 설치 프로그램 (Official Verified Installers)
+          - **`WaterscapeSetup-2.0.0-x64.exe`**: Windows 64-bit 단일 파일 GUI 설치 마법사 & 무인 인스톨러 (`SSE3` 기준선 + 런타임 `AVX2` & `D3D11`/`Vulkan`/`D3D9` 하드웨어 가속 + `uninstall.exe` 내장)
+          - **`WaterscapeSetup-2.0.0-win2000-x86.exe`**: Windows 2000 SP4 ~ Windows 11 호환 32-bit 단일 파일 설치 마법사 (`PE 5.0` · `SSE1` 기준선 · 외부 런타임 DLL 의존성 `0`개)
+          - **`waterscape_2.0.0_amd64.deb`**: Debian / Ubuntu Linux `amd64` 패키지 (`X11 MIT-SHM` + `Vulkan` + `OpenSSL` + `FreeType`)
+          - **`Waterscape-2.0.0-linux-x86_64.run`**: 모든 Linux `x86_64` 배포판용 SHA-256 무결성 검증 자가 설치 인스톨러 (`uninstall.sh` 자동 생성)
+          - **`SHA256SUMS.txt`**: 전 플랫폼 설치 파일 SHA-256 체크섬 목록
+
+          ## Waterscape 2.0 핵심 업그레이드
+          1. **0ms 무지연 탭 전환 & 멀티코어 비동기 아키텍처**: 탭별 전용 프레임버퍼 캐시, 백그라운드 비동기 네비게이션 및 멀티코어 병렬 서브리소스 로더, Y-밴드 공간 인덱싱 `64×64` SIMD 타일 래스터라이저 + 락프리 글리프 아틀라스
+          2. **선명한 sRGB 감마 보정 폰트 안티에일리어싱**: 256단계 스템 다크닝 & 감마 보정 안티에일리어싱(`ClearType`/`FreeType Light`)으로 한글·영문·코드 가독성 극대화
+          3. **2026 최신 웹 규격 전면 지원**: `QuickJS-NG` ES2026 + 모던 Web API(`fetch`, `Promise`, `rAF`, `MutationObserver`, `CustomEvent`, `Canvas 2D`, `HTMLMediaElement`), `Brotli(br)` / `WebP` / `JPEG` / `PNG` / 애니메이션 `GIF` / 벡터 `SVG`, Tailwind CSS v4(`@layer`, `@supports`, `oklch()`, `color-mix()`), 60 FPS `@keyframes` 애니메이션 & `transform`, 실시간 `<video>` 플레이어 및 **YouTube · Google · X · Zuzunza · GitHub** 완벽 대응
+          EOF
+          sed -i 's/^          //' ../RELEASE_NOTES.md
+          if gh release view "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" --clobber \
+              WaterscapeSetup-*-x64.exe WaterscapeSetup-*-win2000-x86.exe waterscape_*_amd64.deb Waterscape-*-linux-x86_64.run SHA256SUMS.txt
+          else
+            gh release create "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" \
+              --title "Waterscape Browser ${GITHUB_REF_NAME#v} (Arcradient Pure C11 Modern Engine)" \
+              --notes-file ../RELEASE_NOTES.md \
+              WaterscapeSetup-*-x64.exe WaterscapeSetup-*-win2000-x86.exe waterscape_*_amd64.deb Waterscape-*-linux-x86_64.run SHA256SUMS.txt
+          fi

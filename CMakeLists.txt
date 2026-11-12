@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(waterscape VERSION 1.0.0 LANGUAGES C)
+project(waterscape VERSION 2.0.0 LANGUAGES C)
 
 # Strict Pure C11 standard without GNU VLA bloat
 set(CMAKE_C_STANDARD 11)
@@ -66,6 +66,94 @@ else()
 endif()
 
 # =============================================================================
+# Vendored Permissive Pure C11 Foundations (Brotli, libwebp, QuickJS-NG, stb, NanoSVG)
+# Compiled with -w so our own Waterscape/Arcradient sources stay -Wall -Wextra -Wpedantic -Wvla!
+# =============================================================================
+file(GLOB ARCR_BROTLI_SRCS
+    "third_party/brotli/common/*.c"
+    "third_party/brotli/dec/*.c"
+)
+add_library(arcr_brotli_obj OBJECT ${ARCR_BROTLI_SRCS})
+set_target_properties(arcr_brotli_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(arcr_brotli_obj PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/brotli/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/brotli"
+)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(arcr_brotli_obj PRIVATE -w)
+endif()
+
+set(ARCR_WEBP_SRCS
+    third_party/libwebp/src/dec/alpha_dec.c
+    third_party/libwebp/src/dec/buffer_dec.c
+    third_party/libwebp/src/dec/frame_dec.c
+    third_party/libwebp/src/dec/idec_dec.c
+    third_party/libwebp/src/dec/io_dec.c
+    third_party/libwebp/src/dec/quant_dec.c
+    third_party/libwebp/src/dec/tree_dec.c
+    third_party/libwebp/src/dec/vp8_dec.c
+    third_party/libwebp/src/dec/vp8l_dec.c
+    third_party/libwebp/src/dec/webp_dec.c
+    third_party/libwebp/src/dsp/alpha_processing.c
+    third_party/libwebp/src/dsp/cpu.c
+    third_party/libwebp/src/dsp/dec.c
+    third_party/libwebp/src/dsp/dec_clip_tables.c
+    third_party/libwebp/src/dsp/filters.c
+    third_party/libwebp/src/dsp/lossless.c
+    third_party/libwebp/src/dsp/rescaler.c
+    third_party/libwebp/src/dsp/upsampling.c
+    third_party/libwebp/src/dsp/yuv.c
+    third_party/libwebp/src/utils/bit_reader_utils.c
+    third_party/libwebp/src/utils/color_cache_utils.c
+    third_party/libwebp/src/utils/filters_utils.c
+    third_party/libwebp/src/utils/huffman_utils.c
+    third_party/libwebp/src/utils/quant_levels_dec_utils.c
+    third_party/libwebp/src/utils/random_utils.c
+    third_party/libwebp/src/utils/rescaler_utils.c
+    third_party/libwebp/src/utils/thread_utils.c
+    third_party/libwebp/src/utils/utils.c
+)
+if(NOT ARCR_LEGACY_X86_WIN2000)
+    list(APPEND ARCR_WEBP_SRCS
+        third_party/libwebp/src/dsp/alpha_processing_sse2.c
+        third_party/libwebp/src/dsp/dec_sse2.c
+        third_party/libwebp/src/dsp/filters_sse2.c
+        third_party/libwebp/src/dsp/lossless_sse2.c
+        third_party/libwebp/src/dsp/rescaler_sse2.c
+        third_party/libwebp/src/dsp/upsampling_sse2.c
+        third_party/libwebp/src/dsp/yuv_sse2.c
+    )
+endif()
+add_library(arcr_webp_obj OBJECT ${ARCR_WEBP_SRCS})
+set_target_properties(arcr_webp_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(arcr_webp_obj PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libwebp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libwebp/src"
+)
+if(ARCR_LEGACY_X86_WIN2000)
+    target_compile_definitions(arcr_webp_obj PRIVATE WEBP_HAVE_SSE2=0 WEBP_HAVE_SSE41=0)
+endif()
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(arcr_webp_obj PRIVATE -w)
+endif()
+
+add_library(arcr_quickjs_obj OBJECT
+    third_party/quickjs/quickjs.c
+    third_party/quickjs/libregexp.c
+    third_party/quickjs/libunicode.c
+    third_party/quickjs/dtoa.c
+)
+set_target_properties(arcr_quickjs_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(arcr_quickjs_obj PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
+target_compile_definitions(arcr_quickjs_obj PRIVATE QUICKJS_NG_BUILD=1)
+if(NOT WIN32)
+    target_compile_definitions(arcr_quickjs_obj PRIVATE _GNU_SOURCE=1 _DEFAULT_SOURCE=1)
+endif()
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(arcr_quickjs_obj PRIVATE -w)
+endif()
+
+# =============================================================================
 # Tier 0 & Tier 1: Zero-Dependency Base + Strict OS Platform Abstraction
 # =============================================================================
 add_library(arcr_platform_deps INTERFACE)
@@ -73,6 +161,11 @@ target_include_directories(arcr_platform_deps INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
     "${CMAKE_CURRENT_SOURCE_DIR}/base"
     "${CMAKE_CURRENT_SOURCE_DIR}/platform"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/brotli/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libwebp/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nanosvg"
 )
 
 set(ARCR_BASE_SOURCES
@@ -93,12 +186,19 @@ endif()
 
 add_library(arcr_base OBJECT ${ARCR_BASE_SOURCES} ${ARCR_PLATFORM_SOURCES})
 set_target_properties(arcr_base PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_definitions(arcr_base PRIVATE ARCR_HAVE_MODERN_CODECS=1)
 target_link_libraries(arcr_base PUBLIC arcr_platform_deps)
+
+set(ARCR_CORE_OBJECTS
+    $<TARGET_OBJECTS:arcr_base>
+    $<TARGET_OBJECTS:arcr_brotli_obj>
+    $<TARGET_OBJECTS:arcr_webp_obj>
+)
 
 if(WIN32)
     # Native Win32 system DLLs present since Windows 2000 SP4 (zero winpthread/vcruntime!)
     target_link_libraries(arcr_platform_deps INTERFACE
-        gdi32 user32 advapi32 shell32 ole32 comctl32 imm32 ws2_32
+        gdi32 user32 advapi32 shell32 ole32 comctl32 imm32 ws2_32 winmm secur32 crypt32
     )
 else()
     find_package(Threads REQUIRED)
@@ -136,10 +236,10 @@ if((CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 
 # =============================================================================
-# Tier 3: Unified Clean-Room Web Engine Core (DOM + O(1) CSS3 + Layout + 64x64 Tile Paint)
+# Tier 3: Unified Clean-Room Web Engine Core (DOM + CSS3 + Layout + 64x64 Tile Paint)
 # =============================================================================
 add_library(arcr_engine SHARED
-    $<TARGET_OBJECTS:arcr_base>
+    ${ARCR_CORE_OBJECTS}
     $<TARGET_OBJECTS:arcr_accel_avx2_obj>
     accel/arcr_accel.c
     core/arcr_dom.c
@@ -155,11 +255,16 @@ if(MINGW)
     target_link_options(arcr_engine PRIVATE "LINKER:--export-all-symbols")
 endif()
 
+if(UNIX AND NOT APPLE)
+    set(CMAKE_BUILD_RPATH "$ORIGIN")
+    set(CMAKE_INSTALL_RPATH "$ORIGIN")
+endif()
+
 # =============================================================================
 # Tier 4: On-Demand Dynamically Loaded Engine Modules (.dll / .so)
 # =============================================================================
-add_library(arcr_net SHARED net/arcr_net.c $<TARGET_OBJECTS:arcr_base>)
-target_link_libraries(arcr_net PRIVATE arcr_platform_deps)
+add_library(arcr_net SHARED net/arcr_net.c)
+target_link_libraries(arcr_net PRIVATE arcr_engine arcr_platform_deps)
 if((NOT WIN32) AND PkgConfig_FOUND AND ARCR_ENABLE_OPENSSL)
     pkg_check_modules(OPENSSL QUIET openssl)
     if(OPENSSL_FOUND)
@@ -169,23 +274,28 @@ if((NOT WIN32) AND PkgConfig_FOUND AND ARCR_ENABLE_OPENSSL)
     endif()
 endif()
 
-add_library(arcr_js_portable SHARED js/arcr_js_portable.c $<TARGET_OBJECTS:arcr_base>)
-target_link_libraries(arcr_js_portable PRIVATE arcr_platform_deps)
+add_library(arcr_js_portable SHARED
+    js/arcr_js_portable.c
+    $<TARGET_OBJECTS:arcr_quickjs_obj>
+)
+target_include_directories(arcr_js_portable PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
+target_link_libraries(arcr_js_portable PRIVATE arcr_engine arcr_platform_deps)
 
-add_library(arcr_media SHARED media/arcr_media.c $<TARGET_OBJECTS:arcr_base>)
-target_link_libraries(arcr_media PRIVATE arcr_platform_deps)
+add_library(arcr_media SHARED media/arcr_media.c)
+target_link_libraries(arcr_media PRIVATE arcr_engine arcr_platform_deps)
 
-add_library(arcr_devtools SHARED devtools/arcr_devtools.c $<TARGET_OBJECTS:arcr_base>)
-target_link_libraries(arcr_devtools PRIVATE arcr_platform_deps)
+add_library(arcr_devtools SHARED devtools/arcr_devtools.c)
+target_link_libraries(arcr_devtools PRIVATE arcr_engine arcr_platform_deps)
 
 # =============================================================================
 # Tier 5: Official Native C11 Telemetry Plugin & WebExtensions (.wsx) Host
 # =============================================================================
-add_library(ws_plugin_perf_hud SHARED plugins/perf_hud/ws_plugin_perf_hud.c $<TARGET_OBJECTS:arcr_base>)
-target_link_libraries(ws_plugin_perf_hud PRIVATE arcr_platform_deps)
+add_library(ws_plugin_perf_hud SHARED plugins/perf_hud/ws_plugin_perf_hud.c)
+target_link_libraries(ws_plugin_perf_hud PRIVATE arcr_engine arcr_platform_deps)
 
 # =============================================================================
 # Tier 7 (Part A): Host Build Tools -> Procedural Brand Assets & .wsx Add-ons
+# Note: Compiled WITHOUT ARCR_HAVE_MODERN_CODECS so host tools build instantly!
 # =============================================================================
 set(WS_BRAND_DIR  "${CMAKE_BINARY_DIR}/brand")
 set(WS_ADDONS_DIR "${CMAKE_BINARY_DIR}/addons")
@@ -316,8 +426,8 @@ if(WIN32)
     )
 endif()
 
-# Primary Waterscape Browser Executable + `arcradient` Compatibility Binary
-add_executable(waterscape shell/main.c ${WS_WIN32_RC_SRCS})
+# Primary Waterscape Browser Executable (WIN32 GUI on Windows — zero console flash!) + `arcradient` CLI/GUI Binary
+add_executable(waterscape WIN32 shell/main.c ${WS_WIN32_RC_SRCS})
 target_link_libraries(waterscape PRIVATE arcr_shell)
 add_dependencies(waterscape waterscape_brand_assets waterscape_bundled_addons ws_plugin_perf_hud)
 if(WIN32)
@@ -386,17 +496,17 @@ if(WIN32)
         OUTPUT "${WS_SETUP_EXE}"
         COMMAND "${CMAKE_COMMAND}" -E rm -rf "${WS_STAGE_DIR}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${WS_STAGE_DIR}/addons"
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:waterscape>"          "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcradient>"          "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:waterscape>"           "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcradient>"           "${WS_STAGE_DIR}/"
         COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:waterscape_uninstall>" "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_engine>"         "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_net>"            "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_js_portable>"    "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_media>"          "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_devtools>"       "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:ws_plugin_perf_hud>"  "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy "${WS_BRAND_DIR}/waterscape.ico"     "${WS_STAGE_DIR}/"
-        COMMAND "${CMAKE_COMMAND}" -E copy ${WS_BUNDLED_ADDON_OUTPUTS}          "${WS_STAGE_DIR}/addons/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_engine>"          "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_net>"             "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_js_portable>"     "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_media>"           "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_devtools>"        "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:ws_plugin_perf_hud>"   "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "${WS_BRAND_DIR}/waterscape.ico"      "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy ${WS_BUNDLED_ADDON_OUTPUTS}           "${WS_STAGE_DIR}/addons/"
         COMMAND "${PACK_INSTALLER_TOOL}" "$<TARGET_FILE:waterscape_setup_stub>" "${WS_STAGE_DIR}" "${WS_SETUP_EXE}"
         DEPENDS
             waterscape arcradient waterscape_uninstall waterscape_setup_stub

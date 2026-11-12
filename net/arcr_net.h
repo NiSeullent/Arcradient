@@ -1,6 +1,7 @@
 /*
- * Waterscape Browser / Arcradient Engine (MSHTML-Next)
- * net/arcr_net.h - HTTP/1.1 + HTTPS (OpenSSL / Win32 SChannel), Gzip, Cookie & Cache VTable
+ * Waterscape Browser 2.0 / Arcradient Engine (MSHTML-Next)
+ * net/arcr_net.h - Incremental HTTP/1.1 Keep-Alive Pool, TLS 1.3 (OpenSSL / Win32 SChannel),
+ *                  Proxy CONNECT, Brotli/Gzip, Cookie & Parallel Multi-Core Fetch VTable
  */
 #ifndef ARCR_NET_H
 #define ARCR_NET_H
@@ -13,12 +14,13 @@
 
 /* 2025-01-01T00:00:00Z epoch guard for CMOS battery reset detection on retro PCs */
 #define ARCR_BUILD_MIN_EPOCH_SEC 1735689600LL
+#define ARCR_NET_MAX_URL_LEN     4096u
 
 typedef struct ArcrParsedUrl {
     char     scheme[16];
-    char     host[192];
+    char     host[256];
     uint16_t port;
-    char     path[512]; /* Includes path + ?query */
+    char     path[ARCR_NET_MAX_URL_LEN]; /* Includes path + ?query */
 } ArcrParsedUrl;
 
 typedef struct ArcrCertCheckInput {
@@ -32,19 +34,22 @@ typedef struct ArcrCertCheckInput {
 
 typedef struct ArcrHttpRequest {
     const char *url;
-    const char *method;           /* "GET" or "POST" */
+    const char *method;           /* "GET", "POST", "HEAD", etc. */
     const char *post_body;        /* Optional form/JSON payload */
     size_t      post_body_len;
     const char *content_type;     /* Default: application/x-www-form-urlencoded */
+    const char *accept;           /* Optional Accept header override */
+    const char *referer;          /* Optional Referer header */
+    const char *extra_headers;    /* Optional raw "Header: Val\r\n" lines */
     bool        private_browsing; /* Do not read/write persistent cookies when true */
     bool        bypass_cache;
 } ArcrHttpRequest;
 
 typedef struct ArcrHttpResponse {
     int               status_code;
-    char              final_url[512];
-    char              content_type[128];
-    uint8_t          *body;       /* Null-terminated byte buffer (caller frees via free_resource) */
+    char              final_url[ARCR_NET_MAX_URL_LEN];
+    char              content_type[256];
+    uint8_t          *body;       /* Null-terminated byte buffer (caller frees via free_resource / free_response) */
     size_t            body_len;
     ArcrSecurityState security;
     char              detail[256];
@@ -62,6 +67,9 @@ typedef struct ArcrNetVTable {
                               size_t *out_len, ArcrSecurityState *out_sec,
                               char *out_detail, size_t detail_cap);
     bool (*fetch_http)(const ArcrHttpRequest *req, ArcrHttpResponse *out_resp);
+    void (*fetch_batch_parallel)(const ArcrHttpRequest *reqs, ArcrHttpResponse *out_resps,
+                                 size_t count);
+    void (*free_response)(ArcrHttpResponse *resp);
     void (*clear_cookies_and_cache)(void);
     void (*free_resource)(char *body);
 } ArcrNetVTable;

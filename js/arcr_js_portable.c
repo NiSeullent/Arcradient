@@ -1,717 +1,121 @@
 /*
- * Waterscape Browser / Arcradient Engine (MSHTML-Next)
- * js/arcr_js_portable.c - Clean-Room Pure C11 Bytecode Compiler, Stack VM & Live DOM/Canvas Bridge
+ * Waterscape Browser 2.0 / Arcradient Engine (MSHTML-Next)
+ * js/arcr_js_portable.c - QuickJS-NG ES2026 Runtime, Live UID-Backed DOM Bridge,
+ *                         2D <canvas> Rasterizer & Full Browser Web APIs
  *
- * Zero external library dependencies (links solely against arcr_base; zero -lm or core symbol deps).
- * Compatible with Windows 2000 SP4 x86 SSE1 through modern x86_64/ARM64 Linux & Windows.
+ * Strictly self-contained Tier-4 module: links ONLY QuickJS-NG + Tier-0/1 base/platform/codec
+ * (zero undefined symbol dependencies on arcr_engine under dlopen RTLD_LOCAL or Win32 DLL).
  */
 #include "arcr_js.h"
 #include "../base/arcr_base.h"
+#include "../base/arcr_codec.h"
+#include "../css/arcr_css.h"
 #include "../platform/arcr_platform.h"
+#include "quickjs.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define JS_FUEL_BUDGET_PER_CALL 500000u
-#define JS_MAX_CALL_DEPTH       64u
-#define JS_MAX_STACK_SLOTS      1024u
-#define JS_MAX_TRY_DEPTH        32u
-#define JS_MAX_LOCALS           128u
-#define JS_MAX_STORAGE_ENTRIES  64u
-#define JS_MAX_EVENT_LISTENERS  128u
-#define JS_PI_CONST             3.14159265358979323846
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 
-/* =========================================================================
- * 1. Self-Contained IEEE-754 Math Helpers (Zero -lm Shared Library Risk)
- * ========================================================================= */
-static bool js_num_is_nan(double x) {
-    return x != x;
-}
+#define ARCR_JS_TURN_DEADLINE_USEC 750000ULL /* 750 ms max synchronous turn */
+#define ARCR_CANVAS_MAX_PTS        1024
+#define ARCR_CANVAS_STACK_MAX      8
+#define ARCR_GRAD_MAX_STOPS        8
+#define ARCR_FRAG_TAG_ATOM_NAME    "#document-fragment"
 
-static bool js_num_is_inf(double x) {
-    return !js_num_is_nan(x) && (x - x != 0.0);
-}
-
-static double js_make_nan(void) {
-    volatile double z = 0.0;
-    return z / z;
-}
-
-static double js_math_abs(double x) {
-    return (x < 0.0) ? -x : x;
-}
-
-static double js_math_trunc(double x) {
-    if (js_num_is_nan(x) || js_num_is_inf(x) || x >= 4503599627370496.0 || x <= -4503599627370496.0) {
-        return x;
-    }
-    int64_t i = (int64_t)x;
-    return (double)i;
-}
-
-static double js_math_floor(double x) {
-    if (js_num_is_nan(x) || js_num_is_inf(x)) return x;
-    double t = js_math_trunc(x);
-    return (x < t) ? (t - 1.0) : t;
-}
-
-static double js_math_ceil(double x) {
-    if (js_num_is_nan(x) || js_num_is_inf(x)) return x;
-    double t = js_math_trunc(x);
-    return (x > t) ? (t + 1.0) : t;
-}
-
-static double js_math_round(double x) {
-    if (js_num_is_nan(x) || js_num_is_inf(x)) return x;
-    return js_math_floor(x + 0.5);
-}
-
-static double js_math_fmod(double x, double y) {
-    if (js_num_is_nan(x) || js_num_is_nan(y) || js_num_is_inf(x) || y == 0.0) {
-        return js_make_nan();
-    }
-    if (js_num_is_inf(y)) return x;
-    double q = js_math_trunc(x / y);
-    return x - q * y;
-}
-
-static double js_math_sqrt(double x) {
-    if (js_num_is_nan(x) || x < 0.0) return js_make_nan();
-    if (x == 0.0 || js_num_is_inf(x)) return x;
-    uint64_t bits = 0u;
-    memcpy(&bits, &x, sizeof(bits));
-    bits = (bits >> 1) + 0x1FF8000000000000ULL;
-    double g = 0.0;
-    memcpy(&g, &bits, sizeof(g));
-    for (int i = 0; i < 6; ++i) {
-        g = 0.5 * (g + x / g);
-    }
-    return g;
-}
-
-static double js_math_sin(double x) {
-    if (js_num_is_nan(x) || js_num_is_inf(x)) return js_make_nan();
-    double two_pi = 2.0 * JS_PI_CONST;
-    x = js_math_fmod(x, two_pi);
-    if (x > JS_PI_CONST) x -= two_pi;
-    else if (x < -JS_PI_CONST) x += two_pi;
-
-    if (x > JS_PI_CONST * 0.5) x = JS_PI_CONST - x;
-    else if (x < -JS_PI_CONST * 0.5) x = -JS_PI_CONST - x;
-
-    double x2   = x * x;
-    double term = x;
-    double sum  = x;
-    for (int k = 1; k <= 8; ++k) {
-        term *= -x2 / (double)((2 * k) * (2 * k + 1));
-        sum  += term;
-    }
-    return sum;
-}
-
-static double js_math_cos(double x) {
-    return js_math_sin(x + JS_PI_CONST * 0.5);
-}
-
-static double js_math_exp(double x) {
-    if (js_num_is_nan(x)) return x;
-    if (x > 709.0) return 1e308 * 10.0;
-    if (x < -709.0) return 0.0;
-    const double ln2 = 0.69314718055994530942;
-    int k = (int)js_math_floor(x / ln2 + 0.5);
-    double r = x - (double)k * ln2;
-    double term = 1.0, sum = 1.0;
-    for (int i = 1; i <= 14; ++i) {
-        term *= r / (double)i;
-        sum  += term;
-    }
-    double scale = 1.0;
-    int ak = (k < 0) ? -k : k;
-    double b = 2.0;
-    while (ak > 0) {
-        if (ak & 1) scale *= b;
-        b *= b;
-        ak >>= 1;
-    }
-    return (k < 0) ? (sum / scale) : (sum * scale);
-}
-
-static double js_math_ln(double x) {
-    if (js_num_is_nan(x) || x < 0.0) return js_make_nan();
-    if (x == 0.0) return -1e308 * 10.0;
-    uint64_t bits = 0u;
-    memcpy(&bits, &x, sizeof(bits));
-    int exp2 = (int)((bits >> 52) & 0x7FFu) - 1023;
-    bits = (bits & 0x000FFFFFFFFFFFFFULL) | 0x3FF0000000000000ULL;
-    double m = 1.0;
-    memcpy(&m, &bits, sizeof(m));
-    if (m > 1.41421356237) { m *= 0.5; ++exp2; }
-    double y  = (m - 1.0) / (m + 1.0);
-    double y2 = y * y;
-    double t  = y, s = y;
-    for (int k = 3; k <= 21; k += 2) {
-        t *= y2;
-        s += t / (double)k;
-    }
-    return 2.0 * s + (double)exp2 * 0.69314718055994530942;
-}
-
-static double js_math_pow(double base, double exp) {
-    if (exp == 0.0) return 1.0;
-    if (js_num_is_nan(base) || js_num_is_nan(exp)) return js_make_nan();
-    if (base == 0.0) return (exp > 0.0) ? 0.0 : (1e308 * 10.0);
-    double ie = js_math_trunc(exp);
-    if (exp == ie && ie >= -1024.0 && ie <= 1024.0) {
-        int n = (int)ie;
-        bool neg = (n < 0);
-        if (neg) n = -n;
-        double res = 1.0, b = base;
-        while (n > 0) {
-            if (n & 1) res *= b;
-            b *= b;
-            n >>= 1;
-        }
-        return neg ? (1.0 / res) : res;
-    }
-    if (base < 0.0) return js_make_nan();
-    return js_math_exp(exp * js_math_ln(base));
-}
-
-/* =========================================================================
- * 2. Bytecode Opcodes & Runtime Value Model
- * ========================================================================= */
-typedef enum JsOpCode {
-    OP_CONST = 0,
-    OP_POP,
-    OP_DUP,
-    OP_DUP2,
-    OP_SWAP,
-    OP_GET_LOCAL,
-    OP_SET_LOCAL,
-    OP_GET_GLOBAL,
-    OP_SET_GLOBAL,
-    OP_GET_PROP,
-    OP_SET_PROP,
-    OP_GET_INDEX,
-    OP_SET_INDEX,
-    OP_ADD,
-    OP_SUB,
-    OP_MUL,
-    OP_DIV,
-    OP_MOD,
-    OP_NEG,
-    OP_POS,
-    OP_NOT,
-    OP_TYPEOF,
-    OP_EQ,
-    OP_NEQ,
-    OP_STRICT_EQ,
-    OP_STRICT_NEQ,
-    OP_LT,
-    OP_LTE,
-    OP_GT,
-    OP_GTE,
-    OP_BIT_AND,
-    OP_BIT_OR,
-    OP_BIT_XOR,
-    OP_SHL,
-    OP_SHR,
-    OP_JMP,
-    OP_JMP_IF_FALSE,
-    OP_JMP_IF_TRUE,
-    OP_CALL,
-    OP_CALL_METHOD,
-    OP_CLOSURE,
-    OP_NEW_ARRAY,
-    OP_NEW_OBJECT,
-    OP_TRY_PUSH,
-    OP_TRY_POP,
-    OP_THROW,
-    OP_THIS,
-    OP_RETURN,
-    OP_HALT
-} JsOpCode;
-
-typedef struct JsInst {
-    uint8_t  op;
-    uint8_t  aux;   /* argc for OP_CALL_METHOD, or flags */
-    uint32_t arg;   /* constant index, jump target, or (depth<<16)|slot */
-} JsInst;
-
-typedef enum JsBuiltinId {
-    JS_BUILTIN_CONSOLE = 1,
-    JS_BUILTIN_MATH,
-    JS_BUILTIN_JSON,
-    JS_BUILTIN_PERFORMANCE,
-    JS_BUILTIN_DATE,
-    JS_BUILTIN_LOCALSTORAGE,
-    JS_BUILTIN_DOCUMENT,
-    JS_BUILTIN_WINDOW,
-    JS_BUILTIN_LOCATION,
-    JS_BUILTIN_NUMBER_CTOR,
-    JS_BUILTIN_STRING_CTOR,
-    JS_BUILTIN_ARRAY_CTOR,
-    JS_BUILTIN_OBJECT_CTOR
-} JsBuiltinId;
-
-typedef enum JsNativeFnId {
-    JS_NAT_PARSE_INT = 1,
-    JS_NAT_PARSE_FLOAT,
-    JS_NAT_IS_NAN,
-    JS_NAT_IS_FINITE,
-    JS_NAT_NUMBER,
-    JS_NAT_STRING,
-    JS_NAT_BOOLEAN,
-    JS_NAT_EVENT_PREVENT_DEFAULT,
-    JS_NAT_EVENT_STOP_PROP
-} JsNativeFnId;
-
-typedef enum JsValKind {
-    JS_VAL_UNDEFINED = 0,
-    JS_VAL_NULL,
-    JS_VAL_BOOL,
-    JS_VAL_NUMBER,
-    JS_VAL_STRING,
-    JS_VAL_ARRAY,
-    JS_VAL_OBJECT,
-    JS_VAL_FUNCTION,
-    JS_VAL_NATIVE_FN,
-    JS_VAL_BUILTIN_OBJ,
-    JS_VAL_DOM_NODE,
-    JS_VAL_DOM_STYLE,
-    JS_VAL_DOM_CLASSLIST,
-    JS_VAL_CANVAS_CTX2D
-} JsValKind;
-
-typedef struct JsString {
-    size_t len;
-    char   data[];
-} JsString;
-
-struct JsArray;
-struct JsObject;
-struct JsFunc;
-struct JsEnv;
-struct JsCanvasCtx2D;
-
-typedef struct JsVal {
-    JsValKind kind;
-    union {
-        bool                  b;
-        double                num;
-        uint32_t              u32;
-        JsString             *str;
-        struct JsArray       *arr;
-        struct JsObject      *obj;
-        struct JsFunc        *fn;
-        struct JsCanvasCtx2D *ctx2d;
-    } as;
-} JsVal;
-
-typedef struct JsArray {
-    JsVal  *items;
-    size_t  len;
-    size_t  cap;
-} JsArray;
-
-typedef struct JsProp {
-    const char *key;
-    JsVal       val;
-} JsProp;
-
-typedef struct JsObject {
-    JsProp *props;
-    size_t  len;
-    size_t  cap;
-} JsObject;
-
-typedef struct JsChunk {
-    JsInst *code;
-    size_t  code_len;
-    size_t  code_cap;
-    JsVal  *consts;
-    size_t  const_len;
-    size_t  const_cap;
-    uint16_t param_count;
-    uint16_t local_count;
-} JsChunk;
-
-typedef struct JsEnv {
-    struct JsEnv *parent;
-    size_t        slot_count;
-    JsVal         slots[];
-} JsEnv;
-
-typedef struct JsFunc {
-    JsChunk *chunk;
-    JsEnv   *captured_env;
-} JsFunc;
-
-typedef struct JsCanvasCtx2D {
-    uint32_t node_uid;
+/* -------------------------------------------------------------------------
+ * 1. Canvas 2D State & VM Context Structures
+ * ------------------------------------------------------------------------- */
+typedef struct CanvasTransform {
+    double a, b, c, d, e, f;
     uint32_t fill_argb;
     uint32_t stroke_argb;
-    float    line_width;
-    float    path_x[256];
-    float    path_y[256];
-    uint8_t  path_move[256]; /* 1 = moveTo subpath start, 0 = lineTo */
-    size_t   path_len;
-} JsCanvasCtx2D;
+    double   line_width;
+    double   global_alpha;
+    int32_t  font_px;
+    bool     font_bold;
+    bool     font_mono;
+} CanvasTransform;
 
-typedef struct JsStorageKV {
-    bool in_use;
-    char key[64];
-    char val[512];
-} JsStorageKV;
+typedef struct CanvasGradStop {
+    double   offset;
+    uint32_t argb;
+} CanvasGradStop;
 
-typedef struct JsEventListener {
-    bool     active;
-    uint32_t node_uid;
-    char     event_type[32];
-    JsVal    callback;
-} JsEventListener;
+typedef struct CanvasGrad {
+    bool           active;
+    bool           is_radial;
+    double         x0, y0, r0, x1, y1, r1;
+    CanvasGradStop stops[ARCR_GRAD_MAX_STOPS];
+    int32_t        stop_count;
+} CanvasGrad;
 
-typedef struct JsTryFrame {
-    size_t   frame_depth;
-    size_t   stack_sp;
-    JsChunk *chunk;
-    JsEnv   *env;
-    size_t   catch_ip;
-} JsTryFrame;
+typedef struct CanvasPt {
+    float x;
+    float y;
+    bool  move_to;
+} CanvasPt;
+
+typedef struct Canvas2DCtx {
+    uint32_t        node_uid;
+    CanvasTransform cur;
+    CanvasTransform stack[ARCR_CANVAS_STACK_MAX];
+    int32_t         stack_top;
+    int32_t         fill_grad_id;   /* -1 if solid color */
+    int32_t         stroke_grad_id; /* -1 if solid color */
+    CanvasPt        pts[ARCR_CANVAS_MAX_PTS];
+    int32_t         pt_count;
+    float           sub_start_x;
+    float           sub_start_y;
+    struct Canvas2DCtx *next;
+} Canvas2DCtx;
+
+typedef struct DetachedSurfTrack {
+    ArcrDomSurface           *surf;
+    struct DetachedSurfTrack *next;
+} DetachedSurfTrack;
 
 struct ArcrJsVm {
-    ArcrArena           vm_arena;
-    ArcrArena           temp_arena; /* Reclaimed on memory pressure */
+    JSRuntime          *rt;
+    JSContext          *ctx;
+    JSClassID           dom_node_class_id;
+    ArcrJsHostCallbacks host;
     size_t              heap_limit;
-    size_t              bytecode_cache_bytes;
-    ArcrJsHostCallbacks host_cb;
-    uint64_t            start_monotonic_usec;
-    uint64_t            rng_state;
-    uint32_t            fuel;
-    uint32_t            executed_scripts;
 
-    JsObject           *globals;
-    char                doc_title[256];
-    char                location_href[512];
-    JsStorageKV         local_storage[JS_MAX_STORAGE_ENTRIES];
-    JsEventListener     listeners[JS_MAX_EVENT_LISTENERS];
+    uint64_t            boot_usec;
+    uint64_t            deadline_usec;
+    bool                interrupt_armed;
 
-    /* Active event dispatch flags for preventDefault / stopPropagation */
-    bool               *active_ev_prevented;
-    bool               *active_ev_stopped;
+    /* O(1) UID -> ArcrDomNode* lookup table (covers both attached & detached nodes) */
+    ArcrDomNode       **uid_table;
+    uint32_t            uid_cap;
+    ArcrAtom            frag_atom;
 
-    /* Detached DOM node registry (createElement / createTextNode / remove) */
-    ArcrDomNode        *detached_nodes[512];
-    const ArcrDocument *detached_docs[512];
-    size_t              detached_cursor;
+    /* JS-side fast hooks initialized during bootstrap */
+    JSValue             fn_dispatch_event;
+    JSValue             fn_tick_timers;
+    JSValue             fn_has_timers;
+    JSValue             fn_wrap_uid;
 
-    JsVal               stack[JS_MAX_STACK_SLOTS];
-    size_t              sp;
-    JsTryFrame          try_stack[JS_MAX_TRY_DEPTH];
-    size_t              try_depth;
-    JsVal               thrown_val;
-    bool                has_exception;
+    /* Canvas 2D contexts & gradients */
+    Canvas2DCtx        *canvas_head;
+    CanvasGrad         *grads;
+    int32_t             grad_count;
+    int32_t             grad_cap;
+    ArcrFontSystem     *canvas_fonts;
+
+    /* Tracked heap surfaces allocated by JS so detached canvases never leak */
+    DetachedSurfTrack  *surf_track_head;
 };
 
-/* Value constructors */
-static JsVal js_undef(void) { JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_UNDEFINED; return v; }
-static JsVal js_null(void)  { JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_NULL; return v; }
-static JsVal js_bool(bool b){ JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_BOOL; v.as.b = b; return v; }
-static JsVal js_num(double n){ JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_NUMBER; v.as.num = n; return v; }
-static JsVal js_dom_node(uint32_t uid) {
-    if (uid == 0u) return js_null();
-    JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_DOM_NODE; v.as.u32 = uid; return v;
-}
-
-static void *vm_alloc(ArcrJsVm *vm, size_t sz, size_t align) {
-    if (vm->vm_arena.total_used + sz > vm->heap_limit) return NULL;
-    return arcr_arena_alloc(&vm->vm_arena, sz, align);
-}
-
-static JsVal js_mk_str_n(ArcrJsVm *vm, const char *s, size_t len) {
-    JsString *st = (JsString *)vm_alloc(vm, sizeof(JsString) + len + 1u, sizeof(void *));
-    if (!st) return js_undef();
-    st->len = len;
-    if (len > 0u && s) memcpy(st->data, s, len);
-    st->data[len] = '\0';
-    JsVal v; memset(&v, 0, sizeof(v));
-    v.kind   = JS_VAL_STRING;
-    v.as.str = st;
-    return v;
-}
-
-static JsVal js_mk_str(ArcrJsVm *vm, const char *s) {
-    return js_mk_str_n(vm, s ? s : "", s ? strlen(s) : 0u);
-}
-
-static JsArray *js_alloc_array(ArcrJsVm *vm, size_t init_cap) {
-    JsArray *a = (JsArray *)vm_alloc(vm, sizeof(JsArray), sizeof(void *));
-    if (!a) return NULL;
-    a->len = 0u;
-    a->cap = (init_cap > 4u) ? init_cap : 4u;
-    a->items = (JsVal *)vm_alloc(vm, a->cap * sizeof(JsVal), sizeof(void *));
-    if (!a->items) return NULL;
-    return a;
-}
-
-static bool js_array_push(ArcrJsVm *vm, JsArray *a, JsVal item) {
-    if (!a) return false;
-    if (a->len >= a->cap) {
-        size_t ncap = a->cap * 2u;
-        JsVal *nitems = (JsVal *)vm_alloc(vm, ncap * sizeof(JsVal), sizeof(void *));
-        if (!nitems) return false;
-        memcpy(nitems, a->items, a->len * sizeof(JsVal));
-        a->items = nitems;
-        a->cap   = ncap;
-    }
-    a->items[a->len++] = item;
-    return true;
-}
-
-static JsObject *js_alloc_object(ArcrJsVm *vm, size_t init_cap) {
-    JsObject *o = (JsObject *)vm_alloc(vm, sizeof(JsObject), sizeof(void *));
-    if (!o) return NULL;
-    o->len = 0u;
-    o->cap = (init_cap > 4u) ? init_cap : 4u;
-    o->props = (JsProp *)vm_alloc(vm, o->cap * sizeof(JsProp), sizeof(void *));
-    if (!o->props) return NULL;
-    return o;
-}
-
-static bool js_obj_get(const JsObject *o, const char *key, JsVal *out_val) {
-    if (!o || !key) return false;
-    for (size_t i = 0u; i < o->len; ++i) {
-        if (strcmp(o->props[i].key, key) == 0) {
-            if (out_val) *out_val = o->props[i].val;
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool js_obj_set(ArcrJsVm *vm, JsObject *o, const char *key, JsVal val) {
-    if (!o || !key) return false;
-    for (size_t i = 0u; i < o->len; ++i) {
-        if (strcmp(o->props[i].key, key) == 0) {
-            o->props[i].val = val;
-            return true;
-        }
-    }
-    if (o->len >= o->cap) {
-        size_t ncap = o->cap * 2u;
-        JsProp *nprops = (JsProp *)vm_alloc(vm, ncap * sizeof(JsProp), sizeof(void *));
-        if (!nprops) return false;
-        memcpy(nprops, o->props, o->len * sizeof(JsProp));
-        o->props = nprops;
-        o->cap   = ncap;
-    }
-    char *kcopy = arcr_arena_strdup(&vm->vm_arena, key, strlen(key));
-    if (!kcopy) return false;
-    o->props[o->len].key = kcopy;
-    o->props[o->len].val = val;
-    o->len++;
-    return true;
-}
-
-/* =========================================================================
- * 3. JS Type Coercions & Comparisons
- * ========================================================================= */
-static bool js_is_truthy(JsVal v) {
-    switch (v.kind) {
-        case JS_VAL_UNDEFINED:
-        case JS_VAL_NULL:
-            return false;
-        case JS_VAL_BOOL:
-            return v.as.b;
-        case JS_VAL_NUMBER:
-            return v.as.num != 0.0 && !js_num_is_nan(v.as.num);
-        case JS_VAL_STRING:
-            return v.as.str && v.as.str->len > 0u;
-        default:
-            return true;
-    }
-}
-
-static double js_parse_float_str(const char *s, size_t len, bool allow_trailing) {
-    if (!s) return js_make_nan();
-    arcr_str_trim_view(&s, &len);
-    if (len == 0u) return allow_trailing ? js_make_nan() : 0.0;
-
-    size_t i = 0u;
-    double sign = 1.0;
-    if (s[i] == '-') { sign = -1.0; ++i; }
-    else if (s[i] == '+') { ++i; }
-
-    if (i + 2u < len && s[i] == '0' && (s[i + 1u] == 'x' || s[i + 1u] == 'X')) {
-        i += 2u;
-        double val = 0.0;
-        bool any = false;
-        while (i < len) {
-            char c = s[i];
-            int d = -1;
-            if (c >= '0' && c <= '9') d = c - '0';
-            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
-            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
-            if (d < 0) { if (!allow_trailing) return js_make_nan(); break; }
-            val = val * 16.0 + (double)d;
-            any = true;
-            ++i;
-        }
-        return any ? (sign * val) : js_make_nan();
-    }
-
-    double res = 0.0;
-    bool any_digit = false;
-    while (i < len && s[i] >= '0' && s[i] <= '9') {
-        res = res * 10.0 + (double)(s[i] - '0');
-        any_digit = true;
-        ++i;
-    }
-    if (i < len && s[i] == '.') {
-        ++i;
-        double frac = 0.1;
-        while (i < len && s[i] >= '0' && s[i] <= '9') {
-            res += (double)(s[i] - '0') * frac;
-            frac *= 0.1;
-            any_digit = true;
-            ++i;
-        }
-    }
-    if (!any_digit) return js_make_nan();
-
-    if (i < len && (s[i] == 'e' || s[i] == 'E')) {
-        size_t save_e = i++;
-        int esign = 1;
-        if (i < len && s[i] == '-') { esign = -1; ++i; }
-        else if (i < len && s[i] == '+') { ++i; }
-        int exp_val = 0;
-        bool exp_ok = false;
-        while (i < len && s[i] >= '0' && s[i] <= '9') {
-            if (exp_val < 1000) exp_val = exp_val * 10 + (s[i] - '0');
-            exp_ok = true;
-            ++i;
-        }
-        if (exp_ok) {
-            res *= js_math_pow(10.0, (double)(esign * exp_val));
-        } else {
-            i = save_e;
-        }
-    }
-    if (!allow_trailing && i < len) return js_make_nan();
-    return sign * res;
-}
-
-static double js_to_number(JsVal v) {
-    switch (v.kind) {
-        case JS_VAL_NUMBER:    return v.as.num;
-        case JS_VAL_BOOL:      return v.as.b ? 1.0 : 0.0;
-        case JS_VAL_NULL:      return 0.0;
-        case JS_VAL_UNDEFINED: return js_make_nan();
-        case JS_VAL_STRING:
-            return v.as.str ? js_parse_float_str(v.as.str->data, v.as.str->len, false) : 0.0;
-        default:
-            return js_make_nan();
-    }
-}
-
-static void js_format_number(double n, char *buf, size_t cap) {
-    if (js_num_is_nan(n)) { arcr_str_copy(buf, cap, "NaN"); return; }
-    if (js_num_is_inf(n)) { arcr_str_copy(buf, cap, (n < 0.0) ? "-Infinity" : "Infinity"); return; }
-    if (n == 0.0)         { arcr_str_copy(buf, cap, "0"); return; }
-    double tr = js_math_trunc(n);
-    if (n == tr && n >= -9007199254740991.0 && n <= 9007199254740991.0 &&
-        n >= -2147483648.0 && n <= 2147483647.0) {
-        snprintf(buf, cap, "%ld", (long)(int32_t)n);
-        return;
-    }
-    snprintf(buf, cap, "%.14g", n);
-}
-
-static const char *js_to_cstr_buf(ArcrJsVm *vm, JsVal v, char *tmp, size_t cap) {
-    switch (v.kind) {
-        case JS_VAL_UNDEFINED: arcr_str_copy(tmp, cap, "undefined"); return tmp;
-        case JS_VAL_NULL:      arcr_str_copy(tmp, cap, "null"); return tmp;
-        case JS_VAL_BOOL:      arcr_str_copy(tmp, cap, v.as.b ? "true" : "false"); return tmp;
-        case JS_VAL_NUMBER:    js_format_number(v.as.num, tmp, cap); return tmp;
-        case JS_VAL_STRING:    return v.as.str ? v.as.str->data : "";
-        case JS_VAL_ARRAY: {
-            size_t pos = 0u;
-            tmp[0] = '\0';
-            if (v.as.arr) {
-                for (size_t i = 0u; i < v.as.arr->len; ++i) {
-                    if (i > 0u && pos + 1u < cap) tmp[pos++] = ',';
-                    char sub[128];
-                    const char *s = js_to_cstr_buf(vm, v.as.arr->items[i], sub, sizeof(sub));
-                    size_t sl = strlen(s);
-                    if (pos + sl >= cap) sl = (cap - 1u > pos) ? (cap - 1u - pos) : 0u;
-                    if (sl > 0u) { memcpy(tmp + pos, s, sl); pos += sl; }
-                }
-                tmp[pos] = '\0';
-            }
-            return tmp;
-        }
-        case JS_VAL_DOM_NODE:  arcr_str_copy(tmp, cap, "[object HTMLElement]"); return tmp;
-        case JS_VAL_FUNCTION:
-        case JS_VAL_NATIVE_FN: arcr_str_copy(tmp, cap, "function() { [code] }"); return tmp;
-        default:               arcr_str_copy(tmp, cap, "[object Object]"); return tmp;
-    }
-}
-
-static JsVal js_to_string_val(ArcrJsVm *vm, JsVal v) {
-    if (v.kind == JS_VAL_STRING) return v;
-    char buf[512];
-    const char *s = js_to_cstr_buf(vm, v, buf, sizeof(buf));
-    return js_mk_str(vm, s);
-}
-
-static bool js_strict_equal(JsVal a, JsVal b) {
-    if (a.kind != b.kind) return false;
-    switch (a.kind) {
-        case JS_VAL_UNDEFINED:
-        case JS_VAL_NULL:
-            return true;
-        case JS_VAL_BOOL:
-            return a.as.b == b.as.b;
-        case JS_VAL_NUMBER:
-            return a.as.num == b.as.num;
-        case JS_VAL_STRING:
-            if (a.as.str == b.as.str) return true;
-            if (!a.as.str || !b.as.str || a.as.str->len != b.as.str->len) return false;
-            return memcmp(a.as.str->data, b.as.str->data, a.as.str->len) == 0;
-        case JS_VAL_ARRAY:
-            return a.as.arr == b.as.arr;
-        case JS_VAL_OBJECT:
-            return a.as.obj == b.as.obj;
-        case JS_VAL_FUNCTION:
-            return a.as.fn == b.as.fn;
-        case JS_VAL_CANVAS_CTX2D:
-            return a.as.ctx2d == b.as.ctx2d;
-        default:
-            return a.as.u32 == b.as.u32;
-    }
-}
-
-static bool js_loose_equal(JsVal a, JsVal b) {
-    if (a.kind == b.kind) return js_strict_equal(a, b);
-    if ((a.kind == JS_VAL_NULL && b.kind == JS_VAL_UNDEFINED) ||
-        (a.kind == JS_VAL_UNDEFINED && b.kind == JS_VAL_NULL)) {
-        return true;
-    }
-    if ((a.kind == JS_VAL_NUMBER || a.kind == JS_VAL_BOOL) &&
-        (b.kind == JS_VAL_NUMBER || b.kind == JS_VAL_BOOL || b.kind == JS_VAL_STRING)) {
-        return js_to_number(a) == js_to_number(b);
-    }
-    if (a.kind == JS_VAL_STRING && (b.kind == JS_VAL_NUMBER || b.kind == JS_VAL_BOOL)) {
-        return js_to_number(a) == js_to_number(b);
-    }
-    return false;
-}
-
-/* =========================================================================
- * 4. Self-Contained Live DOM, CSS Selector, innerHTML & <canvas> 2D Bridge
- *    (Operates directly on ArcrDocument + arcr_base; zero arcr_core link deps!)
- * ========================================================================= */
+/* -------------------------------------------------------------------------
+ * 2. Self-Contained C DOM Engine Helpers (Zero arcr_engine Link Deps!)
+ * ------------------------------------------------------------------------- */
 static uint64_t js_bloom_bits(ArcrAtom atom) {
     if (atom == ARCR_ATOM_NULL) return 0ULL;
     uint32_t x  = (uint32_t)atom * 0x9E3779B1u;
@@ -722,125 +126,364 @@ static uint64_t js_bloom_bits(ArcrAtom atom) {
 
 static uint64_t js_node_self_bloom(const ArcrDomNode *n) {
     if (!n || n->kind != ARCR_NODE_ELEMENT) return 0ULL;
-    uint64_t bits = js_bloom_bits(n->tag) | js_bloom_bits(n->id);
-    for (uint32_t i = 0u; i < n->class_count; ++i) {
+    uint64_t bits = js_bloom_bits(n->tag);
+    if (n->id != ARCR_ATOM_NULL) bits |= js_bloom_bits(n->id);
+    uint32_t inline_n = ARCR_MIN(n->class_count, ARCR_MAX_INLINE_CLASSES);
+    for (uint32_t i = 0u; i < inline_n; ++i) {
         bits |= js_bloom_bits(n->classes[i]);
+    }
+    if (n->class_count > ARCR_MAX_INLINE_CLASSES && n->extra_classes) {
+        uint32_t ext = n->class_count - ARCR_MAX_INLINE_CLASSES;
+        for (uint32_t i = 0u; i < ext; ++i) {
+            bits |= js_bloom_bits(n->extra_classes[i]);
+        }
     }
     return bits;
 }
 
-static void js_recompute_subtree_bloom(ArcrDomNode *n) {
+static void js_recompute_bloom_rec(ArcrDomNode *n) {
     if (!n) return;
-    if (n->parent) {
-        n->ancestor_bloom = n->parent->ancestor_bloom | js_node_self_bloom(n->parent);
-    } else {
-        n->ancestor_bloom = 0ULL;
-    }
+    n->ancestor_bloom = n->parent
+                            ? (n->parent->ancestor_bloom | js_node_self_bloom(n->parent))
+                            : 0ULL;
     for (ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
-        js_recompute_subtree_bloom(ch);
+        js_recompute_bloom_rec(ch);
     }
 }
 
-static void js_dom_ensure_uids_rec(ArcrDocument *doc, ArcrDomNode *n) {
-    if (!n) return;
-    if (n->node_uid == 0u) {
-        if (doc->next_uid == 0u) doc->next_uid = 1u;
-        n->node_uid = doc->next_uid++;
-    } else if (n->node_uid >= doc->next_uid) {
-        doc->next_uid = n->node_uid + 1u;
+static bool js_uid_ensure_cap(ArcrJsVm *vm, uint32_t max_uid) {
+    if (!vm) return false;
+    if (max_uid < vm->uid_cap) return true;
+    uint32_t ncap = vm->uid_cap ? vm->uid_cap : 256u;
+    while (ncap <= max_uid) ncap *= 2u;
+    ArcrDomNode **ntab = (ArcrDomNode **)realloc(vm->uid_table, (size_t)ncap * sizeof(ArcrDomNode *));
+    if (!ntab) return false;
+    memset(ntab + vm->uid_cap, 0, (size_t)(ncap - vm->uid_cap) * sizeof(ArcrDomNode *));
+    vm->uid_table = ntab;
+    vm->uid_cap   = ncap;
+    return true;
+}
+
+static void js_uid_index_tree_rec(ArcrJsVm *vm, ArcrDomNode *n) {
+    if (!vm || !n) return;
+    if (js_uid_ensure_cap(vm, n->node_uid)) {
+        vm->uid_table[n->node_uid] = n;
     }
     for (ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
-        js_dom_ensure_uids_rec(doc, ch);
+        js_uid_index_tree_rec(vm, ch);
     }
 }
 
-static void js_dom_ensure_uids(ArcrDocument *doc) {
-    if (doc && doc->root) {
-        js_dom_ensure_uids_rec(doc, doc->root);
-    }
+static void js_uid_sync_document(ArcrJsVm *vm) {
+    if (!vm || !vm->host.doc || !vm->host.doc->root) return;
+    if (!js_uid_ensure_cap(vm, vm->host.doc->next_uid + 8u)) return;
+    js_uid_index_tree_rec(vm, vm->host.doc->root);
 }
 
-static ArcrDomNode *js_dom_find_uid_rec(ArcrDomNode *n, uint32_t uid) {
-    if (!n || uid == 0u) return NULL;
-    if (n->node_uid == uid) return n;
-    for (ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
-        ArcrDomNode *hit = js_dom_find_uid_rec(ch, uid);
-        if (hit) return hit;
+static ArcrDomNode *js_dom_find_uid(ArcrJsVm *vm, uint32_t uid) {
+    if (!vm || !vm->host.doc) return NULL;
+    ArcrDocument *doc = vm->host.doc;
+    if (uid == 0u) return doc->root;
+    if (uid < vm->uid_cap && vm->uid_table[uid]) {
+        ArcrDomNode *n = vm->uid_table[uid];
+        if (n->node_uid == uid) return n;
+        vm->uid_table[uid] = NULL;
+    }
+    js_uid_sync_document(vm);
+    if (uid < vm->uid_cap && vm->uid_table[uid] && vm->uid_table[uid]->node_uid == uid) {
+        return vm->uid_table[uid];
     }
     return NULL;
 }
 
-static void js_dom_register_detached(ArcrJsVm *vm, const ArcrDocument *doc, ArcrDomNode *node) {
-    if (!vm || !doc || !node) return;
-    for (size_t i = 0u; i < 512u; ++i) {
-        if (vm->detached_nodes[i] == node && vm->detached_docs[i] == doc) return;
-    }
-    size_t slot = vm->detached_cursor % 512u;
-    vm->detached_nodes[slot] = node;
-    vm->detached_docs[slot]  = doc;
-    vm->detached_cursor++;
+static bool js_node_is_fragment(const ArcrJsVm *vm, const ArcrDomNode *n) {
+    return vm && n && n->kind == ARCR_NODE_ELEMENT &&
+           vm->frag_atom != ARCR_ATOM_NULL && n->tag == vm->frag_atom;
 }
 
-static ArcrDomNode *js_dom_find_uid(ArcrJsVm *vm, ArcrDocument *doc, uint32_t uid) {
-    if (!doc || uid == 0u) return NULL;
-    if (doc->root) {
-        js_dom_ensure_uids(doc);
-        ArcrDomNode *hit = js_dom_find_uid_rec(doc->root, uid);
-        if (hit) return hit;
+static bool js_node_in_doc_root(const ArcrDocument *doc, const ArcrDomNode *n) {
+    if (!doc || !doc->root || !n) return false;
+    for (const ArcrDomNode *cur = n; cur != NULL; cur = cur->parent) {
+        if (cur == doc->root) return true;
     }
-    if (vm) {
-        size_t lim = (vm->detached_cursor < 512u) ? vm->detached_cursor : 512u;
-        for (size_t i = 0u; i < lim; ++i) {
-            if (vm->detached_docs[i] == doc && vm->detached_nodes[i] != NULL) {
-                ArcrDomNode *hit = js_dom_find_uid_rec(vm->detached_nodes[i], uid);
-                if (hit) return hit;
+    return false;
+}
+
+static void js_dom_unlink(ArcrDocument *doc, ArcrDomNode *node) {
+    if (!node || !node->parent) return;
+    ArcrDomNode *p = node->parent;
+    if (node->prev_sibling) {
+        node->prev_sibling->next_sibling = node->next_sibling;
+    } else if (p->first_child == node) {
+        p->first_child = node->next_sibling;
+    } else {
+        /* Fallback scan if HTML parser constructed singly-linked list */
+        ArcrDomNode *prev = NULL;
+        for (ArcrDomNode *c = p->first_child; c != NULL; c = c->next_sibling) {
+            if (c == node) {
+                if (prev) prev->next_sibling = c->next_sibling;
+                else p->first_child = c->next_sibling;
+                if (p->last_child == c) p->last_child = prev;
+                break;
+            }
+            prev = c;
+        }
+    }
+    if (node->next_sibling) {
+        node->next_sibling->prev_sibling = node->prev_sibling;
+    }
+    if (p->last_child == node) {
+        p->last_child = node->prev_sibling;
+    }
+    node->parent       = NULL;
+    node->prev_sibling = NULL;
+    node->next_sibling = NULL;
+    if (doc) {
+        if (doc->focused_node == node) doc->focused_node = NULL;
+        if (doc->hovered_node == node) doc->hovered_node = NULL;
+        doc->dom_dirty = true;
+    }
+}
+
+static void js_dom_append_style_block(ArcrDocument *doc, const char *css, size_t len) {
+    if (!doc || !css || len == 0u) return;
+    ArcrStyleBlock *sb = (ArcrStyleBlock *)arcr_arena_alloc(
+        &doc->arena, sizeof(ArcrStyleBlock), sizeof(void *));
+    if (!sb) return;
+    sb->css_text = arcr_arena_strdup(&doc->arena, css, len);
+    sb->css_len  = len;
+    sb->next     = NULL;
+    if (!doc->style_blocks_head) {
+        doc->style_blocks_head = sb;
+        doc->style_blocks_tail = sb;
+    } else {
+        doc->style_blocks_tail->next = sb;
+        doc->style_blocks_tail       = sb;
+    }
+    doc->dom_dirty = true;
+}
+
+static void js_sync_DynamicStyle_if_needed(ArcrDocument *doc, ArcrDomNode *node) {
+    if (!doc || !node) return;
+    if (node->kind == ARCR_NODE_ELEMENT) {
+        const char *tname = arcr_atom_cstr(doc->atoms, node->tag);
+        if (arcr_str_eq_nocase(tname, "style")) {
+            if (node->text && node->text_len > 0u) {
+                js_dom_append_style_block(doc, node->text, node->text_len);
+            } else {
+                for (ArcrDomNode *ch = node->first_child; ch != NULL; ch = ch->next_sibling) {
+                    if (ch->kind == ARCR_NODE_TEXT && ch->text && ch->text_len > 0u) {
+                        js_dom_append_style_block(doc, ch->text, ch->text_len);
+                    }
+                }
             }
         }
     }
-    return NULL;
 }
 
-static const char *js_dom_get_attr(const ArcrDocument *doc, const ArcrDomNode *el, const char *name) {
+static bool js_is_ancestor_or_self(const ArcrDomNode *anc, const ArcrDomNode *node) {
+    for (const ArcrDomNode *p = node; p != NULL; p = p->parent) {
+        if (p == anc) return true;
+    }
+    return false;
+}
+
+static void js_dom_insert_before_raw(ArcrJsVm *vm, ArcrDomNode *parent,
+                                     ArcrDomNode *child, ArcrDomNode *ref) {
+    if (!vm || !vm->host.doc || !parent || !child || parent == child) return;
+    if (js_is_ancestor_or_self(child, parent)) return;
+    ArcrDocument *doc = vm->host.doc;
+
+    if (js_node_is_fragment(vm, child)) {
+        ArcrDomNode *cur = child->first_child;
+        while (cur) {
+            ArcrDomNode *nxt = cur->next_sibling;
+            js_dom_insert_before_raw(vm, parent, cur, ref);
+            cur = nxt;
+        }
+        return;
+    }
+
+    if (ref && ref->parent != parent) ref = NULL;
+    if (ref == child) return;
+
+    js_dom_unlink(doc, child);
+    child->parent = parent;
+
+    if (!ref) {
+        child->prev_sibling = parent->last_child;
+        child->next_sibling = NULL;
+        if (parent->last_child) {
+            parent->last_child->next_sibling = child;
+        } else {
+            parent->first_child = child;
+        }
+        parent->last_child = child;
+    } else {
+        /* Ensure ref->prev_sibling is accurate even if HTML parser only set next_sibling */
+        ArcrDomNode *prev = ref->prev_sibling;
+        if (!prev && parent->first_child != ref) {
+            for (ArcrDomNode *c = parent->first_child; c != NULL; c = c->next_sibling) {
+                if (c->next_sibling == ref) { prev = c; break; }
+            }
+        }
+        child->prev_sibling = prev;
+        child->next_sibling = ref;
+        ref->prev_sibling   = child;
+        if (prev) prev->next_sibling = child;
+        else parent->first_child = child;
+    }
+
+    if (!doc->body && child->kind == ARCR_NODE_ELEMENT &&
+        arcr_str_eq_nocase(arcr_atom_cstr(doc->atoms, child->tag), "body")) {
+        doc->body = child;
+    }
+    js_recompute_bloom_rec(child);
+    if (js_node_in_doc_root(doc, parent)) {
+        js_sync_DynamicStyle_if_needed(doc, child);
+    }
+    doc->dom_dirty = true;
+}
+
+static ArcrDomNode *js_dom_alloc_node(ArcrJsVm *vm, ArcrNodeKind kind) {
+    if (!vm || !vm->host.doc) return NULL;
+    ArcrDocument *doc = vm->host.doc;
+    ArcrDomNode *n = (ArcrDomNode *)arcr_slab_alloc(&doc->node_slab);
+    if (!n) return NULL;
+    memset(n, 0, sizeof(*n));
+    n->kind     = kind;
+    n->node_uid = ++doc->next_uid;
+    doc->node_count++;
+    doc->dom_dirty = true;
+    if (js_uid_ensure_cap(vm, n->node_uid)) {
+        vm->uid_table[n->node_uid] = n;
+    }
+    return n;
+}
+
+static ArcrDomNode *js_dom_create_element(ArcrJsVm *vm, const char *tag, size_t len) {
+    if (!vm || !vm->host.doc || !tag || len == 0u) return NULL;
+    ArcrDocument *doc = vm->host.doc;
+    ArcrDomNode *n = js_dom_alloc_node(vm, ARCR_NODE_ELEMENT);
+    if (!n) return NULL;
+    n->tag = arcr_atom_intern_lower(doc->atoms, tag, len);
+    if (arcr_str_eq_nocase_n(tag, len, "video", 5u) ||
+        arcr_str_eq_nocase_n(tag, len, "audio", 5u)) {
+        doc->has_media = true;
+    } else if (arcr_str_eq_nocase_n(tag, len, "img", 3u) ||
+               arcr_str_eq_nocase_n(tag, len, "canvas", 6u)) {
+        doc->has_images = true;
+    }
+    return n;
+}
+
+static ArcrDomNode *js_dom_create_text(ArcrJsVm *vm, const char *s, size_t len) {
+    if (!vm || !vm->host.doc) return NULL;
+    ArcrDocument *doc = vm->host.doc;
+    ArcrDomNode *n = js_dom_alloc_node(vm, ARCR_NODE_TEXT);
+    if (!n) return NULL;
+    n->text     = arcr_arena_strdup(&doc->arena, s ? s : "", len);
+    n->text_len = len;
+    return n;
+}
+
+static ArcrDomNode *js_dom_create_comment(ArcrJsVm *vm, const char *s, size_t len) {
+    if (!vm || !vm->host.doc) return NULL;
+    ArcrDocument *doc = vm->host.doc;
+    ArcrDomNode *n = js_dom_alloc_node(vm, ARCR_NODE_COMMENT);
+    if (!n) return NULL;
+    n->text     = arcr_arena_strdup(&doc->arena, s ? s : "", len);
+    n->text_len = len;
+    return n;
+}
+
+static ArcrDomNode *js_dom_create_fragment(ArcrJsVm *vm) {
+    if (!vm || !vm->host.doc) return NULL;
+    if (vm->frag_atom == ARCR_ATOM_NULL) {
+        vm->frag_atom = arcr_atom_intern_lower(
+            vm->host.doc->atoms, ARCR_FRAG_TAG_ATOM_NAME, strlen(ARCR_FRAG_TAG_ATOM_NAME));
+    }
+    ArcrDomNode *n = js_dom_alloc_node(vm, ARCR_NODE_ELEMENT);
+    if (n) n->tag = vm->frag_atom;
+    return n;
+}
+
+static bool js_elem_has_class(const ArcrDomNode *el, ArcrAtom cls) {
+    if (!el || el->kind != ARCR_NODE_ELEMENT || cls == ARCR_ATOM_NULL) return false;
+    uint32_t inl = ARCR_MIN(el->class_count, ARCR_MAX_INLINE_CLASSES);
+    for (uint32_t i = 0u; i < inl; ++i) {
+        if (el->classes[i] == cls) return true;
+    }
+    if (el->class_count > ARCR_MAX_INLINE_CLASSES && el->extra_classes) {
+        uint32_t ext = el->class_count - ARCR_MAX_INLINE_CLASSES;
+        for (uint32_t i = 0u; i < ext; ++i) {
+            if (el->extra_classes[i] == cls) return true;
+        }
+    }
+    return false;
+}
+
+static void js_elem_add_class_atom(ArcrDocument *doc, ArcrDomNode *el, ArcrAtom cls) {
+    if (!doc || !el || cls == ARCR_ATOM_NULL || js_elem_has_class(el, cls)) return;
+    if (el->class_count < ARCR_MAX_INLINE_CLASSES) {
+        el->classes[el->class_count++] = cls;
+    } else {
+        uint32_t ext_idx = el->class_count - ARCR_MAX_INLINE_CLASSES;
+        if (ext_idx >= el->extra_class_cap) {
+            uint32_t ncap = el->extra_class_cap ? el->extra_class_cap * 2u : 16u;
+            ArcrAtom *narr = (ArcrAtom *)arcr_arena_alloc(
+                &doc->arena, (size_t)ncap * sizeof(ArcrAtom), sizeof(ArcrAtom));
+            if (!narr) return;
+            if (el->extra_classes && ext_idx > 0u) {
+                memcpy(narr, el->extra_classes, (size_t)ext_idx * sizeof(ArcrAtom));
+            }
+            el->extra_classes   = narr;
+            el->extra_class_cap = ncap;
+        }
+        el->extra_classes[ext_idx] = cls;
+        el->class_count++;
+    }
+}
+
+static void js_sync_classes_from_str(ArcrDocument *doc, ArcrDomNode *el,
+                                     const char *val, size_t len) {
+    if (!doc || !el) return;
+    el->class_count = 0u;
+    size_t i = 0u;
+    while (i < len) {
+        while (i < len && (val[i] == ' ' || val[i] == '\t' || val[i] == '\n' || val[i] == '\r')) ++i;
+        size_t st = i;
+        while (i < len && val[i] != ' ' && val[i] != '\t' && val[i] != '\n' && val[i] != '\r') ++i;
+        if (i > st) {
+            ArcrAtom a = arcr_atom_intern(doc->atoms, val + st, i - st);
+            js_elem_add_class_atom(doc, el, a);
+        }
+    }
+    js_recompute_bloom_rec(el);
+}
+
+static const char *js_dom_get_attr(const ArcrDocument *doc, const ArcrDomNode *el,
+                                   const char *name) {
     if (!doc || !el || el->kind != ARCR_NODE_ELEMENT || !name) return NULL;
-    ArcrAtom a = arcr_atom_intern_lower(doc->atoms, name, strlen(name));
-    for (const ArcrAttr *at = el->first_attr; at != NULL; at = at->next) {
-        if (at->name == a) return at->value;
+    ArcrAtom na = arcr_atom_intern_lower(doc->atoms, name, strlen(name));
+    for (const ArcrAttr *a = el->first_attr; a != NULL; a = a->next) {
+        if (a->name == na) return a->value;
     }
     return NULL;
 }
 
-static void js_dom_sync_class_attr(ArcrDocument *doc, ArcrDomNode *el) {
-    char buf[512];
-    size_t pos = 0u;
-    buf[0] = '\0';
-    for (uint32_t i = 0u; i < el->class_count; ++i) {
-        const char *cs = arcr_atom_cstr(doc->atoms, el->classes[i]);
-        if (!cs) continue;
-        size_t cl = strlen(cs);
-        if (pos > 0u && pos + 1u < sizeof(buf)) buf[pos++] = ' ';
-        if (pos + cl < sizeof(buf)) {
-            memcpy(buf + pos, cs, cl);
-            pos += cl;
-        }
+static void js_dom_set_input_val(ArcrDocument *doc, ArcrDomNode *el, const char *val) {
+    if (!doc || !el) return;
+    if (!val) val = "";
+    size_t len = strlen(val);
+    if (!el->input_value || len + 1u > el->input_cap) {
+        size_t ncap = ARCR_MAX(len + 32u, el->input_cap ? el->input_cap * 2u : 64u);
+        char *nbuf = (char *)arcr_arena_alloc(&doc->arena, ncap, 1u);
+        if (!nbuf) return;
+        el->input_value = nbuf;
+        el->input_cap   = ncap;
     }
-    buf[pos] = '\0';
-    ArcrAtom ca = arcr_atom_intern_lower(doc->atoms, "class", 5u);
-    char *stored = arcr_arena_strdup(&doc->arena, buf, pos);
-    if (!stored) return;
-    for (ArcrAttr *at = el->first_attr; at != NULL; at = at->next) {
-        if (at->name == ca) {
-            at->value = stored;
-            doc->dom_dirty = true;
-            return;
-        }
-    }
-    ArcrAttr *na = (ArcrAttr *)arcr_arena_alloc(&doc->arena, sizeof(ArcrAttr), sizeof(void *));
-    if (na) {
-        na->name = ca;
-        na->value = stored;
-        na->next = el->first_attr;
-        el->first_attr = na;
-    }
+    memcpy(el->input_value, val, len + 1u);
     doc->dom_dirty = true;
 }
 
@@ -849,4077 +492,3767 @@ static void js_dom_set_attr(ArcrDocument *doc, ArcrDomNode *el,
                             const char *val, size_t vlen) {
     if (!doc || !el || el->kind != ARCR_NODE_ELEMENT || !name || nlen == 0u) return;
     ArcrAtom na = arcr_atom_intern_lower(doc->atoms, name, nlen);
-    char *stored = arcr_arena_strdup(&doc->arena, val ? val : "", vlen);
-    if (!stored) return;
+    const char *dup_v = arcr_arena_strdup(&doc->arena, val ? val : "", vlen);
+    if (!dup_v) return;
 
-    bool updated = false;
-    for (ArcrAttr *at = el->first_attr; at != NULL; at = at->next) {
-        if (at->name == na) {
-            at->value = stored;
-            updated   = true;
+    bool found = false;
+    ArcrAttr *tail = NULL;
+    for (ArcrAttr *a = el->first_attr; a != NULL; a = a->next) {
+        if (a->name == na) {
+            a->value = dup_v;
+            found = true;
             break;
         }
+        tail = a;
     }
-    if (!updated) {
-        ArcrAttr *at = (ArcrAttr *)arcr_arena_alloc(&doc->arena, sizeof(ArcrAttr), sizeof(void *));
-        if (!at) return;
-        at->name       = na;
-        at->value      = stored;
-        at->next       = el->first_attr;
-        el->first_attr = at;
+    if (!found) {
+        ArcrAttr *na_node = (ArcrAttr *)arcr_arena_alloc(&doc->arena, sizeof(ArcrAttr), sizeof(void *));
+        if (!na_node) return;
+        na_node->name  = na;
+        na_node->value = dup_v;
+        na_node->next  = NULL;
+        if (tail) tail->next = na_node;
+        else el->first_attr = na_node;
     }
 
     if (arcr_str_eq_nocase_n(name, nlen, "id", 2u)) {
-        el->id = (vlen > 0u) ? arcr_atom_intern(doc->atoms, val, vlen) : ARCR_ATOM_NULL;
-        js_recompute_subtree_bloom(el);
+        el->id = (vlen > 0u) ? arcr_atom_intern(doc->atoms, dup_v, vlen) : ARCR_ATOM_NULL;
+        js_recompute_bloom_rec(el);
     } else if (arcr_str_eq_nocase_n(name, nlen, "class", 5u)) {
-        el->class_count = 0u;
-        size_t i = 0u;
-        while (i < vlen && el->class_count < ARCR_MAX_INLINE_CLASSES) {
-            while (i < vlen && (val[i] == ' ' || val[i] == '\t' || val[i] == '\n' || val[i] == '\r')) ++i;
-            size_t st = i;
-            while (i < vlen && val[i] != ' ' && val[i] != '\t' && val[i] != '\n' && val[i] != '\r') ++i;
-            if (i > st) {
-                el->classes[el->class_count++] = arcr_atom_intern(doc->atoms, val + st, i - st);
-            }
-        }
-        js_recompute_subtree_bloom(el);
+        js_sync_classes_from_str(doc, el, dup_v, vlen);
     } else if (arcr_str_eq_nocase_n(name, nlen, "checked", 7u)) {
-        el->state_flags |= ARCR_STATE_CHECKED;
+        el->state_flags |= (uint32_t)ARCR_STATE_CHECKED;
+    } else if (arcr_str_eq_nocase_n(name, nlen, "value", 5u) && !el->input_value) {
+        js_dom_set_input_val(doc, el, dup_v);
     }
     doc->dom_dirty = true;
 }
 
-static void js_dom_unlink(ArcrDomNode *node) {
-    if (!node || !node->parent) return;
-    ArcrDomNode *p = node->parent;
-    ArcrDomNode *prev = NULL;
-    for (ArcrDomNode *cur = p->first_child; cur != NULL; cur = cur->next_sibling) {
-        if (cur == node) {
-            if (prev) prev->next_sibling = cur->next_sibling;
-            else p->first_child = cur->next_sibling;
-            if (p->last_child == cur) p->last_child = prev;
+static void js_dom_remove_attr(ArcrDocument *doc, ArcrDomNode *el, const char *name) {
+    if (!doc || !el || el->kind != ARCR_NODE_ELEMENT || !name) return;
+    size_t nlen = strlen(name);
+    ArcrAtom na = arcr_atom_intern_lower(doc->atoms, name, nlen);
+    ArcrAttr *prev = NULL;
+    for (ArcrAttr *a = el->first_attr; a != NULL; a = a->next) {
+        if (a->name == na) {
+            if (prev) prev->next = a->next;
+            else el->first_attr = a->next;
             break;
         }
-        prev = cur;
+        prev = a;
     }
-    node->parent       = NULL;
-    node->next_sibling = NULL;
-}
-
-static void js_dom_append_child(ArcrDocument *doc, ArcrDomNode *parent, ArcrDomNode *child) {
-    if (!doc || !parent || !child || parent == child) return;
-    for (ArcrDomNode *anc = parent; anc != NULL; anc = anc->parent) {
-        if (anc == child) return; /* Prevent DOM cycle */
+    if (arcr_str_eq_nocase_n(name, nlen, "id", 2u)) {
+        el->id = ARCR_ATOM_NULL;
+        js_recompute_bloom_rec(el);
+    } else if (arcr_str_eq_nocase_n(name, nlen, "class", 5u)) {
+        el->class_count = 0u;
+        js_recompute_bloom_rec(el);
+    } else if (arcr_str_eq_nocase_n(name, nlen, "checked", 7u)) {
+        el->state_flags &= ~((uint32_t)ARCR_STATE_CHECKED);
     }
-    js_dom_unlink(child);
-    child->parent       = parent;
-    child->next_sibling = NULL;
-    if (!parent->first_child) {
-        parent->first_child = child;
-        parent->last_child  = child;
-    } else {
-        parent->last_child->next_sibling = child;
-        parent->last_child               = child;
-    }
-    js_recompute_subtree_bloom(child);
     doc->dom_dirty = true;
 }
 
-static ArcrDomNode *js_dom_create_element(ArcrDocument *doc, const char *tag, size_t tlen) {
-    if (!doc || !tag || tlen == 0u) return NULL;
-    ArcrDomNode *n = (ArcrDomNode *)arcr_slab_alloc(&doc->node_slab);
-    if (!n) return NULL;
-    memset(n, 0, sizeof(*n));
-    if (doc->next_uid == 0u) doc->next_uid = 1u;
-    n->kind     = ARCR_NODE_ELEMENT;
-    n->node_uid = doc->next_uid++;
-    n->tag      = arcr_atom_intern_lower(doc->atoms, tag, tlen);
-    doc->node_count++;
-    doc->dom_dirty = true;
-    return n;
-}
+static ArcrDomSurface *js_dom_ensure_surface(ArcrJsVm *vm, ArcrDomNode *el,
+                                             int32_t w, int32_t h) {
+    if (!vm || !vm->host.doc || !el || w <= 0 || h <= 0) return NULL;
+    if (w > 4096) w = 4096;
+    if (h > 4096) h = 4096;
+    ArcrDocument *doc = vm->host.doc;
 
-static ArcrDomNode *js_dom_create_text(ArcrDocument *doc, const char *txt, size_t len) {
-    if (!doc) return NULL;
-    ArcrDomNode *n = (ArcrDomNode *)arcr_slab_alloc(&doc->node_slab);
-    if (!n) return NULL;
-    memset(n, 0, sizeof(*n));
-    if (doc->next_uid == 0u) doc->next_uid = 1u;
-    n->kind     = ARCR_NODE_TEXT;
-    n->node_uid = doc->next_uid++;
-    n->text     = arcr_arena_strdup(&doc->arena, txt ? txt : "", len);
-    n->text_len = len;
-    doc->node_count++;
-    doc->dom_dirty = true;
-    return n;
-}
-
-static void js_dom_clear_children(ArcrDocument *doc, ArcrDomNode *el) {
-    if (!doc || !el) return;
-    ArcrDomNode *ch = el->first_child;
-    while (ch) {
-        ArcrDomNode *nx = ch->next_sibling;
-        ch->parent       = NULL;
-        ch->next_sibling = NULL;
-        ch = nx;
+    if (el->surface && el->surface->argb_pixels &&
+        el->surface->width == w && el->surface->height == h) {
+        return el->surface;
     }
-    el->first_child = NULL;
-    el->last_child  = NULL;
+    if (!el->surface) {
+        el->surface = (ArcrDomSurface *)arcr_arena_calloc(
+            &doc->arena, 1u, sizeof(ArcrDomSurface), sizeof(void *));
+        if (!el->surface) return NULL;
+        DetachedSurfTrack *tr = (DetachedSurfTrack *)malloc(sizeof(DetachedSurfTrack));
+        if (tr) {
+            tr->surf = el->surface;
+            tr->next = vm->surf_track_head;
+            vm->surf_track_head = tr;
+        }
+    } else if (el->surface->heap_owned && el->surface->argb_pixels) {
+        free(el->surface->argb_pixels);
+        el->surface->argb_pixels = NULL;
+        el->surface->heap_owned  = false;
+    }
+
+    uint32_t *px = (uint32_t *)calloc((size_t)w * (size_t)h, sizeof(uint32_t));
+    if (!px) return NULL;
+    el->surface->width       = w;
+    el->surface->height      = h;
+    el->surface->argb_pixels = px;
+    el->surface->heap_owned  = true;
+    doc->has_images = true;
     doc->dom_dirty  = true;
+    return el->surface;
 }
 
-static size_t js_dom_collect_text(const ArcrDomNode *n, char *out, size_t cap, size_t pos) {
-    if (!n) return pos;
-    if (n->kind == ARCR_NODE_TEXT && n->text && n->text_len > 0u) {
-        if (out && cap > 0u && pos + 1u < cap) {
-            size_t cn = ARCR_MIN(n->text_len, cap - 1u - pos);
-            memcpy(out + pos, n->text, cn);
-        }
-        pos += n->text_len;
+/* -------------------------------------------------------------------------
+ * 3. Growable Buffer, HTML Serializer, Fragment Parser & CSS Selector Engine
+ * ------------------------------------------------------------------------- */
+typedef struct JsByteBuf {
+    char  *data;
+    size_t len;
+    size_t cap;
+} JsByteBuf;
+
+static bool jbuf_push(JsByteBuf *b, const char *s, size_t n) {
+    if (!b) return false;
+    if (b->len + n + 1u > b->cap) {
+        size_t ncap = b->cap ? b->cap * 2u : 256u;
+        while (ncap < b->len + n + 1u) ncap *= 2u;
+        char *nd = (char *)realloc(b->data, ncap);
+        if (!nd) return false;
+        b->data = nd;
+        b->cap  = ncap;
     }
-    for (const ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
-        pos = js_dom_collect_text(ch, out, cap, pos);
-    }
-    return pos;
-}
-
-static void js_dom_parse_fragment(ArcrDocument *doc, ArcrDomNode *target, const char *html, size_t len) {
-    if (!doc || !target) return;
-    js_dom_clear_children(doc, target);
-    if (!html || len == 0u) return;
-
-    ArcrDomNode *stack[32];
-    size_t depth = 0u;
-    stack[depth++] = target;
-
-    size_t i = 0u;
-    while (i < len) {
-        if (html[i] == '<') {
-            if (i + 4u <= len && memcmp(html + i, "<!--", 4u) == 0) {
-                size_t j = i + 4u;
-                while (j + 3u <= len && memcmp(html + j, "-->", 3u) != 0) ++j;
-                i = (j + 3u <= len) ? (j + 3u) : len;
-                continue;
-            }
-            if (i + 2u < len && html[i + 1u] == '/') {
-                size_t j = i + 2u;
-                size_t ts = j;
-                while (j < len && html[j] != '>' && html[j] != ' ') ++j;
-                size_t te = j;
-                while (j < len && html[j] != '>') ++j;
-                i = (j < len) ? (j + 1u) : len;
-                if (te > ts) {
-                    ArcrAtom ca = arcr_atom_intern_lower(doc->atoms, html + ts, te - ts);
-                    for (size_t k = depth; k > 1u; --k) {
-                        if (stack[k - 1u]->tag == ca) { depth = k - 1u; break; }
-                    }
-                }
-                continue;
-            }
-            if (i + 1u < len && ((html[i + 1u] >= 'a' && html[i + 1u] <= 'z') ||
-                                 (html[i + 1u] >= 'A' && html[i + 1u] <= 'Z'))) {
-                size_t j = i + 1u;
-                size_t ts = j;
-                while (j < len && html[j] != ' ' && html[j] != '\t' && html[j] != '\n' &&
-                       html[j] != '\r' && html[j] != '>' && html[j] != '/') ++j;
-                const char *tptr = html + ts;
-                size_t tlen = j - ts;
-                ArcrDomNode *el = js_dom_create_element(doc, tptr, tlen);
-                if (el) js_dom_append_child(doc, stack[depth - 1u], el);
-
-                bool self_close = false;
-                while (j < len) {
-                    while (j < len && (html[j] == ' ' || html[j] == '\t' || html[j] == '\n' || html[j] == '\r')) ++j;
-                    if (j >= len) break;
-                    if (html[j] == '>') { ++j; break; }
-                    if (html[j] == '/' && j + 1u < len && html[j + 1u] == '>') { self_close = true; j += 2u; break; }
-                    size_t as = j;
-                    while (j < len && html[j] != '=' && html[j] != '>' && html[j] != '/' &&
-                           html[j] != ' ' && html[j] != '\t') ++j;
-                    size_t ae = j;
-                    while (j < len && (html[j] == ' ' || html[j] == '\t')) ++j;
-                    const char *vp = "";
-                    size_t vl = 0u;
-                    if (j < len && html[j] == '=') {
-                        ++j;
-                        while (j < len && (html[j] == ' ' || html[j] == '\t')) ++j;
-                        if (j < len && (html[j] == '"' || html[j] == '\'')) {
-                            char q = html[j++];
-                            size_t vs = j;
-                            while (j < len && html[j] != q) ++j;
-                            vp = html + vs;
-                            vl = j - vs;
-                            if (j < len) ++j;
-                        } else {
-                            size_t vs = j;
-                            while (j < len && html[j] != ' ' && html[j] != '>') ++j;
-                            vp = html + vs;
-                            vl = j - vs;
-                        }
-                    }
-                    if (ae > as && el) js_dom_set_attr(doc, el, html + as, ae - as, vp, vl);
-                    else if (j == as) ++j;
-                }
-                i = j;
-                bool is_void = arcr_str_eq_nocase_n(tptr, tlen, "br", 2u) ||
-                               arcr_str_eq_nocase_n(tptr, tlen, "hr", 2u) ||
-                               arcr_str_eq_nocase_n(tptr, tlen, "img", 3u) ||
-                               arcr_str_eq_nocase_n(tptr, tlen, "input", 5u);
-                if (!self_close && !is_void && el && depth + 1u < ARCR_ARRAY_LEN(stack)) {
-                    stack[depth++] = el;
-                }
-                continue;
-            }
-        }
-        size_t ts = i;
-        while (i < len && html[i] != '<') ++i;
-        if (i > ts) {
-            ArcrDomNode *tn = js_dom_create_text(doc, html + ts, i - ts);
-            if (tn) js_dom_append_child(doc, stack[depth - 1u], tn);
-        }
-    }
-}
-
-static size_t js_dom_serialize_children(const ArcrDocument *doc, const ArcrDomNode *parent,
-                                        char *out, size_t cap, size_t pos) {
-    for (const ArcrDomNode *ch = parent ? parent->first_child : NULL; ch != NULL; ch = ch->next_sibling) {
-        if (ch->kind == ARCR_NODE_TEXT && ch->text) {
-            if (out && pos + ch->text_len < cap) memcpy(out + pos, ch->text, ch->text_len);
-            pos += ch->text_len;
-        } else if (ch->kind == ARCR_NODE_ELEMENT) {
-            const char *tg = arcr_atom_cstr(doc->atoms, ch->tag);
-            if (!tg) tg = "div";
-            size_t tl = strlen(tg);
-            if (out && pos + tl + 2u < cap) {
-                out[pos] = '<';
-                memcpy(out + pos + 1u, tg, tl);
-                out[pos + 1u + tl] = '>';
-            }
-            pos += tl + 2u;
-            pos = js_dom_serialize_children(doc, ch, out, cap, pos);
-            if (out && pos + tl + 3u < cap) {
-                out[pos] = '<';
-                out[pos + 1u] = '/';
-                memcpy(out + pos + 2u, tg, tl);
-                out[pos + 2u + tl] = '>';
-            }
-            pos += tl + 3u;
-        }
-    }
-    if (out && cap > 0u) out[(pos < cap) ? pos : (cap - 1u)] = '\0';
-    return pos;
-}
-
-/* CSS Selector matching for getElementById / querySelector / querySelectorAll */
-typedef struct JsSimpleSel {
-    ArcrAtom    tag;
-    ArcrAtom    id;
-    ArcrAtom    classes[4];
-    uint32_t    class_cnt;
-    ArcrAtom    attr_name;
-    const char *attr_val;
-    size_t      attr_vlen;
-    bool        has_attr_val;
-} JsSimpleSel;
-
-static void js_parse_simple_sel(ArcrAtomTable *atoms, const char *s, size_t len, JsSimpleSel *out) {
-    memset(out, 0, sizeof(*out));
-    arcr_str_trim_view(&s, &len);
-    if (len == 0u || (len == 1u && s[0] == '*')) return;
-
-    size_t i = 0u;
-    if (s[0] != '#' && s[0] != '.' && s[0] != '[') {
-        size_t st = 0u;
-        while (i < len && s[i] != '#' && s[i] != '.' && s[i] != '[' && s[i] != ':') ++i;
-        if (i > st) out->tag = arcr_atom_intern_lower(atoms, s + st, i - st);
-    }
-    while (i < len) {
-        char ch = s[i];
-        if (ch == '#' || ch == '.') {
-            ++i;
-            size_t st = i;
-            while (i < len && s[i] != '#' && s[i] != '.' && s[i] != '[' && s[i] != ':') ++i;
-            if (i > st) {
-                if (ch == '#') out->id = arcr_atom_intern(atoms, s + st, i - st);
-                else if (out->class_cnt < 4u)
-                    out->classes[out->class_cnt++] = arcr_atom_intern(atoms, s + st, i - st);
-            }
-        } else if (ch == '[') {
-            ++i;
-            size_t st = i;
-            while (i < len && s[i] != '=' && s[i] != ']') ++i;
-            if (i > st) {
-                const char *an = s + st;
-                size_t al = i - st;
-                arcr_str_trim_view(&an, &al);
-                out->attr_name = arcr_atom_intern_lower(atoms, an, al);
-            }
-            if (i < len && s[i] == '=') {
-                ++i;
-                size_t vs = i;
-                while (i < len && s[i] != ']') ++i;
-                const char *av = s + vs;
-                size_t avl = i - vs;
-                arcr_str_trim_view(&av, &avl);
-                if (avl >= 2u && (av[0] == '"' || av[0] == '\'') && av[avl - 1u] == av[0]) {
-                    ++av;
-                    avl -= 2u;
-                }
-                out->attr_val     = av;
-                out->attr_vlen    = avl;
-                out->has_attr_val = true;
-            }
-            if (i < len && s[i] == ']') ++i;
-        } else {
-            ++i;
-        }
-    }
-}
-
-static bool js_match_simple_sel(const JsSimpleSel *sel, const ArcrDomNode *el) {
-    if (!el || el->kind != ARCR_NODE_ELEMENT) return false;
-    if (sel->tag != ARCR_ATOM_NULL && el->tag != sel->tag) return false;
-    if (sel->id != ARCR_ATOM_NULL && el->id != sel->id) return false;
-    for (uint32_t c = 0u; c < sel->class_cnt; ++c) {
-        bool found = false;
-        for (uint32_t j = 0u; j < el->class_count; ++j) {
-            if (el->classes[j] == sel->classes[c]) { found = true; break; }
-        }
-        if (!found) return false;
-    }
-    if (sel->attr_name != ARCR_ATOM_NULL) {
-        const char *av = NULL;
-        for (const ArcrAttr *at = el->first_attr; at != NULL; at = at->next) {
-            if (at->name == sel->attr_name) { av = at->value; break; }
-        }
-        if (!av) return false;
-        if (sel->has_attr_val && (strlen(av) != sel->attr_vlen ||
-                                  memcmp(av, sel->attr_val, sel->attr_vlen) != 0)) {
-            return false;
-        }
-    }
+    if (s && n > 0u) memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
     return true;
 }
 
-static bool js_match_compound_sel(ArcrAtomTable *atoms, const char *sel_str, size_t sel_len,
-                                  const ArcrDomNode *el, const ArcrDomNode *scope_root) {
-    arcr_str_trim_view(&sel_str, &sel_len);
-    if (sel_len == 0u) return false;
-
-    /* Split whitespace/'>' combinators right-to-left */
-    JsSimpleSel chain[8];
-    bool direct_parent[8];
-    size_t count = 0u;
-    memset(direct_parent, 0, sizeof(direct_parent));
-
-    size_t i = 0u;
-    bool next_direct = false;
-    while (i < sel_len && count < 8u) {
-        while (i < sel_len && (sel_str[i] == ' ' || sel_str[i] == '\t')) ++i;
-        if (i < sel_len && sel_str[i] == '>') {
-            next_direct = true;
-            ++i;
-            while (i < sel_len && (sel_str[i] == ' ' || sel_str[i] == '\t')) ++i;
-        }
-        size_t st = i;
-        int brk = 0;
-        while (i < sel_len) {
-            if (sel_str[i] == '[') ++brk;
-            else if (sel_str[i] == ']' && brk > 0) --brk;
-            else if (brk == 0 && (sel_str[i] == ' ' || sel_str[i] == '\t' || sel_str[i] == '>')) break;
-            ++i;
-        }
-        if (i > st) {
-            js_parse_simple_sel(atoms, sel_str + st, i - st, &chain[count]);
-            direct_parent[count] = next_direct;
-            next_direct = false;
-            ++count;
-        }
-    }
-    if (count == 0u) return false;
-    if (!js_match_simple_sel(&chain[count - 1u], el)) return false;
-
-    const ArcrDomNode *cur = el;
-    for (size_t k = count - 1u; k > 0u; --k) {
-        if (direct_parent[k]) {
-            cur = cur->parent;
-            if (!cur || cur == scope_root->parent || !js_match_simple_sel(&chain[k - 1u], cur)) {
-                return false;
-            }
-        } else {
-            cur = cur->parent;
-            bool matched = false;
-            while (cur && cur != scope_root->parent) {
-                if (js_match_simple_sel(&chain[k - 1u], cur)) { matched = true; break; }
-                cur = cur->parent;
-            }
-            if (!matched) return false;
-        }
-    }
-    return true;
+static bool jbuf_cstr(JsByteBuf *b, const char *s) {
+    return jbuf_push(b, s, s ? strlen(s) : 0u);
 }
 
-static bool js_match_selector_list(ArcrAtomTable *atoms, const char *sel, const ArcrDomNode *el,
-                                   const ArcrDomNode *scope_root) {
-    size_t len = strlen(sel);
-    size_t pos = 0u;
-    while (pos < len) {
-        size_t comma = pos;
-        int brk = 0;
-        while (comma < len) {
-            if (sel[comma] == '[') ++brk;
-            else if (sel[comma] == ']' && brk > 0) --brk;
-            else if (brk == 0 && sel[comma] == ',') break;
-            ++comma;
-        }
-        if (js_match_compound_sel(atoms, sel + pos, comma - pos, el, scope_root)) return true;
-        pos = (comma < len) ? (comma + 1u) : len;
+static void jbuf_html_escaped(JsByteBuf *b, const char *s, size_t len, bool is_attr) {
+    if (!s) return;
+    for (size_t i = 0u; i < len; ++i) {
+        char c = s[i];
+        if (c == '&') jbuf_cstr(b, "&amp;");
+        else if (c == '<' && !is_attr) jbuf_cstr(b, "&lt;");
+        else if (c == '>' && !is_attr) jbuf_cstr(b, "&gt;");
+        else if (c == '"' && is_attr)  jbuf_cstr(b, "&quot;");
+        else jbuf_push(b, &c, 1u);
+    }
+}
+
+static bool is_void_html_tag(const char *t) {
+    static const char *const kVoid[] = {
+        "area", "base", "br", "col", "embed", "hr", "img",
+        "input", "link", "meta", "param", "source", "track", "wbr"
+    };
+    for (size_t i = 0u; i < ARCR_ARRAY_LEN(kVoid); ++i) {
+        if (arcr_str_eq_nocase(t, kVoid[i])) return true;
     }
     return false;
 }
 
-static void js_query_walk(ArcrDocument *doc, ArcrDomNode *node, ArcrDomNode *scope_root,
-                          const char *sel, ArcrDomNode **out, size_t *io_cnt, size_t max_out) {
-    if (!node || *io_cnt >= max_out) return;
-    if (node != scope_root && node->kind == ARCR_NODE_ELEMENT) {
-        if (js_match_selector_list(doc->atoms, sel, node, scope_root)) {
-            out[(*io_cnt)++] = node;
-            if (*io_cnt >= max_out) return;
+static void js_serialize_node_rec(const ArcrJsVm *vm, const ArcrDocument *doc,
+                                  const ArcrDomNode *n, bool include_self, JsByteBuf *out) {
+    if (!doc || !n || !out) return;
+    if (!include_self || n->kind == ARCR_NODE_DOCUMENT || js_node_is_fragment(vm, n)) {
+        for (const ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
+            js_serialize_node_rec(vm, doc, ch, true, out);
         }
+        return;
     }
-    for (ArcrDomNode *ch = node->first_child; ch != NULL; ch = ch->next_sibling) {
-        js_query_walk(doc, ch, scope_root, sel, out, io_cnt, max_out);
-        if (*io_cnt >= max_out) return;
+    if (n->kind == ARCR_NODE_TEXT) {
+        jbuf_html_escaped(out, n->text, n->text_len, false);
+        return;
     }
-}
-
-static ArcrDomNode *js_dom_find_by_id_rec(ArcrDomNode *n, ArcrAtom id_atom) {
-    if (!n) return NULL;
-    if (n->kind == ARCR_NODE_ELEMENT && n->id == id_atom) return n;
-    for (ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
-        ArcrDomNode *hit = js_dom_find_by_id_rec(ch, id_atom);
-        if (hit) return hit;
+    if (n->kind == ARCR_NODE_COMMENT) {
+        jbuf_cstr(out, "<!--");
+        jbuf_push(out, n->text, n->text_len);
+        jbuf_cstr(out, "-->");
+        return;
     }
-    return NULL;
-}
-
-/* Inline style camelCase <-> kebab-case updater */
-static void camel_to_kebab(const char *src, char *dst, size_t cap) {
-    if (strcmp(src, "cssFloat") == 0) { arcr_str_copy(dst, cap, "float"); return; }
-    size_t j = 0u;
-    for (size_t i = 0u; src[i] != '\0' && j + 2u < cap; ++i) {
-        char c = src[i];
-        if (c >= 'A' && c <= 'Z') {
-            dst[j++] = '-';
-            dst[j++] = (char)(c - 'A' + 'a');
+    if (n->kind == ARCR_NODE_ELEMENT) {
+        const char *tag = arcr_atom_cstr(doc->atoms, n->tag);
+        jbuf_cstr(out, "<");
+        jbuf_cstr(out, tag);
+        for (const ArcrAttr *a = n->first_attr; a != NULL; a = a->next) {
+            const char *an = arcr_atom_cstr(doc->atoms, a->name);
+            jbuf_cstr(out, " ");
+            jbuf_cstr(out, an);
+            jbuf_cstr(out, "=\"");
+            if (a->value) jbuf_html_escaped(out, a->value, strlen(a->value), true);
+            jbuf_cstr(out, "\"");
+        }
+        jbuf_cstr(out, ">");
+        if (is_void_html_tag(tag)) return;
+        if (!n->first_child && n->text && n->text_len > 0u) {
+            jbuf_push(out, n->text, n->text_len);
         } else {
-            dst[j++] = c;
-        }
-    }
-    dst[j] = '\0';
-}
-
-static void js_style_set_prop(ArcrDocument *doc, ArcrDomNode *el,
-                              const char *camel_prop, const char *new_val) {
-    if (!doc || !el) return;
-    if (strcmp(camel_prop, "cssText") == 0) {
-        js_dom_set_attr(doc, el, "style", 5u, new_val, strlen(new_val));
-        return;
-    }
-    char kebab[64];
-    camel_to_kebab(camel_prop, kebab, sizeof(kebab));
-    size_t klen = strlen(kebab);
-
-    const char *old_css = js_dom_get_attr(doc, el, "style");
-    char rebuilt[1024];
-    size_t rpos = 0u;
-    rebuilt[0] = '\0';
-
-    if (old_css && old_css[0] != '\0') {
-        size_t olen = strlen(old_css);
-        size_t i = 0u;
-        while (i < olen) {
-            size_t semi = i;
-            while (semi < olen && old_css[semi] != ';') ++semi;
-            const char *decl = old_css + i;
-            size_t dlen = semi - i;
-            i = (semi < olen) ? (semi + 1u) : olen;
-            arcr_str_trim_view(&decl, &dlen);
-            if (dlen == 0u) continue;
-
-            size_t colon = 0u;
-            while (colon < dlen && decl[colon] != ':') ++colon;
-            if (colon < dlen) {
-                const char *pk = decl;
-                size_t pkl = colon;
-                arcr_str_trim_view(&pk, &pkl);
-                if (arcr_str_eq_nocase_n(pk, pkl, kebab, klen)) continue;
-            }
-            if (rpos + dlen + 3u < sizeof(rebuilt)) {
-                if (rpos > 0u) rebuilt[rpos++] = ' ';
-                memcpy(rebuilt + rpos, decl, dlen);
-                rpos += dlen;
-                rebuilt[rpos++] = ';';
+            for (const ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
+                js_serialize_node_rec(vm, doc, ch, true, out);
             }
         }
+        jbuf_cstr(out, "</");
+        jbuf_cstr(out, tag);
+        jbuf_cstr(out, ">");
     }
-    if (new_val && new_val[0] != '\0') {
-        int n = snprintf(rebuilt + rpos, sizeof(rebuilt) - rpos,
-                         "%s%s: %s;", (rpos > 0u) ? " " : "", kebab, new_val);
-        if (n > 0 && rpos + (size_t)n < sizeof(rebuilt)) rpos += (size_t)n;
-    }
-    rebuilt[rpos] = '\0';
-    js_dom_set_attr(doc, el, "style", 5u, rebuilt, strlen(rebuilt));
 }
 
-static void js_style_get_prop(const ArcrDocument *doc, const ArcrDomNode *el,
-                              const char *camel_prop, char *out_val, size_t cap) {
-    out_val[0] = '\0';
-    if (!doc || !el) return;
-    const char *css = js_dom_get_attr(doc, el, "style");
-    if (!css) return;
-    if (strcmp(camel_prop, "cssText") == 0) {
-        arcr_str_copy(out_val, cap, css);
+static void js_collect_text_rec(const ArcrDomNode *n, JsByteBuf *out) {
+    if (!n || !out) return;
+    if (n->kind == ARCR_NODE_TEXT && n->text && n->text_len > 0u) {
+        jbuf_push(out, n->text, n->text_len);
         return;
     }
-    char kebab[64];
-    camel_to_kebab(camel_prop, kebab, sizeof(kebab));
-    size_t klen = strlen(kebab);
-    size_t clen = strlen(css);
+    if (n->kind == ARCR_NODE_ELEMENT && !n->first_child && n->text && n->text_len > 0u) {
+        jbuf_push(out, n->text, n->text_len);
+        return;
+    }
+    for (const ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
+        js_collect_text_rec(ch, out);
+    }
+}
+
+static void decode_html_entities(const char *src, size_t len, JsByteBuf *out) {
     size_t i = 0u;
-    while (i < clen) {
-        size_t semi = i;
-        while (semi < clen && css[semi] != ';') ++semi;
-        const char *decl = css + i;
-        size_t dlen = semi - i;
-        i = (semi < clen) ? (semi + 1u) : clen;
-        size_t colon = 0u;
-        while (colon < dlen && decl[colon] != ':') ++colon;
-        if (colon < dlen) {
-            const char *pk = decl;
-            size_t pkl = colon;
-            const char *pv = decl + colon + 1u;
-            size_t pvl = dlen - colon - 1u;
-            arcr_str_trim_view(&pk, &pkl);
-            arcr_str_trim_view(&pv, &pvl);
-            if (arcr_str_eq_nocase_n(pk, pkl, kebab, klen)) {
-                size_t cn = ARCR_MIN(pvl, cap - 1u);
-                memcpy(out_val, pv, cn);
-                out_val[cn] = '\0';
+    while (i < len) {
+        if (src[i] == '&') {
+            size_t semi = i + 1u;
+            while (semi < len && semi - i < 12u && src[semi] != ';' && src[semi] != '&' && src[semi] != ' ') {
+                ++semi;
             }
+            if (semi < len && src[semi] == ';') {
+                const char *ent = src + i + 1u;
+                size_t elen = semi - (i + 1u);
+                if (arcr_str_eq_nocase_n(ent, elen, "amp", 3u))  { jbuf_cstr(out, "&"); i = semi + 1u; continue; }
+                if (arcr_str_eq_nocase_n(ent, elen, "lt", 2u))   { jbuf_cstr(out, "<"); i = semi + 1u; continue; }
+                if (arcr_str_eq_nocase_n(ent, elen, "gt", 2u))   { jbuf_cstr(out, ">"); i = semi + 1u; continue; }
+                if (arcr_str_eq_nocase_n(ent, elen, "quot", 4u)) { jbuf_cstr(out, "\""); i = semi + 1u; continue; }
+                if (arcr_str_eq_nocase_n(ent, elen, "apos", 4u) ||
+                    arcr_str_eq_nocase_n(ent, elen, "#39", 3u))  { jbuf_cstr(out, "'"); i = semi + 1u; continue; }
+                if (arcr_str_eq_nocase_n(ent, elen, "nbsp", 4u)) { jbuf_cstr(out, "\xC2\xA0"); i = semi + 1u; continue; }
+                if (elen >= 2u && ent[0] == '#') {
+                    uint32_t cp = 0u;
+                    if (ent[1] == 'x' || ent[1] == 'X') {
+                        for (size_t k = 2u; k < elen; ++k) {
+                            char hc = ent[k];
+                            uint32_t d = (hc >= '0' && hc <= '9') ? (uint32_t)(hc - '0') :
+                                         (hc >= 'a' && hc <= 'f') ? (uint32_t)(hc - 'a' + 10) :
+                                         (hc >= 'A' && hc <= 'F') ? (uint32_t)(hc - 'A' + 10) : 99u;
+                            if (d > 15u) { cp = 0u; break; }
+                            cp = (cp << 4) | d;
+                        }
+                    } else {
+                        for (size_t k = 1u; k < elen; ++k) {
+                            if (ent[k] < '0' || ent[k] > '9') { cp = 0u; break; }
+                            cp = cp * 10u + (uint32_t)(ent[k] - '0');
+                        }
+                    }
+                    if (cp > 0u && cp <= 0x10FFFFu) {
+                        char u8[4];
+                        size_t ulen = arcr_utf8_encode_one(cp, u8);
+                        jbuf_push(out, u8, ulen);
+                        i = semi + 1u;
+                        continue;
+                    }
+                }
+            }
+        }
+        jbuf_push(out, &src[i], 1u);
+        ++i;
+    }
+}
+
+static bool is_html_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
+}
+
+static void js_parse_html_fragment(ArcrJsVm *vm, ArcrDomNode *target_parent,
+                                   const char *html, size_t len) {
+    if (!vm || !vm->host.doc || !target_parent || !html) return;
+    ArcrDocument *doc = vm->host.doc;
+    ArcrDomNode *stack[64];
+    int sp = 0;
+    stack[0] = target_parent;
+
+    size_t i = 0u;
+    while (i < len) {
+        if (html[i] != '<') {
+            size_t st = i;
+            while (i < len && html[i] != '<') ++i;
+            JsByteBuf dec = {0};
+            decode_html_entities(html + st, i - st, &dec);
+            if (dec.len > 0u) {
+                ArcrDomNode *tn = js_dom_create_text(vm, dec.data, dec.len);
+                if (tn) js_dom_insert_before_raw(vm, stack[sp], tn, NULL);
+            }
+            free(dec.data);
+            continue;
+        }
+
+        /* Comment <!-- ... --> */
+        if (i + 4u <= len && memcmp(html + i, "<!--", 4u) == 0) {
+            size_t st = i + 4u;
+            size_t end = st;
+            while (end + 3u <= len && memcmp(html + end, "-->", 3u) != 0) ++end;
+            ArcrDomNode *cn = js_dom_create_comment(vm, html + st, end - st);
+            if (cn) js_dom_insert_before_raw(vm, stack[sp], cn, NULL);
+            i = (end + 3u <= len) ? (end + 3u) : len;
+            continue;
+        }
+
+        /* <!DOCTYPE ...> */
+        if (i + 2u < len && html[i + 1u] == '!') {
+            while (i < len && html[i] != '>') ++i;
+            if (i < len) ++i;
+            continue;
+        }
+
+        /* Closing tag </tag> */
+        if (i + 2u < len && html[i + 1u] == '/') {
+            size_t st = i + 2u;
+            while (st < len && is_html_space(html[st])) ++st;
+            size_t te = st;
+            while (te < len && !is_html_space(html[te]) && html[te] != '>') ++te;
+            size_t gt = te;
+            while (gt < len && html[gt] != '>') ++gt;
+            if (te > st) {
+                ArcrAtom close_atom = arcr_atom_intern_lower(doc->atoms, html + st, te - st);
+                for (int k = sp; k > 0; --k) {
+                    if (stack[k]->tag == close_atom) {
+                        sp = k - 1;
+                        break;
+                    }
+                }
+            }
+            i = (gt < len) ? (gt + 1u) : len;
+            continue;
+        }
+
+        /* Opening tag <tag attr="val" ...> */
+        size_t st = i + 1u;
+        size_t te = st;
+        while (te < len && !is_html_space(html[te]) && html[te] != '>' && html[te] != '/') ++te;
+        if (te == st) {
+            ArcrDomNode *tn = js_dom_create_text(vm, "<", 1u);
+            if (tn) js_dom_insert_before_raw(vm, stack[sp], tn, NULL);
+            ++i;
+            continue;
+        }
+
+        ArcrDomNode *el = js_dom_create_element(vm, html + st, te - st);
+        size_t p = te;
+        bool self_close = false;
+        while (p < len && html[p] != '>') {
+            while (p < len && is_html_space(html[p])) ++p;
+            if (p < len && html[p] == '/') {
+                self_close = true;
+                ++p;
+                continue;
+            }
+            if (p >= len || html[p] == '>') break;
+            size_t an_s = p;
+            while (p < len && !is_html_space(html[p]) && html[p] != '=' && html[p] != '>' && html[p] != '/') ++p;
+            size_t an_e = p;
+            while (p < len && is_html_space(html[p])) ++p;
+            const char *av_ptr = "";
+            size_t av_len = 0u;
+            JsByteBuf av_dec = {0};
+            if (p < len && html[p] == '=') {
+                ++p;
+                while (p < len && is_html_space(html[p])) ++p;
+                if (p < len && (html[p] == '"' || html[p] == '\'')) {
+                    char q = html[p++];
+                    size_t vs = p;
+                    while (p < len && html[p] != q) ++p;
+                    decode_html_entities(html + vs, p - vs, &av_dec);
+                    if (p < len && html[p] == q) ++p;
+                } else {
+                    size_t vs = p;
+                    while (p < len && !is_html_space(html[p]) && html[p] != '>') ++p;
+                    decode_html_entities(html + vs, p - vs, &av_dec);
+                }
+                av_ptr = av_dec.data ? av_dec.data : "";
+                av_len = av_dec.len;
+            }
+            if (el && an_e > an_s) {
+                js_dom_set_attr(doc, el, html + an_s, an_e - an_s, av_ptr, av_len);
+            }
+            free(av_dec.data);
+        }
+        if (p < len && html[p] == '>') ++p;
+        i = p;
+
+        if (!el) continue;
+        const char *tname = arcr_atom_cstr(doc->atoms, el->tag);
+
+        /* Raw text elements: <script> and <style> */
+        if (!self_close && (arcr_str_eq_nocase(tname, "style") || arcr_str_eq_nocase(tname, "script"))) {
+            size_t raw_s = i;
+            size_t tlen = strlen(tname);
+            while (i < len) {
+                if (i + 2u + tlen < len && html[i] == '<' && html[i + 1u] == '/' &&
+                    arcr_str_eq_nocase_n(html + i + 2u, tlen, tname, tlen)) {
+                    break;
+                }
+                ++i;
+            }
+            el->text     = arcr_arena_strdup(&doc->arena, html + raw_s, i - raw_s);
+            el->text_len = i - raw_s;
+            while (i < len && html[i] != '>') ++i;
+            if (i < len) ++i;
+            js_dom_insert_before_raw(vm, stack[sp], el, NULL);
+            continue;
+        }
+
+        js_dom_insert_before_raw(vm, stack[sp], el, NULL);
+        if (!self_close && !is_void_html_tag(tname) && sp + 1 < 64) {
+            stack[++sp] = el;
         }
     }
 }
 
-/* HTML5 <canvas> 2D Color Parser & Software Rasterizer */
-static int js_hex_nib(char c) {
+/* Selector matching for querySelector / querySelectorAll / matches / closest */
+static bool js_match_selector_list(const ArcrDocument *doc, const ArcrDomNode *el,
+                                   const char *sel, size_t sel_len);
+
+static bool js_match_compound(const ArcrDocument *doc, const ArcrDomNode *el,
+                              const char *s, size_t len) {
+    if (!doc || !el || el->kind != ARCR_NODE_ELEMENT) return false;
+    arcr_str_trim_view(&s, &len);
+    if (len == 0u) return false;
+
+    size_t i = 0u;
+    while (i < len) {
+        char c = s[i];
+        if (c == '*') {
+            ++i;
+        } else if (c == '#' || c == '.') {
+            ++i;
+            size_t st = i;
+            while (i < len && s[i] != '#' && s[i] != '.' && s[i] != '[' && s[i] != ':') ++i;
+            if (i == st) return false;
+            if (c == '#') {
+                const char *id_c = arcr_atom_cstr(doc->atoms, el->id);
+                if (!id_c || strlen(id_c) != (i - st) || memcmp(id_c, s + st, i - st) != 0) {
+                    return false;
+                }
+            } else {
+                ArcrAtom ca = arcr_atom_intern(doc->atoms, s + st, i - st);
+                if (!js_elem_has_class(el, ca)) return false;
+            }
+        } else if (c == '[') {
+            ++i;
+            size_t rb = i;
+            while (rb < len && s[rb] != ']') ++rb;
+            const char *in = s + i;
+            size_t in_len = rb - i;
+            i = (rb < len) ? (rb + 1u) : len;
+
+            size_t eq = 0u;
+            char op = 0;
+            while (eq < in_len && in[eq] != '=' && in[eq] != '^' && in[eq] != '$' && in[eq] != '*' && in[eq] != '~') {
+                ++eq;
+            }
+            const char *an = in;
+            size_t an_l = eq;
+            arcr_str_trim_view(&an, &an_l);
+            char an_buf[128];
+            if (an_l >= sizeof(an_buf)) an_l = sizeof(an_buf) - 1u;
+            memcpy(an_buf, an, an_l);
+            an_buf[an_l] = '\0';
+            const char *actual = js_dom_get_attr(doc, el, an_buf);
+            if (!actual) return false;
+
+            if (eq < in_len) {
+                if (in[eq] != '=' && eq + 1u < in_len && in[eq + 1u] == '=') {
+                    op = in[eq];
+                    eq += 2u;
+                } else if (in[eq] == '=') {
+                    op = '=';
+                    eq += 1u;
+                }
+                const char *ev = in + eq;
+                size_t ev_l = (eq <= in_len) ? (in_len - eq) : 0u;
+                arcr_str_trim_view(&ev, &ev_l);
+                if (ev_l >= 2u && ((ev[0] == '"' && ev[ev_l - 1u] == '"') ||
+                                   (ev[0] == '\'' && ev[ev_l - 1u] == '\''))) {
+                    ev += 1u;
+                    ev_l -= 2u;
+                }
+                size_t act_l = strlen(actual);
+                if (op == '=') {
+                    if (act_l != ev_l || memcmp(actual, ev, ev_l) != 0) return false;
+                } else if (op == '^') {
+                    if (ev_l == 0u || act_l < ev_l || memcmp(actual, ev, ev_l) != 0) return false;
+                } else if (op == '$') {
+                    if (ev_l == 0u || act_l < ev_l || memcmp(actual + act_l - ev_l, ev, ev_l) != 0) return false;
+                } else if (op == '*') {
+                    char needle[128];
+                    if (ev_l >= sizeof(needle)) ev_l = sizeof(needle) - 1u;
+                    memcpy(needle, ev, ev_l);
+                    needle[ev_l] = '\0';
+                    if (ev_l == 0u || strstr(actual, needle) == NULL) return false;
+                }
+            }
+        } else if (c == ':') {
+            ++i;
+            if (i < len && s[i] == ':') return false; /* pseudo-element */
+            size_t st = i;
+            while (i < len && s[i] != '#' && s[i] != '.' && s[i] != '[' && s[i] != ':' && s[i] != '(') ++i;
+            const char *ps = s + st;
+            size_t psl = i - st;
+            const char *arg = NULL;
+            size_t argl = 0u;
+            if (i < len && s[i] == '(') {
+                ++i;
+                arg = s + i;
+                int depth = 1;
+                while (i < len && depth > 0) {
+                    if (s[i] == '(') ++depth;
+                    else if (s[i] == ')') --depth;
+                    if (depth > 0) ++i;
+                }
+                argl = (size_t)((s + i) - arg);
+                if (i < len && s[i] == ')') ++i;
+            }
+            if (arcr_str_eq_nocase_n(ps, psl, "checked", 7u)) {
+                if ((el->state_flags & (uint32_t)ARCR_STATE_CHECKED) == 0u) return false;
+            } else if (arcr_str_eq_nocase_n(ps, psl, "disabled", 8u)) {
+                if (!js_dom_get_attr(doc, el, "disabled")) return false;
+            } else if (arcr_str_eq_nocase_n(ps, psl, "enabled", 7u)) {
+                if (js_dom_get_attr(doc, el, "disabled")) return false;
+            } else if (arcr_str_eq_nocase_n(ps, psl, "first-child", 11u)) {
+                if (!el->parent) return false;
+                for (const ArcrDomNode *ch = el->parent->first_child; ch != NULL; ch = ch->next_sibling) {
+                    if (ch->kind == ARCR_NODE_ELEMENT) {
+                        if (ch != el) return false;
+                        break;
+                    }
+                }
+            } else if (arcr_str_eq_nocase_n(ps, psl, "last-child", 10u)) {
+                for (const ArcrDomNode *ch = el->next_sibling; ch != NULL; ch = ch->next_sibling) {
+                    if (ch->kind == ARCR_NODE_ELEMENT) return false;
+                }
+            } else if (arcr_str_eq_nocase_n(ps, psl, "not", 3u) && arg) {
+                if (js_match_selector_list(doc, el, arg, argl)) return false;
+            } else if (arcr_str_eq_nocase_n(ps, psl, "is", 2u) ||
+                       arcr_str_eq_nocase_n(ps, psl, "where", 5u)) {
+                if (arg && !js_match_selector_list(doc, el, arg, argl)) return false;
+            }
+        } else {
+            size_t st = i;
+            while (i < len && s[i] != '#' && s[i] != '.' && s[i] != '[' && s[i] != ':') ++i;
+            const char *tname = arcr_atom_cstr(doc->atoms, el->tag);
+            if (!tname || !arcr_str_eq_nocase_n(tname, strlen(tname), s + st, i - st)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+typedef struct JsSelPart {
+    const char *ptr;
+    size_t      len;
+    char        comb; /* 0, ' ', '>', '+', '~' */
+} JsSelPart;
+
+static bool js_match_chain(const ArcrDocument *doc, const ArcrDomNode *el,
+                           const JsSelPart *parts, int idx) {
+    if (!js_match_compound(doc, el, parts[idx].ptr, parts[idx].len)) return false;
+    if (idx == 0) return true;
+
+    char comb = parts[idx].comb;
+    if (comb == '>') {
+        const ArcrDomNode *p = el->parent;
+        return p && p->kind == ARCR_NODE_ELEMENT && js_match_chain(doc, p, parts, idx - 1);
+    }
+    if (comb == ' ') {
+        for (const ArcrDomNode *p = el->parent; p != NULL; p = p->parent) {
+            if (p->kind == ARCR_NODE_ELEMENT && js_match_chain(doc, p, parts, idx - 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (comb == '+' || comb == '~') {
+        if (!el->parent) return false;
+        const ArcrDomNode *prev_el = NULL;
+        for (const ArcrDomNode *c = el->parent->first_child; c != NULL && c != el; c = c->next_sibling) {
+            if (c->kind == ARCR_NODE_ELEMENT) {
+                if (comb == '~' && js_match_chain(doc, c, parts, idx - 1)) return true;
+                prev_el = c;
+            }
+        }
+        if (comb == '+') {
+            return prev_el && js_match_chain(doc, prev_el, parts, idx - 1);
+        }
+    }
+    return false;
+}
+
+static bool js_match_single_selector(const ArcrDocument *doc, const ArcrDomNode *el,
+                                     const char *sel, size_t len) {
+    arcr_str_trim_view(&sel, &len);
+    if (len == 0u) return false;
+
+    JsSelPart parts[12];
+    int count = 0;
+    size_t i = 0u;
+    char next_comb = 0;
+
+    while (i < len && count < 12) {
+        while (i < len && is_html_space(sel[i])) ++i;
+        if (i >= len) break;
+        if (sel[i] == '>' || sel[i] == '+' || sel[i] == '~') {
+            next_comb = sel[i++];
+            while (i < len && is_html_space(sel[i])) ++i;
+        }
+        size_t st = i;
+        int brk = 0, par = 0;
+        while (i < len) {
+            char c = sel[i];
+            if (c == '[') ++brk;
+            else if (c == ']' && brk > 0) --brk;
+            else if (c == '(') ++par;
+            else if (c == ')' && par > 0) --par;
+            else if (brk == 0 && par == 0 &&
+                     (is_html_space(c) || c == '>' || c == '+' || c == '~')) {
+                break;
+            }
+            ++i;
+        }
+        if (i > st) {
+            parts[count].ptr  = sel + st;
+            parts[count].len  = i - st;
+            parts[count].comb = (count == 0) ? 0 : (next_comb ? next_comb : ' ');
+            count++;
+            next_comb = 0;
+        }
+    }
+    if (count == 0) return false;
+    return js_match_chain(doc, el, parts, count - 1);
+}
+
+static bool js_match_selector_list(const ArcrDocument *doc, const ArcrDomNode *el,
+                                   const char *sel, size_t sel_len) {
+    if (!doc || !el || el->kind != ARCR_NODE_ELEMENT || !sel) return false;
+    size_t i = 0u;
+    while (i < sel_len) {
+        size_t st = i;
+        int brk = 0, par = 0;
+        while (i < sel_len) {
+            if (sel[i] == '[') ++brk;
+            else if (sel[i] == ']' && brk > 0) --brk;
+            else if (sel[i] == '(') ++par;
+            else if (sel[i] == ')' && par > 0) --par;
+            else if (brk == 0 && par == 0 && sel[i] == ',') break;
+            ++i;
+        }
+        if (js_match_single_selector(doc, el, sel + st, i - st)) return true;
+        if (i < sel_len && sel[i] == ',') ++i;
+    }
+    return false;
+}
+
+/* -------------------------------------------------------------------------
+ * 4. CSS Color Parser & Full 2D <canvas> Software Rasterizer
+ * ------------------------------------------------------------------------- */
+static int js_hex_val(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
     if (c >= 'A' && c <= 'F') return c - 'A' + 10;
     return -1;
 }
 
-static uint32_t js_parse_css_color(const char *s, uint32_t fallback) {
-    if (!s) return fallback;
+static uint32_t js_parse_css_color(const char *s) {
+    if (!s) return 0xFF000000u;
     size_t len = strlen(s);
     arcr_str_trim_view(&s, &len);
-    if (len == 0u) return fallback;
+    if (len == 0u) return 0xFF000000u;
 
     if (s[0] == '#') {
         if (len == 4u) {
-            int r = js_hex_nib(s[1]), g = js_hex_nib(s[2]), b = js_hex_nib(s[3]);
-            if (r >= 0 && g >= 0 && b >= 0)
+            int r = js_hex_val(s[1]), g = js_hex_val(s[2]), b = js_hex_val(s[3]);
+            if (r >= 0 && g >= 0 && b >= 0) {
                 return 0xFF000000u | ((uint32_t)(r * 17) << 16) |
                        ((uint32_t)(g * 17) << 8) | (uint32_t)(b * 17);
+            }
+        } else if (len == 5u) {
+            int r = js_hex_val(s[1]), g = js_hex_val(s[2]), b = js_hex_val(s[3]), a = js_hex_val(s[4]);
+            if (r >= 0 && g >= 0 && b >= 0 && a >= 0) {
+                return ((uint32_t)(a * 17) << 24) | ((uint32_t)(r * 17) << 16) |
+                       ((uint32_t)(g * 17) << 8) | (uint32_t)(b * 17);
+            }
         } else if (len == 7u || len == 9u) {
-            int r = (js_hex_nib(s[1]) << 4) | js_hex_nib(s[2]);
-            int g = (js_hex_nib(s[3]) << 4) | js_hex_nib(s[4]);
-            int b = (js_hex_nib(s[5]) << 4) | js_hex_nib(s[6]);
-            int a = (len == 9u) ? ((js_hex_nib(s[7]) << 4) | js_hex_nib(s[8])) : 255;
-            if (r >= 0 && g >= 0 && b >= 0 && a >= 0)
-                return ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+            int r1 = js_hex_val(s[1]), r2 = js_hex_val(s[2]);
+            int g1 = js_hex_val(s[3]), g2 = js_hex_val(s[4]);
+            int b1 = js_hex_val(s[5]), b2 = js_hex_val(s[6]);
+            int a1 = 15, a2 = 15;
+            if (len == 9u) { a1 = js_hex_val(s[7]); a2 = js_hex_val(s[8]); }
+            if (r1 >= 0 && r2 >= 0 && g1 >= 0 && g2 >= 0 && b1 >= 0 && b2 >= 0 && a1 >= 0 && a2 >= 0) {
+                return ((uint32_t)((a1 << 4) | a2) << 24) |
+                       ((uint32_t)((r1 << 4) | r2) << 16) |
+                       ((uint32_t)((g1 << 4) | g2) << 8) |
+                       (uint32_t)((b1 << 4) | b2);
+            }
         }
-        return fallback;
+        return 0xFF000000u;
     }
 
-    if ((len > 5u && arcr_str_eq_nocase_n(s, 4u, "rgb(", 4u)) ||
-        (len > 6u && arcr_str_eq_nocase_n(s, 5u, "rgba(", 5u))) {
-        bool has_a = (s[3] == 'a' || s[3] == 'A');
-        const char *p = s + (has_a ? 5u : 4u);
-        size_t rem = len - (has_a ? 6u : 5u);
-        double c[4] = {0.0, 0.0, 0.0, 1.0};
-        int cnt = has_a ? 4 : 3;
-        for (int idx = 0; idx < cnt; ++idx) {
-            size_t cm = 0u;
-            while (cm < rem && p[cm] != ',') ++cm;
-            c[idx] = js_parse_float_str(p, cm, true);
-            if (js_num_is_nan(c[idx])) c[idx] = (idx == 3) ? 1.0 : 0.0;
-            if (cm < rem) { p += cm + 1u; rem -= cm + 1u; }
-            else rem = 0u;
+    if ((len > 4u && arcr_str_eq_nocase_n(s, 4u, "rgb(", 4u)) ||
+        (len > 5u && arcr_str_eq_nocase_n(s, 5u, "rgba(", 5u))) {
+        const char *lp = (const char *)memchr(s, '(', len);
+        if (lp) {
+            double r = 0.0, g = 0.0, b = 0.0, a = 1.0;
+            char tmp[96];
+            size_t il = (size_t)((s + len) - (lp + 1));
+            if (il >= sizeof(tmp)) il = sizeof(tmp) - 1u;
+            memcpy(tmp, lp + 1, il);
+            tmp[il] = '\0';
+            for (size_t k = 0u; tmp[k] != '\0'; ++k) {
+                if (tmp[k] == ',' || tmp[k] == '/' || tmp[k] == ')') tmp[k] = ' ';
+            }
+            int n = sscanf(tmp, "%lf %lf %lf %lf", &r, &g, &b, &a);
+            if (n >= 3) {
+                uint32_t ur = (uint32_t)ARCR_CLAMP((int)(r + 0.5), 0, 255);
+                uint32_t ug = (uint32_t)ARCR_CLAMP((int)(g + 0.5), 0, 255);
+                uint32_t ub = (uint32_t)ARCR_CLAMP((int)(b + 0.5), 0, 255);
+                uint32_t ua = (n >= 4) ? (uint32_t)ARCR_CLAMP((int)(a * 255.0 + 0.5), 0, 255) : 255u;
+                return (ua << 24) | (ur << 16) | (ug << 8) | ub;
+            }
         }
-        uint32_t r = (uint32_t)ARCR_CLAMP((int32_t)c[0], 0, 255);
-        uint32_t g = (uint32_t)ARCR_CLAMP((int32_t)c[1], 0, 255);
-        uint32_t b = (uint32_t)ARCR_CLAMP((int32_t)c[2], 0, 255);
-        uint32_t a = (uint32_t)ARCR_CLAMP((int32_t)js_math_round(c[3] * 255.0), 0, 255);
-        return (a << 24) | (r << 16) | (g << 8) | b;
     }
 
-    static const struct { const char *n; uint32_t c; } kNames[] = {
-        {"transparent", 0x00000000u}, {"black", 0xFF000000u}, {"white", 0xFFFFFFFFu},
-        {"red", 0xFFEF4444u}, {"green", 0xFF22C55Eu}, {"blue", 0xFF3B82F6u},
-        {"yellow", 0xFFEAB308u}, {"orange", 0xFFF97316u}, {"purple", 0xFFA855F7u},
-        {"cyan", 0xFF06B6D4u}, {"magenta", 0xFFEC4899u}, {"gray", 0xFF6B7280u},
-        {"grey", 0xFF6B7280u}, {"navy", 0xFF1E3A8Au}, {"silver", 0xFFCBD5E1u},
-        {"teal", 0xFF14B8A6u}, {"gold", 0xFFFACC15u}, {"tomato", 0xFFF87171u},
-        {"dodgerblue", 0xFF1E90FFu}, {"cornflowerblue", 0xFF6495EDu}
+    static const struct { const char *name; uint32_t argb; } kNamed[] = {
+        {"transparent", 0x00000000u}, {"black",       0xFF000000u},
+        {"white",       0xFFFFFFFFu}, {"red",         0xFFFF0000u},
+        {"green",       0xFF008000u}, {"lime",        0xFF00FF00u},
+        {"blue",        0xFF0000FFu}, {"yellow",      0xFFFFFF00u},
+        {"cyan",        0xFF00FFFFu}, {"aqua",        0xFF00FFFFu},
+        {"magenta",     0xFFFF00FFu}, {"fuchsia",     0xFFFF00FFu},
+        {"gray",        0xFF808080u}, {"grey",        0xFF808080u},
+        {"silver",      0xFFC0C0C0u}, {"maroon",      0xFF800000u},
+        {"olive",       0xFF808000u}, {"purple",      0xFF800080u},
+        {"teal",        0xFF008080u}, {"navy",        0xFF000080u},
+        {"orange",      0xFFFFA500u}, {"pink",        0xFFFFC0CBu},
+        {"gold",        0xFFFFD700u}, {"coral",       0xFFFF7F50u},
+        {"tomato",      0xFFFF6347u}, {"crimson",     0xFFDC143Cu},
+        {"dodgerblue",  0xFF1E90FFu}, {"royalblue",   0xFF4169E1u},
+        {"skyblue",     0xFF87CEEBu}, {"rebeccapurple",0xFF663399u}
     };
-    for (size_t i = 0u; i < ARCR_ARRAY_LEN(kNames); ++i) {
-        if (arcr_str_eq_nocase_n(s, len, kNames[i].n, strlen(kNames[i].n))) return kNames[i].c;
+    for (size_t i = 0u; i < ARCR_ARRAY_LEN(kNamed); ++i) {
+        if (arcr_str_eq_nocase_n(s, len, kNamed[i].name, strlen(kNamed[i].name))) {
+            return kNamed[i].argb;
+        }
     }
-    return fallback;
+    return 0xFF000000u;
 }
 
-static ArcrDomSurface *js_ensure_canvas_surface(ArcrDocument *doc, ArcrDomNode *el) {
-    if (!doc || !el) return NULL;
+static Canvas2DCtx *js_get_canvas_ctx(ArcrJsVm *vm, uint32_t uid) {
+    if (!vm) return NULL;
+    for (Canvas2DCtx *c = vm->canvas_head; c != NULL; c = c->next) {
+        if (c->node_uid == uid) return c;
+    }
+    Canvas2DCtx *c = (Canvas2DCtx *)calloc(1u, sizeof(Canvas2DCtx));
+    if (!c) return NULL;
+    c->node_uid          = uid;
+    c->cur.a             = 1.0;
+    c->cur.d             = 1.0;
+    c->cur.fill_argb     = 0xFF000000u;
+    c->cur.stroke_argb   = 0xFF000000u;
+    c->cur.line_width    = 1.0;
+    c->cur.global_alpha  = 1.0;
+    c->cur.font_px       = 14;
+    c->fill_grad_id      = -1;
+    c->stroke_grad_id    = -1;
+    c->next              = vm->canvas_head;
+    vm->canvas_head      = c;
+    return c;
+}
+
+static ArcrDomSurface *js_canvas_get_surf(ArcrJsVm *vm, uint32_t uid) {
+    ArcrDomNode *el = js_dom_find_uid(vm, uid);
+    if (!el || el->kind != ARCR_NODE_ELEMENT || !vm->host.doc) return NULL;
+    if (el->surface && el->surface->argb_pixels) return el->surface;
+
     int32_t w = 300, h = 150;
-    const char *ws = js_dom_get_attr(doc, el, "width");
-    const char *hs = js_dom_get_attr(doc, el, "height");
-    if (ws) { int32_t pw = 0; if (arcr_parse_i32(ws, strlen(ws), &pw) && pw > 0 && pw <= 4096) w = pw; }
-    if (hs) { int32_t ph = 0; if (arcr_parse_i32(hs, strlen(hs), &ph) && ph > 0 && ph <= 4096) h = ph; }
-
-    if (el->surface && el->surface->width == w && el->surface->height == h && el->surface->argb_pixels) {
-        return el->surface;
-    }
-    ArcrDomSurface *sf = (ArcrDomSurface *)arcr_arena_alloc(&doc->arena, sizeof(ArcrDomSurface), sizeof(void *));
-    if (!sf) return NULL;
-    uint32_t *px = (uint32_t *)arcr_arena_calloc(&doc->arena, (size_t)w * (size_t)h, sizeof(uint32_t), 16u);
-    if (!px) return NULL;
-    sf->width       = w;
-    sf->height      = h;
-    sf->argb_pixels = px;
-    sf->heap_owned  = false;
-    el->surface     = sf;
-    doc->dom_dirty  = true;
-    return sf;
+    const char *wa = js_dom_get_attr(vm->host.doc, el, "width");
+    const char *ha = js_dom_get_attr(vm->host.doc, el, "height");
+    int32_t pw = 0, ph = 0;
+    if (wa && arcr_parse_i32(wa, strlen(wa), &pw) && pw > 0) w = pw;
+    if (ha && arcr_parse_i32(ha, strlen(ha), &ph) && ph > 0) h = ph;
+    return js_dom_ensure_surface(vm, el, w, h);
 }
 
-static void canvas_put_pixel(ArcrDomSurface *sf, int32_t x, int32_t y, uint32_t src) {
-    if (x < 0 || y < 0 || x >= sf->width || y >= sf->height) return;
+static inline void canvas_xfm_pt(const CanvasTransform *t, double x, double y,
+                                 float *ox, float *oy) {
+    *ox = (float)(t->a * x + t->c * y + t->e);
+    *oy = (float)(t->b * x + t->d * y + t->f);
+}
+
+static inline uint32_t canvas_apply_alpha(uint32_t argb, double global_a) {
+    uint32_t a = (argb >> 24) & 0xFFu;
+    if (global_a < 0.999) {
+        a = (uint32_t)ARCR_CLAMP((int)((double)a * global_a + 0.5), 0, 255);
+    }
+    return (argb & 0x00FFFFFFu) | (a << 24);
+}
+
+static inline void canvas_blend_px(uint32_t *dst, uint32_t src) {
     uint32_t sa = (src >> 24) & 0xFFu;
     if (sa == 0u) return;
-    uint32_t *dst_p = &sf->argb_pixels[(size_t)y * (size_t)sf->width + (size_t)x];
-    if (sa == 255u) {
-        *dst_p = src;
-        return;
-    }
-    uint32_t d = *dst_p;
+    if (sa == 255u) { *dst = src; return; }
+    uint32_t d = *dst;
+    uint32_t da = (d >> 24) & 0xFFu;
+    if (da == 0u) { *dst = src; return; }
     uint32_t inv = 255u - sa;
+    uint32_t out_a = sa + (da * inv + 127u) / 255u;
     uint32_t r = (((src >> 16) & 0xFFu) * sa + ((d >> 16) & 0xFFu) * inv + 127u) / 255u;
     uint32_t g = (((src >> 8)  & 0xFFu) * sa + ((d >> 8)  & 0xFFu) * inv + 127u) / 255u;
-    uint32_t b = (( src        & 0xFFu) * sa + ( d        & 0xFFu) * inv + 127u) / 255u;
-    uint32_t a = sa + (((d >> 24) & 0xFFu) * inv + 127u) / 255u;
-    if (a > 255u) a = 255u;
-    *dst_p = (a << 24) | (r << 16) | (g << 8) | b;
+    uint32_t b = ((src         & 0xFFu) * sa + (d         & 0xFFu) * inv + 127u) / 255u;
+    *dst = (ARCR_MIN(out_a, 255u) << 24) | (ARCR_MIN(r, 255u) << 16) |
+           (ARCR_MIN(g, 255u) << 8) | ARCR_MIN(b, 255u);
 }
 
-static void canvas_fill_rect(ArcrDomSurface *sf, double rx, double ry, double rw, double rh,
-                             uint32_t color, bool clear_mode) {
-    if (!sf || !sf->argb_pixels) return;
-    if (rw < 0.0) { rx += rw; rw = -rw; }
-    if (rh < 0.0) { ry += rh; rh = -rh; }
-    int32_t x0 = ARCR_CLAMP((int32_t)js_math_round(rx), 0, sf->width);
-    int32_t y0 = ARCR_CLAMP((int32_t)js_math_round(ry), 0, sf->height);
-    int32_t x1 = ARCR_CLAMP((int32_t)js_math_round(rx + rw), 0, sf->width);
-    int32_t y1 = ARCR_CLAMP((int32_t)js_math_round(ry + rh), 0, sf->height);
-    for (int32_t y = y0; y < y1; ++y) {
-        uint32_t *row = sf->argb_pixels + (size_t)y * (size_t)sf->width;
-        if (clear_mode) {
-            for (int32_t x = x0; x < x1; ++x) row[x] = 0x00000000u;
-        } else if ((color >> 24) == 0xFFu) {
-            for (int32_t x = x0; x < x1; ++x) row[x] = color;
-        } else {
-            for (int32_t x = x0; x < x1; ++x) canvas_put_pixel(sf, x, y, color);
+static uint32_t canvas_sample_grad(const ArcrJsVm *vm, int32_t grad_id, double px, double py) {
+    if (!vm || grad_id < 0 || grad_id >= vm->grad_count) return 0xFF000000u;
+    const CanvasGrad *g = &vm->grads[grad_id];
+    if (!g->active || g->stop_count <= 0) return 0xFF000000u;
+    if (g->stop_count == 1) return g->stops[0].argb;
+
+    double t = 0.0;
+    if (!g->is_radial) {
+        double dx = g->x1 - g->x0;
+        double dy = g->y1 - g->y0;
+        double len2 = dx * dx + dy * dy;
+        if (len2 > 1e-6) {
+            t = ((px - g->x0) * dx + (py - g->y0) * dy) / len2;
+        }
+    } else {
+        double dx = px - g->x1;
+        double dy = py - g->y1;
+        double dist = sqrt(dx * dx + dy * dy);
+        double dr = g->r1 - g->r0;
+        t = (fabs(dr) > 1e-6) ? ((dist - g->r0) / dr) : 0.0;
+    }
+    if (t <= g->stops[0].offset) return g->stops[0].argb;
+    if (t >= g->stops[g->stop_count - 1].offset) return g->stops[g->stop_count - 1].argb;
+
+    for (int32_t i = 0; i + 1 < g->stop_count; ++i) {
+        double o0 = g->stops[i].offset;
+        double o1 = g->stops[i + 1].offset;
+        if (t >= o0 && t <= o1) {
+            double f = (o1 > o0 + 1e-6) ? ((t - o0) / (o1 - o0)) : 0.0;
+            uint32_t c0 = g->stops[i].argb;
+            uint32_t c1 = g->stops[i + 1].argb;
+            uint32_t a = (uint32_t)((1.0 - f) * ((c0 >> 24) & 0xFFu) + f * ((c1 >> 24) & 0xFFu) + 0.5);
+            uint32_t r = (uint32_t)((1.0 - f) * ((c0 >> 16) & 0xFFu) + f * ((c1 >> 16) & 0xFFu) + 0.5);
+            uint32_t gc = (uint32_t)((1.0 - f) * ((c0 >> 8) & 0xFFu) + f * ((c1 >> 8) & 0xFFu) + 0.5);
+            uint32_t b = (uint32_t)((1.0 - f) * (c0 & 0xFFu) + f * (c1 & 0xFFu) + 0.5);
+            return (ARCR_MIN(a, 255u) << 24) | (ARCR_MIN(r, 255u) << 16) |
+                   (ARCR_MIN(gc, 255u) << 8) | ARCR_MIN(b, 255u);
         }
     }
+    return g->stops[g->stop_count - 1].argb;
 }
 
-static void canvas_draw_segment(ArcrDomSurface *sf, float x0, float y0, float x1, float y1,
-                                float line_w, uint32_t color) {
+static void canvas_push_pt(Canvas2DCtx *c, double x, double y, bool move_to) {
+    if (!c || c->pt_count >= ARCR_CANVAS_MAX_PTS) return;
+    float ox = 0.0f, oy = 0.0f;
+    canvas_xfm_pt(&c->cur, x, y, &ox, &oy);
+    c->pts[c->pt_count].x       = ox;
+    c->pts[c->pt_count].y       = oy;
+    c->pts[c->pt_count].move_to = move_to;
+    if (move_to || c->pt_count == 0) {
+        c->sub_start_x = ox;
+        c->sub_start_y = oy;
+    }
+    c->pt_count++;
+}
+
+static void canvas_draw_thick_seg(ArcrDomSurface *surf, float x0, float y0, float x1, float y1,
+                                  float half_w, uint32_t col) {
+    if (!surf || !surf->argb_pixels) return;
     float dx = x1 - x0;
     float dy = y1 - y0;
-    float steps = (float)js_math_sqrt((double)(dx * dx + dy * dy)) * 2.0f;
-    if (steps < 1.0f) steps = 1.0f;
-    int n = (int)steps;
-    int r = (int)((line_w - 1.0f) * 0.5f);
-    for (int i = 0; i <= n; ++i) {
-        float t  = (float)i / (float)n;
-        int32_t cx = (int32_t)js_math_round((double)(x0 + dx * t));
-        int32_t cy = (int32_t)js_math_round((double)(y0 + dy * t));
-        for (int oy = -r; oy <= r; ++oy) {
-            for (int ox = -r; ox <= r; ++ox) {
-                canvas_put_pixel(sf, cx + ox, cy + oy, color);
+    float len2 = dx * dx + dy * dy;
+    float r = ARCR_MAX(0.6f, half_w);
+    int32_t min_x = ARCR_CLAMP((int32_t)floorf(ARCR_MIN(x0, x1) - r - 1.0f), 0, surf->width - 1);
+    int32_t max_x = ARCR_CLAMP((int32_t)ceilf(ARCR_MAX(x0, x1) + r + 1.0f),  0, surf->width - 1);
+    int32_t min_y = ARCR_CLAMP((int32_t)floorf(ARCR_MIN(y0, y1) - r - 1.0f), 0, surf->height - 1);
+    int32_t max_y = ARCR_CLAMP((int32_t)ceilf(ARCR_MAX(y0, y1) + r + 1.0f),  0, surf->height - 1);
+
+    uint32_t base_a = (col >> 24) & 0xFFu;
+    if (base_a == 0u) return;
+
+    for (int32_t py = min_y; py <= max_y; ++py) {
+        float cy = (float)py + 0.5f;
+        uint32_t *row = surf->argb_pixels + (size_t)py * (size_t)surf->width;
+        for (int32_t px = min_x; px <= max_x; ++px) {
+            float cx = (float)px + 0.5f;
+            float t = (len2 > 1e-5f) ? (((cx - x0) * dx + (cy - y0) * dy) / len2) : 0.0f;
+            if (t < 0.0f) t = 0.0f;
+            else if (t > 1.0f) t = 1.0f;
+            float nx = x0 + t * dx;
+            float ny = y0 + t * dy;
+            float dist = sqrtf((cx - nx) * (cx - nx) + (cy - ny) * (cy - ny));
+            float cov = r + 0.5f - dist;
+            if (cov > 0.0f) {
+                if (cov > 1.0f) cov = 1.0f;
+                uint32_t a = (uint32_t)((float)base_a * cov + 0.5f);
+                canvas_blend_px(&row[px], (col & 0x00FFFFFFu) | (a << 24));
             }
         }
     }
 }
 
-static void canvas_stroke_path(ArcrDomSurface *sf, const JsCanvasCtx2D *ctx) {
-    if (!sf || !ctx || ctx->path_len < 2u) return;
-    float lw = (ctx->line_width >= 1.0f) ? ctx->line_width : 1.0f;
-    for (size_t i = 1u; i < ctx->path_len; ++i) {
-        if (ctx->path_move[i] == 0u) {
-            canvas_draw_segment(sf, ctx->path_x[i - 1u], ctx->path_y[i - 1u],
-                                ctx->path_x[i], ctx->path_y[i], lw, ctx->stroke_argb);
-        }
-    }
-}
+static void canvas_fill_current_path(ArcrJsVm *vm, Canvas2DCtx *c, ArcrDomSurface *surf) {
+    if (!c || !surf || !surf->argb_pixels || c->pt_count < 3) return;
 
-static void canvas_fill_path(ArcrDomSurface *sf, const JsCanvasCtx2D *ctx) {
-    if (!sf || !ctx || ctx->path_len < 3u) return;
-    float min_y = ctx->path_y[0], max_y = ctx->path_y[0];
-    for (size_t i = 1u; i < ctx->path_len; ++i) {
-        if (ctx->path_y[i] < min_y) min_y = ctx->path_y[i];
-        if (ctx->path_y[i] > max_y) max_y = ctx->path_y[i];
+    float min_y_f = c->pts[0].y, max_y_f = c->pts[0].y;
+    for (int32_t i = 1; i < c->pt_count; ++i) {
+        if (c->pts[i].y < min_y_f) min_y_f = c->pts[i].y;
+        if (c->pts[i].y > max_y_f) max_y_f = c->pts[i].y;
     }
-    int32_t y0 = ARCR_CLAMP((int32_t)js_math_floor((double)min_y), 0, sf->height - 1);
-    int32_t y1 = ARCR_CLAMP((int32_t)js_math_ceil((double)max_y), 0, sf->height - 1);
+    int32_t y0 = ARCR_CLAMP((int32_t)floorf(min_y_f), 0, surf->height - 1);
+    int32_t y1 = ARCR_CLAMP((int32_t)ceilf(max_y_f),  0, surf->height - 1);
 
+    float x_inter[256];
     for (int32_t y = y0; y <= y1; ++y) {
-        float scan_y = (float)y + 0.5f;
-        float x_hits[64];
-        size_t hit_cnt = 0u;
-        size_t sub_start = 0u;
+        float sy = (float)y + 0.5f;
+        int n_int = 0;
 
-        for (size_t i = 0u; i < ctx->path_len; ++i) {
-            if (ctx->path_move[i] != 0u) sub_start = i;
-            bool is_sub_end = (i + 1u == ctx->path_len) || (ctx->path_move[i + 1u] != 0u);
-            size_t j = is_sub_end ? sub_start : (i + 1u);
-            if (i == j) continue;
-
-            float ay = ctx->path_y[i], by = ctx->path_y[j];
-            float ax = ctx->path_x[i], bx = ctx->path_x[j];
-            if ((ay <= scan_y && by > scan_y) || (by <= scan_y && ay > scan_y)) {
-                if (hit_cnt < ARCR_ARRAY_LEN(x_hits)) {
-                    x_hits[hit_cnt++] = ax + (scan_y - ay) * (bx - ax) / (by - ay);
+        int32_t sub_start = 0;
+        for (int32_t i = 1; i <= c->pt_count; ++i) {
+            bool end_sub = (i == c->pt_count) || c->pts[i].move_to;
+            int32_t a_idx = end_sub ? (i - 1) : (i - 1);
+            int32_t b_idx = end_sub ? sub_start : i;
+            if (a_idx != b_idx) {
+                float ay = c->pts[a_idx].y, by = c->pts[b_idx].y;
+                float ax = c->pts[a_idx].x, bx = c->pts[b_idx].x;
+                if ((ay <= sy && by > sy) || (by <= sy && ay > sy)) {
+                    if (n_int < 256) {
+                        x_inter[n_int++] = ax + (sy - ay) * (bx - ax) / (by - ay);
+                    }
                 }
             }
+            if (end_sub) sub_start = i;
         }
+
         /* Insertion sort intersections */
-        for (size_t a = 1u; a < hit_cnt; ++a) {
-            float kv = x_hits[a];
-            size_t b = a;
-            while (b > 0u && x_hits[b - 1u] > kv) { x_hits[b] = x_hits[b - 1u]; --b; }
-            x_hits[b] = kv;
+        for (int i = 1; i < n_int; ++i) {
+            float key = x_inter[i];
+            int j = i - 1;
+            while (j >= 0 && x_inter[j] > key) {
+                x_inter[j + 1] = x_inter[j];
+                --j;
+            }
+            x_inter[j + 1] = key;
         }
-        for (size_t k = 0u; k + 1u < hit_cnt; k += 2u) {
-            int32_t sx0 = ARCR_CLAMP((int32_t)js_math_round((double)x_hits[k]), 0, sf->width);
-            int32_t sx1 = ARCR_CLAMP((int32_t)js_math_round((double)x_hits[k + 1u]), 0, sf->width);
+
+        uint32_t *row = surf->argb_pixels + (size_t)y * (size_t)surf->width;
+        for (int i = 0; i + 1 < n_int; i += 2) {
+            int32_t sx0 = ARCR_CLAMP((int32_t)floorf(x_inter[i]),     0, surf->width);
+            int32_t sx1 = ARCR_CLAMP((int32_t)ceilf(x_inter[i + 1]),  0, surf->width);
             for (int32_t x = sx0; x < sx1; ++x) {
-                canvas_put_pixel(sf, x, y, ctx->fill_argb);
+                uint32_t raw_c = (c->fill_grad_id >= 0)
+                                     ? canvas_sample_grad(vm, c->fill_grad_id, (double)x + 0.5, (double)y + 0.5)
+                                     : c->cur.fill_argb;
+                canvas_blend_px(&row[x], canvas_apply_alpha(raw_c, c->cur.global_alpha));
             }
         }
     }
 }
 
-/* =========================================================================
- * 5. Pure C11 JSON.parse / JSON.stringify, PRNG & localStorage Helpers
- * ========================================================================= */
-static uint64_t js_next_rand_u64(ArcrJsVm *vm) {
-    if (vm->rng_state == 0ULL) {
-        uint8_t seed[8] = {0};
-        if (arcr_platform_csprng_bytes(seed, sizeof(seed))) {
-            memcpy(&vm->rng_state, seed, sizeof(uint64_t));
-        }
-        if (vm->rng_state == 0ULL) vm->rng_state = 0x9E3779B97F4A7C15ULL;
+/* Base64 encoder for HTMLCanvasElement.prototype.toDataURL() */
+static char *js_base64_encode_png_uri(const uint8_t *src, size_t len) {
+    static const char kB64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const char *prefix = "data:image/png;base64,";
+    size_t plen = strlen(prefix);
+    size_t b64_len = ((len + 2u) / 3u) * 4u;
+    char *out = (char *)malloc(plen + b64_len + 1u);
+    if (!out) return NULL;
+    memcpy(out, prefix, plen);
+
+    size_t w = plen;
+    size_t i = 0u;
+    while (i + 3u <= len) {
+        uint32_t v = ((uint32_t)src[i] << 16) | ((uint32_t)src[i + 1u] << 8) | src[i + 2u];
+        out[w++] = kB64[(v >> 18) & 63u];
+        out[w++] = kB64[(v >> 12) & 63u];
+        out[w++] = kB64[(v >> 6)  & 63u];
+        out[w++] = kB64[v         & 63u];
+        i += 3u;
     }
-    uint64_t x = vm->rng_state;
-    x ^= x >> 12;
-    x ^= x << 25;
-    x ^= x >> 27;
-    vm->rng_state = x;
-    return x * 0x2545F4914F6CDD1DULL;
+    if (i < len) {
+        uint32_t v = (uint32_t)src[i] << 16;
+        if (i + 1u < len) v |= (uint32_t)src[i + 1u] << 8;
+        out[w++] = kB64[(v >> 18) & 63u];
+        out[w++] = kB64[(v >> 12) & 63u];
+        out[w++] = (i + 1u < len) ? kB64[(v >> 6) & 63u] : '=';
+        out[w++] = '=';
+    }
+    out[w] = '\0';
+    return out;
 }
 
-typedef struct JsonBuf {
-    char  *buf;
-    size_t len;
-    size_t cap;
-} JsonBuf;
-
-static void jbuf_append(ArcrArena *arena, JsonBuf *jb, const char *s, size_t n) {
-    if (n == 0u) return;
-    if (jb->len + n + 1u > jb->cap) {
-        size_t ncap = (jb->cap == 0u) ? 128u : (jb->cap * 2u);
-        while (ncap < jb->len + n + 1u) ncap *= 2u;
-        char *nb = (char *)arcr_arena_alloc(arena, ncap, 1u);
-        if (!nb) return;
-        if (jb->len > 0u && jb->buf) memcpy(nb, jb->buf, jb->len);
-        jb->buf = nb;
-        jb->cap = ncap;
-    }
-    memcpy(jb->buf + jb->len, s, n);
-    jb->len += n;
-    jb->buf[jb->len] = '\0';
+/* -------------------------------------------------------------------------
+ * 5. Native QuickJS Bridge Functions (`B.*`)
+ * ------------------------------------------------------------------------- */
+static inline ArcrJsVm *vm_from_ctx(JSContext *ctx) {
+    return (ArcrJsVm *)JS_GetContextOpaque(ctx);
 }
 
-static void jbuf_append_escaped_str(ArcrArena *arena, JsonBuf *jb, const char *s, size_t len) {
-    jbuf_append(arena, jb, "\"", 1u);
-    for (size_t i = 0u; i < len; ++i) {
-        unsigned char c = (unsigned char)s[i];
-        if (c == '"')       jbuf_append(arena, jb, "\\\"", 2u);
-        else if (c == '\\') jbuf_append(arena, jb, "\\\\", 2u);
-        else if (c == '\n') jbuf_append(arena, jb, "\\n", 2u);
-        else if (c == '\r') jbuf_append(arena, jb, "\\r", 2u);
-        else if (c == '\t') jbuf_append(arena, jb, "\\t", 2u);
-        else if (c < 0x20u) {
-            char u[8];
-            snprintf(u, sizeof(u), "\\u%04x", (unsigned)c);
-            jbuf_append(arena, jb, u, 6u);
-        } else {
-            char ch = (char)c;
-            jbuf_append(arena, jb, &ch, 1u);
-        }
+static JSValue b_alloc_node_obj(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 2) return JS_NULL;
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    JSValue obj = JS_NewObjectProtoClass(ctx, argv[1], vm->dom_node_class_id);
+    if (!JS_IsException(obj)) {
+        (void)JS_SetOpaque(obj, (void *)(uintptr_t)(uid + 1u));
     }
-    jbuf_append(arena, jb, "\"", 1u);
+    return obj;
 }
 
-static void json_stringify_rec(ArcrJsVm *vm, JsVal v, JsonBuf *jb, int depth) {
-    if (depth > 16) { jbuf_append(&vm->temp_arena, jb, "null", 4u); return; }
-    switch (v.kind) {
-        case JS_VAL_NULL:
-        case JS_VAL_UNDEFINED:
-            jbuf_append(&vm->temp_arena, jb, "null", 4u);
-            break;
-        case JS_VAL_BOOL:
-            jbuf_append(&vm->temp_arena, jb, v.as.b ? "true" : "false", v.as.b ? 4u : 5u);
-            break;
-        case JS_VAL_NUMBER:
-            if (js_num_is_nan(v.as.num) || js_num_is_inf(v.as.num)) {
-                jbuf_append(&vm->temp_arena, jb, "null", 4u);
-            } else {
-                char nb[64];
-                js_format_number(v.as.num, nb, sizeof(nb));
-                jbuf_append(&vm->temp_arena, jb, nb, strlen(nb));
-            }
-            break;
-        case JS_VAL_STRING:
-            jbuf_append_escaped_str(&vm->temp_arena, jb,
-                                    v.as.str ? v.as.str->data : "",
-                                    v.as.str ? v.as.str->len : 0u);
-            break;
-        case JS_VAL_ARRAY:
-            jbuf_append(&vm->temp_arena, jb, "[", 1u);
-            if (v.as.arr) {
-                for (size_t i = 0u; i < v.as.arr->len; ++i) {
-                    if (i > 0u) jbuf_append(&vm->temp_arena, jb, ",", 1u);
-                    json_stringify_rec(vm, v.as.arr->items[i], jb, depth + 1);
-                }
-            }
-            jbuf_append(&vm->temp_arena, jb, "]", 1u);
-            break;
-        case JS_VAL_OBJECT:
-            jbuf_append(&vm->temp_arena, jb, "{", 1u);
-            if (v.as.obj) {
-                bool first = true;
-                for (size_t i = 0u; i < v.as.obj->len; ++i) {
-                    JsVal pv = v.as.obj->props[i].val;
-                    if (pv.kind == JS_VAL_UNDEFINED || pv.kind == JS_VAL_FUNCTION ||
-                        pv.kind == JS_VAL_NATIVE_FN) continue;
-                    if (!first) jbuf_append(&vm->temp_arena, jb, ",", 1u);
-                    first = false;
-                    const char *k = v.as.obj->props[i].key;
-                    jbuf_append_escaped_str(&vm->temp_arena, jb, k, strlen(k));
-                    jbuf_append(&vm->temp_arena, jb, ":", 1u);
-                    json_stringify_rec(vm, pv, jb, depth + 1);
-                }
-            }
-            jbuf_append(&vm->temp_arena, jb, "}", 1u);
-            break;
-        default:
-            jbuf_append(&vm->temp_arena, jb, "null", 4u);
-            break;
-    }
+static JSValue b_node_uid_of(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 1 || !JS_IsObject(argv[0])) return JS_NewInt32(ctx, -1);
+    void *op = JS_GetOpaque(argv[0], vm->dom_node_class_id);
+    if (!op) return JS_NewInt32(ctx, -1);
+    uint32_t uid = (uint32_t)((uintptr_t)op - 1u);
+    return JS_NewUint32(ctx, uid);
 }
 
-typedef struct JsonParser {
-    ArcrJsVm   *vm;
-    const char *s;
-    size_t      len;
-    size_t      pos;
-    bool        ok;
-} JsonParser;
+static JSValue b_node_info(JSContext *ctx, JSValueConst this_val,
+                           int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 1) return JS_NULL;
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    if (!n) return JS_NULL;
 
-static void jp_skip_ws(JsonParser *p) {
-    while (p->pos < p->len) {
-        char c = p->s[p->pos];
-        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') ++p->pos;
-        else break;
-    }
-}
-
-static JsVal jp_parse_value(JsonParser *p, int depth);
-
-static JsVal jp_parse_string(JsonParser *p) {
-    if (p->pos >= p->len || p->s[p->pos] != '"') { p->ok = false; return js_undef(); }
-    ++p->pos;
-    JsonBuf jb = {0};
-    while (p->pos < p->len) {
-        char c = p->s[p->pos++];
-        if (c == '"') {
-            return js_mk_str_n(p->vm, jb.buf ? jb.buf : "", jb.len);
-        }
-        if (c == '\\') {
-            if (p->pos >= p->len) break;
-            char esc = p->s[p->pos++];
-            char outc = esc;
-            if (esc == 'n') outc = '\n';
-            else if (esc == 'r') outc = '\r';
-            else if (esc == 't') outc = '\t';
-            else if (esc == 'b') outc = '\b';
-            else if (esc == 'f') outc = '\f';
-            else if (esc == 'u' && p->pos + 4u <= p->len) {
-                uint32_t cp = 0u;
-                for (int k = 0; k < 4; ++k) {
-                    int h = js_hex_nib(p->s[p->pos + (size_t)k]);
-                    if (h < 0) { p->ok = false; return js_undef(); }
-                    cp = (cp << 4) | (uint32_t)h;
-                }
-                p->pos += 4u;
-                char u8[4];
-                size_t un = arcr_utf8_encode_one(cp, u8);
-                jbuf_append(&p->vm->temp_arena, &jb, u8, un);
-                continue;
-            }
-            jbuf_append(&p->vm->temp_arena, &jb, &outc, 1u);
-        } else {
-            jbuf_append(&p->vm->temp_arena, &jb, &c, 1u);
-        }
-    }
-    p->ok = false;
-    return js_undef();
-}
-
-static JsVal jp_parse_value(JsonParser *p, int depth) {
-    if (!p->ok || depth > 32) { p->ok = false; return js_undef(); }
-    jp_skip_ws(p);
-    if (p->pos >= p->len) { p->ok = false; return js_undef(); }
-    char c = p->s[p->pos];
-    if (c == '"') return jp_parse_string(p);
-    if (c == '[') {
-        ++p->pos;
-        JsArray *arr = js_alloc_array(p->vm, 4u);
-        if (!arr) { p->ok = false; return js_undef(); }
-        jp_skip_ws(p);
-        if (p->pos < p->len && p->s[p->pos] == ']') {
-            ++p->pos;
-            JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_ARRAY; v.as.arr = arr;
-            return v;
-        }
-        while (p->pos < p->len && p->ok) {
-            JsVal elem = jp_parse_value(p, depth + 1);
-            if (!p->ok) return js_undef();
-            js_array_push(p->vm, arr, elem);
-            jp_skip_ws(p);
-            if (p->pos < p->len && p->s[p->pos] == ',') { ++p->pos; continue; }
-            if (p->pos < p->len && p->s[p->pos] == ']') {
-                ++p->pos;
-                JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_ARRAY; v.as.arr = arr;
-                return v;
-            }
-            break;
-        }
-        p->ok = false;
-        return js_undef();
-    }
-    if (c == '{') {
-        ++p->pos;
-        JsObject *obj = js_alloc_object(p->vm, 4u);
-        if (!obj) { p->ok = false; return js_undef(); }
-        jp_skip_ws(p);
-        if (p->pos < p->len && p->s[p->pos] == '}') {
-            ++p->pos;
-            JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_OBJECT; v.as.obj = obj;
-            return v;
-        }
-        while (p->pos < p->len && p->ok) {
-            jp_skip_ws(p);
-            JsVal kval = jp_parse_string(p);
-            if (!p->ok || kval.kind != JS_VAL_STRING) { p->ok = false; return js_undef(); }
-            jp_skip_ws(p);
-            if (p->pos >= p->len || p->s[p->pos] != ':') { p->ok = false; return js_undef(); }
-            ++p->pos;
-            JsVal vval = jp_parse_value(p, depth + 1);
-            if (!p->ok) return js_undef();
-            js_obj_set(p->vm, obj, kval.as.str->data, vval);
-            jp_skip_ws(p);
-            if (p->pos < p->len && p->s[p->pos] == ',') { ++p->pos; continue; }
-            if (p->pos < p->len && p->s[p->pos] == '}') {
-                ++p->pos;
-                JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_OBJECT; v.as.obj = obj;
-                return v;
-            }
-            break;
-        }
-        p->ok = false;
-        return js_undef();
-    }
-    if (p->pos + 4u <= p->len && memcmp(p->s + p->pos, "true", 4u) == 0) {
-        p->pos += 4u; return js_bool(true);
-    }
-    if (p->pos + 5u <= p->len && memcmp(p->s + p->pos, "false", 5u) == 0) {
-        p->pos += 5u; return js_bool(false);
-    }
-    if (p->pos + 4u <= p->len && memcmp(p->s + p->pos, "null", 4u) == 0) {
-        p->pos += 4u; return js_null();
-    }
-    if (c == '-' || (c >= '0' && c <= '9')) {
-        size_t st = p->pos;
-        if (p->s[p->pos] == '-') ++p->pos;
-        while (p->pos < p->len && ((p->s[p->pos] >= '0' && p->s[p->pos] <= '9') ||
-               p->s[p->pos] == '.' || p->s[p->pos] == 'e' || p->s[p->pos] == 'E' ||
-               p->s[p->pos] == '+' || p->s[p->pos] == '-')) {
-            ++p->pos;
-        }
-        double num = js_parse_float_str(p->s + st, p->pos - st, false);
-        if (js_num_is_nan(num)) { p->ok = false; return js_undef(); }
-        return js_num(num);
-    }
-    p->ok = false;
-    return js_undef();
-}
-
-/* =========================================================================
- * 6. Lexer & Recursive-Descent / Pratt Bytecode Compiler
- * ========================================================================= */
-typedef enum JsTokKind {
-    TOK_EOF = 0,
-    TOK_IDENT,
-    TOK_NUMBER,
-    TOK_STRING,
-    TOK_BACKTICK,
-    TOK_LPAREN, TOK_RPAREN,
-    TOK_LBRACE, TOK_RBRACE,
-    TOK_LBRACKET, TOK_RBRACKET,
-    TOK_SEMI, TOK_COMMA, TOK_DOT, TOK_COLON, TOK_QUESTION, TOK_ARROW,
-    TOK_PLUS, TOK_MINUS, TOK_STAR, TOK_SLASH, TOK_PERCENT,
-    TOK_INC, TOK_DEC,
-    TOK_ASSIGN, TOK_ADD_ASSIGN, TOK_SUB_ASSIGN, TOK_MUL_ASSIGN, TOK_DIV_ASSIGN, TOK_MOD_ASSIGN,
-    TOK_EQ, TOK_NEQ, TOK_SEQ, TOK_SNEQ,
-    TOK_LT, TOK_LTE, TOK_GT, TOK_GTE,
-    TOK_AND, TOK_OR, TOK_NULLISH, TOK_BANG,
-    TOK_BIT_AND, TOK_BIT_OR, TOK_BIT_XOR, TOK_SHL, TOK_SHR,
-    TOK_KW_VAR, TOK_KW_LET, TOK_KW_CONST, TOK_KW_FUNCTION, TOK_KW_RETURN,
-    TOK_KW_IF, TOK_KW_ELSE, TOK_KW_WHILE, TOK_KW_DO, TOK_KW_FOR, TOK_KW_OF,
-    TOK_KW_BREAK, TOK_KW_CONTINUE, TOK_KW_TRY, TOK_KW_CATCH, TOK_KW_FINALLY, TOK_KW_THROW,
-    TOK_KW_TYPEOF, TOK_KW_NEW, TOK_KW_THIS,
-    TOK_KW_TRUE, TOK_KW_FALSE, TOK_KW_NULL, TOK_KW_UNDEFINED, TOK_KW_VOID
-} JsTokKind;
-
-typedef struct JsToken {
-    JsTokKind   kind;
-    const char *start;
-    size_t      len;
-    double      num_val;
-    JsVal       str_val;
-    bool        newline_before;
-} JsToken;
-
-typedef struct JsLexer {
-    ArcrJsVm   *vm;
-    const char *src;
-    size_t      len;
-    size_t      pos;
-    JsToken     cur;
-} JsLexer;
-
-static bool is_ident_start(unsigned char c) {
-    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '$' || c >= 0x80u;
-}
-
-static bool is_ident_cont(unsigned char c) {
-    return is_ident_start(c) || (c >= '0' && c <= '9');
-}
-
-static JsTokKind match_keyword(const char *s, size_t len) {
-    static const struct { const char *kw; JsTokKind tk; } kKw[] = {
-        {"var", TOK_KW_VAR}, {"let", TOK_KW_LET}, {"const", TOK_KW_CONST},
-        {"function", TOK_KW_FUNCTION}, {"return", TOK_KW_RETURN},
-        {"if", TOK_KW_IF}, {"else", TOK_KW_ELSE}, {"while", TOK_KW_WHILE},
-        {"do", TOK_KW_DO}, {"for", TOK_KW_FOR}, {"of", TOK_KW_OF},
-        {"break", TOK_KW_BREAK}, {"continue", TOK_KW_CONTINUE},
-        {"try", TOK_KW_TRY}, {"catch", TOK_KW_CATCH}, {"finally", TOK_KW_FINALLY},
-        {"throw", TOK_KW_THROW}, {"typeof", TOK_KW_TYPEOF}, {"new", TOK_KW_NEW},
-        {"this", TOK_KW_THIS}, {"true", TOK_KW_TRUE}, {"false", TOK_KW_FALSE},
-        {"null", TOK_KW_NULL}, {"undefined", TOK_KW_UNDEFINED}, {"void", TOK_KW_VOID}
-    };
-    for (size_t i = 0u; i < ARCR_ARRAY_LEN(kKw); ++i) {
-        if (strlen(kKw[i].kw) == len && memcmp(s, kKw[i].kw, len) == 0) return kKw[i].tk;
-    }
-    return TOK_IDENT;
-}
-
-static void lex_next(JsLexer *lx) {
-    bool saw_nl = false;
-    while (lx->pos < lx->len) {
-        char c = lx->src[lx->pos];
-        if (c == '\n' || c == '\r') { saw_nl = true; ++lx->pos; continue; }
-        if (c == ' ' || c == '\t' || c == '\f' || c == '\v') { ++lx->pos; continue; }
-        if (c == '/' && lx->pos + 1u < lx->len && lx->src[lx->pos + 1u] == '/') {
-            lx->pos += 2u;
-            while (lx->pos < lx->len && lx->src[lx->pos] != '\n') ++lx->pos;
-            continue;
-        }
-        if (c == '/' && lx->pos + 1u < lx->len && lx->src[lx->pos + 1u] == '*') {
-            lx->pos += 2u;
-            while (lx->pos + 1u < lx->len &&
-                   !(lx->src[lx->pos] == '*' && lx->src[lx->pos + 1u] == '/')) {
-                if (lx->src[lx->pos] == '\n') saw_nl = true;
-                ++lx->pos;
-            }
-            lx->pos = (lx->pos + 1u < lx->len) ? (lx->pos + 2u) : lx->len;
-            continue;
-        }
-        break;
-    }
-
-    JsToken tk;
-    memset(&tk, 0, sizeof(tk));
-    tk.newline_before = saw_nl;
-    tk.start = lx->src + lx->pos;
-
-    if (lx->pos >= lx->len) {
-        tk.kind = TOK_EOF;
-        lx->cur = tk;
-        return;
-    }
-
-    unsigned char ch = (unsigned char)lx->src[lx->pos];
-
-    /* Identifiers & keywords */
-    if (is_ident_start(ch)) {
-        size_t st = lx->pos++;
-        while (lx->pos < lx->len && is_ident_cont((unsigned char)lx->src[lx->pos])) ++lx->pos;
-        tk.len  = lx->pos - st;
-        tk.kind = match_keyword(tk.start, tk.len);
-        lx->cur = tk;
-        return;
-    }
-
-    /* Numeric literals */
-    if ((ch >= '0' && ch <= '9') ||
-        (ch == '.' && lx->pos + 1u < lx->len && lx->src[lx->pos + 1u] >= '0' && lx->src[lx->pos + 1u] <= '9')) {
-        size_t st = lx->pos;
-        if (ch == '0' && lx->pos + 1u < lx->len && (lx->src[lx->pos + 1u] == 'x' || lx->src[lx->pos + 1u] == 'X')) {
-            lx->pos += 2u;
-            while (lx->pos < lx->len && js_hex_nib(lx->src[lx->pos]) >= 0) ++lx->pos;
-        } else {
-            while (lx->pos < lx->len && lx->src[lx->pos] >= '0' && lx->src[lx->pos] <= '9') ++lx->pos;
-            if (lx->pos < lx->len && lx->src[lx->pos] == '.') {
-                ++lx->pos;
-                while (lx->pos < lx->len && lx->src[lx->pos] >= '0' && lx->src[lx->pos] <= '9') ++lx->pos;
-            }
-            if (lx->pos < lx->len && (lx->src[lx->pos] == 'e' || lx->src[lx->pos] == 'E')) {
-                ++lx->pos;
-                if (lx->pos < lx->len && (lx->src[lx->pos] == '+' || lx->src[lx->pos] == '-')) ++lx->pos;
-                while (lx->pos < lx->len && lx->src[lx->pos] >= '0' && lx->src[lx->pos] <= '9') ++lx->pos;
-            }
-        }
-        tk.len     = lx->pos - st;
-        tk.kind    = TOK_NUMBER;
-        tk.num_val = js_parse_float_str(tk.start, tk.len, false);
-        lx->cur    = tk;
-        return;
-    }
-
-    /* Single / Double Quoted String Literals */
-    if (ch == '\'' || ch == '"') {
-        char quote = (char)ch;
-        ++lx->pos;
-        JsonBuf sb = {0};
-        while (lx->pos < lx->len && lx->src[lx->pos] != quote) {
-            char c = lx->src[lx->pos++];
-            if (c == '\\' && lx->pos < lx->len) {
-                char esc = lx->src[lx->pos++];
-                char outc = esc;
-                if (esc == 'n') outc = '\n';
-                else if (esc == 'r') outc = '\r';
-                else if (esc == 't') outc = '\t';
-                else if (esc == '0') outc = '\0';
-                else if (esc == 'x' && lx->pos + 2u <= lx->len) {
-                    int h1 = js_hex_nib(lx->src[lx->pos]), h2 = js_hex_nib(lx->src[lx->pos + 1u]);
-                    if (h1 >= 0 && h2 >= 0) {
-                        outc = (char)((h1 << 4) | h2);
-                        lx->pos += 2u;
-                    }
-                } else if (esc == 'u' && lx->pos + 4u <= lx->len) {
-                    uint32_t cp = 0u;
-                    bool ok = true;
-                    for (int k = 0; k < 4; ++k) {
-                        int h = js_hex_nib(lx->src[lx->pos + (size_t)k]);
-                        if (h < 0) { ok = false; break; }
-                        cp = (cp << 4) | (uint32_t)h;
-                    }
-                    if (ok) {
-                        lx->pos += 4u;
-                        char u8[4];
-                        size_t un = arcr_utf8_encode_one(cp, u8);
-                        jbuf_append(&lx->vm->temp_arena, &sb, u8, un);
-                        continue;
-                    }
-                }
-                jbuf_append(&lx->vm->temp_arena, &sb, &outc, 1u);
-            } else {
-                jbuf_append(&lx->vm->temp_arena, &sb, &c, 1u);
-            }
-        }
-        if (lx->pos < lx->len && lx->src[lx->pos] == quote) ++lx->pos;
-        tk.kind    = TOK_STRING;
-        tk.str_val = js_mk_str_n(lx->vm, sb.buf ? sb.buf : "", sb.len);
-        lx->cur    = tk;
-        return;
-    }
-
-    if (ch == '`') {
-        ++lx->pos;
-        tk.kind = TOK_BACKTICK;
-        tk.len  = 1u;
-        lx->cur = tk;
-        return;
-    }
-
-    /* Punctuation & Multi-char operators */
-    char n1 = (lx->pos + 1u < lx->len) ? lx->src[lx->pos + 1u] : '\0';
-    char n2 = (lx->pos + 2u < lx->len) ? lx->src[lx->pos + 2u] : '\0';
-    ++lx->pos;
-    tk.len = 1u;
-
-    switch (ch) {
-        case '(': tk.kind = TOK_LPAREN; break;
-        case ')': tk.kind = TOK_RPAREN; break;
-        case '{': tk.kind = TOK_LBRACE; break;
-        case '}': tk.kind = TOK_RBRACE; break;
-        case '[': tk.kind = TOK_LBRACKET; break;
-        case ']': tk.kind = TOK_RBRACKET; break;
-        case ';': tk.kind = TOK_SEMI; break;
-        case ',': tk.kind = TOK_COMMA; break;
-        case '.': tk.kind = TOK_DOT; break;
-        case ':': tk.kind = TOK_COLON; break;
-        case '^': tk.kind = TOK_BIT_XOR; break;
-        case '?':
-            if (n1 == '?') { ++lx->pos; tk.len = 2u; tk.kind = TOK_NULLISH; }
-            else tk.kind = TOK_QUESTION;
-            break;
-        case '+':
-            if (n1 == '+') { ++lx->pos; tk.len = 2u; tk.kind = TOK_INC; }
-            else if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_ADD_ASSIGN; }
-            else tk.kind = TOK_PLUS;
-            break;
-        case '-':
-            if (n1 == '-') { ++lx->pos; tk.len = 2u; tk.kind = TOK_DEC; }
-            else if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_SUB_ASSIGN; }
-            else tk.kind = TOK_MINUS;
-            break;
-        case '*':
-            if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_MUL_ASSIGN; }
-            else tk.kind = TOK_STAR;
-            break;
-        case '/':
-            if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_DIV_ASSIGN; }
-            else tk.kind = TOK_SLASH;
-            break;
-        case '%':
-            if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_MOD_ASSIGN; }
-            else tk.kind = TOK_PERCENT;
-            break;
-        case '=':
-            if (n1 == '>' ) { ++lx->pos; tk.len = 2u; tk.kind = TOK_ARROW; }
-            else if (n1 == '=' && n2 == '=') { lx->pos += 2u; tk.len = 3u; tk.kind = TOK_SEQ; }
-            else if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_EQ; }
-            else tk.kind = TOK_ASSIGN;
-            break;
-        case '!':
-            if (n1 == '=' && n2 == '=') { lx->pos += 2u; tk.len = 3u; tk.kind = TOK_SNEQ; }
-            else if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_NEQ; }
-            else tk.kind = TOK_BANG;
-            break;
-        case '<':
-            if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_LTE; }
-            else if (n1 == '<') { ++lx->pos; tk.len = 2u; tk.kind = TOK_SHL; }
-            else tk.kind = TOK_LT;
-            break;
-        case '>':
-            if (n1 == '=') { ++lx->pos; tk.len = 2u; tk.kind = TOK_GTE; }
-            else if (n1 == '>' && n2 == '>') { lx->pos += 2u; tk.len = 3u; tk.kind = TOK_SHR; }
-            else if (n1 == '>') { ++lx->pos; tk.len = 2u; tk.kind = TOK_SHR; }
-            else tk.kind = TOK_GT;
-            break;
-        case '&':
-            if (n1 == '&') { ++lx->pos; tk.len = 2u; tk.kind = TOK_AND; }
-            else tk.kind = TOK_BIT_AND;
-            break;
-        case '|':
-            if (n1 == '|') { ++lx->pos; tk.len = 2u; tk.kind = TOK_OR; }
-            else tk.kind = TOK_BIT_OR;
-            break;
-        default:
-            tk.kind = TOK_SEMI; /* Tolerate stray char cleanly */
-            break;
-    }
-    lx->cur = tk;
-}
-
-/* Compiler Structures */
-typedef struct JsLocalVar {
-    const char *name;
-    size_t      len;
-    int         scope_depth;
-} JsLocalVar;
-
-typedef struct JsLoopPatch {
-    size_t continue_ip;
-    size_t break_patches[32];
-    size_t break_count;
-    size_t cont_patches[32];
-    size_t cont_count;
-    bool   cont_uses_patches;
-} JsLoopPatch;
-
-typedef struct JsCompiler {
-    ArcrJsVm          *vm;
-    JsLexer           *lx;
-    struct JsCompiler *parent;
-    JsChunk           *chunk;
-    bool               is_function;
-    int                scope_depth;
-    JsLocalVar         locals[JS_MAX_LOCALS];
-    uint16_t           local_count;
-    JsLoopPatch        loops[16];
-    size_t             loop_depth;
-    bool               had_error;
-} JsCompiler;
-
-static JsChunk *alloc_chunk(ArcrJsVm *vm) {
-    JsChunk *ch = (JsChunk *)vm_alloc(vm, sizeof(JsChunk), sizeof(void *));
-    if (!ch) return NULL;
-    memset(ch, 0, sizeof(*ch));
-    return ch;
-}
-
-static uint32_t chunk_add_const(ArcrJsVm *vm, JsChunk *ch, JsVal val) {
-    if (val.kind == JS_VAL_STRING && val.as.str) {
-        for (size_t i = 0u; i < ch->const_len; ++i) {
-            if (ch->consts[i].kind == JS_VAL_STRING && ch->consts[i].as.str &&
-                ch->consts[i].as.str->len == val.as.str->len &&
-                memcmp(ch->consts[i].as.str->data, val.as.str->data, val.as.str->len) == 0) {
-                return (uint32_t)i;
-            }
-        }
-    }
-    if (ch->const_len >= ch->const_cap) {
-        size_t ncap = (ch->const_cap == 0u) ? 16u : (ch->const_cap * 2u);
-        JsVal *nc = (JsVal *)vm_alloc(vm, ncap * sizeof(JsVal), sizeof(void *));
-        if (!nc) return 0u;
-        if (ch->const_len > 0u) memcpy(nc, ch->consts, ch->const_len * sizeof(JsVal));
-        ch->consts    = nc;
-        ch->const_cap = ncap;
-    }
-    ch->consts[ch->const_len] = val;
-    return (uint32_t)(ch->const_len++);
-}
-
-static size_t emit_op(JsCompiler *c, JsOpCode op, uint8_t aux, uint32_t arg) {
-    JsChunk *ch = c->chunk;
-    if (ch->code_len >= ch->code_cap) {
-        size_t ncap = (ch->code_cap == 0u) ? 64u : (ch->code_cap * 2u);
-        JsInst *ni = (JsInst *)vm_alloc(c->vm, ncap * sizeof(JsInst), sizeof(void *));
-        if (!ni) { c->had_error = true; return 0u; }
-        if (ch->code_len > 0u) memcpy(ni, ch->code, ch->code_len * sizeof(JsInst));
-        ch->code     = ni;
-        ch->code_cap = ncap;
-        c->vm->bytecode_cache_bytes += (ncap / 2u) * sizeof(JsInst);
-    }
-    ch->code[ch->code_len].op  = (uint8_t)op;
-    ch->code[ch->code_len].aux = aux;
-    ch->code[ch->code_len].arg = arg;
-    return ch->code_len++;
-}
-
-static void patch_jump(JsCompiler *c, size_t inst_idx) {
-    if (inst_idx < c->chunk->code_len) {
-        c->chunk->code[inst_idx].arg = (uint32_t)c->chunk->code_len;
-    }
-}
-
-static bool resolve_lexical(JsCompiler *c, const char *name, size_t len, uint32_t *out_encoded) {
-    uint16_t depth = 0u;
-    for (JsCompiler *cur = c; cur != NULL; cur = cur->parent, ++depth) {
-        for (int i = (int)cur->local_count - 1; i >= 0; --i) {
-            if (cur->locals[i].len == len && memcmp(cur->locals[i].name, name, len) == 0) {
-                *out_encoded = ((uint32_t)depth << 16) | (uint32_t)i;
-                return true;
-            }
-        }
-    }
-    return false;
-}
-
-static int declare_local(JsCompiler *c, const char *name, size_t len) {
-    if (c->local_count >= JS_MAX_LOCALS) { c->had_error = true; return 0; }
-    int slot = (int)c->local_count++;
-    c->locals[slot].name        = name;
-    c->locals[slot].len         = len;
-    c->locals[slot].scope_depth = c->scope_depth;
-    if (c->local_count > c->chunk->local_count) {
-        c->chunk->local_count = c->local_count;
-    }
-    return slot;
-}
-
-static void pop_locals_to_depth(JsCompiler *c, int target_depth) {
-    while (c->local_count > 0u && c->locals[c->local_count - 1u].scope_depth > target_depth) {
-        --c->local_count;
-    }
-}
-
-static bool match_tok(JsCompiler *c, JsTokKind k) {
-    if (c->lx->cur.kind == k) { lex_next(c->lx); return true; }
-    return false;
-}
-
-static void consume_semi_optional(JsCompiler *c) {
-    if (c->lx->cur.kind == TOK_SEMI) lex_next(c->lx);
-}
-
-static void compile_expr(JsCompiler *c);
-static void compile_assign(JsCompiler *c);
-static void compile_stmt(JsCompiler *c);
-
-static void compile_function_body(JsCompiler *outer, const char *params_src[], size_t params_len[],
-                                  size_t param_cnt, bool concise_expr_body) {
-    JsChunk *fn_chunk = alloc_chunk(outer->vm);
-    if (!fn_chunk) { outer->had_error = true; return; }
-    fn_chunk->param_count = (uint16_t)param_cnt;
-
-    JsCompiler sub;
-    memset(&sub, 0, sizeof(sub));
-    sub.vm          = outer->vm;
-    sub.lx          = outer->lx;
-    sub.parent      = outer;
-    sub.chunk       = fn_chunk;
-    sub.is_function = true;
-    sub.scope_depth = 1;
-
-    for (size_t i = 0u; i < param_cnt; ++i) {
-        declare_local(&sub, params_src[i], params_len[i]);
-    }
-
-    if (concise_expr_body) {
-        compile_assign(&sub);
-        emit_op(&sub, OP_RETURN, 0u, 0u);
+    int32_t ntype = 1;
+    const char *tname = "";
+    if (n->kind == ARCR_NODE_DOCUMENT) {
+        ntype = 9;
+        tname = "#document";
+    } else if (js_node_is_fragment(vm, n)) {
+        ntype = 11;
+        tname = "#document-fragment";
+    } else if (n->kind == ARCR_NODE_TEXT) {
+        ntype = 3;
+        tname = "#text";
+    } else if (n->kind == ARCR_NODE_COMMENT) {
+        ntype = 8;
+        tname = "#comment";
     } else {
-        match_tok(&sub, TOK_LBRACE);
-        while (sub.lx->cur.kind != TOK_RBRACE && sub.lx->cur.kind != TOK_EOF && !sub.had_error) {
-            compile_stmt(&sub);
-        }
-        match_tok(&sub, TOK_RBRACE);
-        uint32_t u_idx = chunk_add_const(sub.vm, fn_chunk, js_undef());
-        emit_op(&sub, OP_CONST, 0u, u_idx);
-        emit_op(&sub, OP_RETURN, 0u, 0u);
+        ntype = 1;
+        tname = arcr_atom_cstr(vm->host.doc->atoms, n->tag);
+        if (!tname) tname = "div";
     }
-    if (sub.had_error) outer->had_error = true;
 
-    JsFunc *proto = (JsFunc *)vm_alloc(outer->vm, sizeof(JsFunc), sizeof(void *));
-    if (!proto) { outer->had_error = true; return; }
-    proto->chunk        = fn_chunk;
-    proto->captured_env = NULL;
-
-    JsVal fv; memset(&fv, 0, sizeof(fv));
-    fv.kind  = JS_VAL_FUNCTION;
-    fv.as.fn = proto;
-    uint32_t cidx = chunk_add_const(outer->vm, outer->chunk, fv);
-    emit_op(outer, OP_CLOSURE, 0u, cidx);
+    JSValue o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "uid", JS_NewUint32(ctx, n->node_uid));
+    JS_SetPropertyStr(ctx, o, "nodeType", JS_NewInt32(ctx, ntype));
+    JS_SetPropertyStr(ctx, o, "tag", JS_NewString(ctx, tname));
+    JS_SetPropertyStr(ctx, o, "connected", JS_NewBool(ctx, js_node_in_doc_root(vm->host.doc, n)));
+    return o;
 }
 
-/* Lookahead helper: checks if current '(' starts an arrow function `(a, b) => ...` */
-static bool is_paren_arrow_ahead(const JsLexer *lx_in) {
-    JsLexer probe = *lx_in;
-    if (probe.cur.kind != TOK_LPAREN) return false;
-    lex_next(&probe);
-    int depth = 1;
-    while (probe.cur.kind != TOK_EOF && depth > 0) {
-        if (probe.cur.kind == TOK_LPAREN) ++depth;
-        else if (probe.cur.kind == TOK_RPAREN) --depth;
-        lex_next(&probe);
+static ArcrDomNode *find_first_tag_rec(const ArcrDocument *doc, ArcrDomNode *n, const char *tag) {
+    if (!doc || !n) return NULL;
+    if (n->kind == ARCR_NODE_ELEMENT &&
+        arcr_str_eq_nocase(arcr_atom_cstr(doc->atoms, n->tag), tag)) {
+        return n;
     }
-    return probe.cur.kind == TOK_ARROW;
+    for (ArcrDomNode *c = n->first_child; c != NULL; c = c->next_sibling) {
+        ArcrDomNode *f = find_first_tag_rec(doc, c, tag);
+        if (f) return f;
+    }
+    return NULL;
 }
 
-static void compile_template_literal(JsCompiler *c) {
-    /* Lexer just consumed opening '`'; lx->pos points to first template character */
-    JsLexer *lx = c->lx;
-    uint32_t empty_idx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, "", 0u));
-    emit_op(c, OP_CONST, 0u, empty_idx);
+static JSValue b_doc_special_uids(JSContext *ctx, JSValueConst this_val,
+                                  int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || !vm->host.doc->root) return JS_NULL;
+    js_uid_sync_document(vm);
+    ArcrDocument *doc = vm->host.doc;
+    ArcrDomNode *html = find_first_tag_rec(doc, doc->root, "html");
+    ArcrDomNode *head = find_first_tag_rec(doc, doc->root, "head");
+    ArcrDomNode *body = doc->body ? doc->body : find_first_tag_rec(doc, doc->root, "body");
+    ArcrDomNode *act  = doc->focused_node ? doc->focused_node : body;
 
-    JsonBuf seg = {0};
-    while (lx->pos < lx->len) {
-        char ch = lx->src[lx->pos];
-        if (ch == '`') {
-            ++lx->pos;
-            if (seg.len > 0u) {
-                uint32_t sidx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, seg.buf, seg.len));
-                emit_op(c, OP_CONST, 0u, sidx);
-                emit_op(c, OP_ADD, 0u, 0u);
-            }
-            lex_next(lx);
-            return;
-        }
-        if (ch == '\\' && lx->pos + 1u < lx->len) {
-            ++lx->pos;
-            char esc = lx->src[lx->pos++];
-            char outc = (esc == 'n') ? '\n' : (esc == 'r') ? '\r' : (esc == 't') ? '\t' : esc;
-            jbuf_append(&c->vm->temp_arena, &seg, &outc, 1u);
-            continue;
-        }
-        if (ch == '$' && lx->pos + 1u < lx->len && lx->src[lx->pos + 1u] == '{') {
-            if (seg.len > 0u) {
-                uint32_t sidx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, seg.buf, seg.len));
-                emit_op(c, OP_CONST, 0u, sidx);
-                emit_op(c, OP_ADD, 0u, 0u);
-                seg.len = 0u;
-            }
-            lx->pos += 2u;
-            size_t expr_start = lx->pos;
-            int bdepth = 1;
-            while (lx->pos < lx->len && bdepth > 0) {
-                char ec = lx->src[lx->pos];
-                if (ec == '\'' || ec == '"') {
-                    char q = ec; ++lx->pos;
-                    while (lx->pos < lx->len && lx->src[lx->pos] != q) {
-                        if (lx->src[lx->pos] == '\\') ++lx->pos;
-                        if (lx->pos < lx->len) ++lx->pos;
-                    }
-                    if (lx->pos < lx->len) ++lx->pos;
-                    continue;
-                }
-                if (ec == '{') ++bdepth;
-                else if (ec == '}') --bdepth;
-                if (bdepth > 0) ++lx->pos;
-            }
-            size_t expr_len = lx->pos - expr_start;
-            if (lx->pos < lx->len && lx->src[lx->pos] == '}') ++lx->pos;
-
-            JsLexer sub_lx;
-            memset(&sub_lx, 0, sizeof(sub_lx));
-            sub_lx.vm  = c->vm;
-            sub_lx.src = lx->src + expr_start;
-            sub_lx.len = expr_len;
-            lex_next(&sub_lx);
-
-            JsLexer *saved = c->lx;
-            c->lx = &sub_lx;
-            compile_expr(c);
-            c->lx = saved;
-            emit_op(c, OP_ADD, 0u, 0u);
-            continue;
-        }
-        jbuf_append(&c->vm->temp_arena, &seg, &ch, 1u);
-        ++lx->pos;
-    }
-    lex_next(lx);
+    JSValue o = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, "doc",  JS_NewUint32(ctx, doc->root->node_uid));
+    JS_SetPropertyStr(ctx, o, "html", JS_NewUint32(ctx, html ? html->node_uid : 0u));
+    JS_SetPropertyStr(ctx, o, "head", JS_NewUint32(ctx, head ? head->node_uid : 0u));
+    JS_SetPropertyStr(ctx, o, "body", JS_NewUint32(ctx, body ? body->node_uid : 0u));
+    JS_SetPropertyStr(ctx, o, "active", JS_NewUint32(ctx, act ? act->node_uid : 0u));
+    return o;
 }
 
-static uint8_t compile_arg_list(JsCompiler *c) {
-    uint8_t argc = 0u;
-    if (c->lx->cur.kind != TOK_RPAREN) {
-        do {
-            if (c->lx->cur.kind == TOK_RPAREN) break;
-            compile_assign(c);
-            if (argc < 250u) ++argc;
-        } while (match_tok(c, TOK_COMMA));
-    }
-    match_tok(c, TOK_RPAREN);
-    return argc;
+static JSValue b_get_title(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    const char *t = (vm && vm->host.doc && vm->host.doc->title) ? vm->host.doc->title : "";
+    return JS_NewString(ctx, t);
 }
 
-static void compile_primary(JsCompiler *c) {
-    JsToken tk = c->lx->cur;
-    switch (tk.kind) {
-        case TOK_NUMBER: {
-            lex_next(c->lx);
-            uint32_t idx = chunk_add_const(c->vm, c->chunk, js_num(tk.num_val));
-            emit_op(c, OP_CONST, 0u, idx);
-            return;
+static JSValue b_set_title(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 1) return JS_UNDEFINED;
+    const char *s = JS_ToCString(ctx, argv[0]);
+    if (!s) return JS_EXCEPTION;
+    if (vm->host.doc) {
+        vm->host.doc->title = arcr_arena_strdup(&vm->host.doc->arena, s, strlen(s));
+        ArcrDomNode *tnode = find_first_tag_rec(vm->host.doc, vm->host.doc->root, "title");
+        if (tnode) {
+            tnode->first_child = NULL;
+            tnode->last_child  = NULL;
+            ArcrDomNode *tx = js_dom_create_text(vm, s, strlen(s));
+            if (tx) js_dom_insert_before_raw(vm, tnode, tx, NULL);
         }
-        case TOK_STRING: {
-            lex_next(c->lx);
-            uint32_t idx = chunk_add_const(c->vm, c->chunk, tk.str_val);
-            emit_op(c, OP_CONST, 0u, idx);
-            return;
-        }
-        case TOK_BACKTICK:
-            compile_template_literal(c);
-            return;
-        case TOK_KW_TRUE: {
-            lex_next(c->lx);
-            uint32_t idx = chunk_add_const(c->vm, c->chunk, js_bool(true));
-            emit_op(c, OP_CONST, 0u, idx);
-            return;
-        }
-        case TOK_KW_FALSE: {
-            lex_next(c->lx);
-            uint32_t idx = chunk_add_const(c->vm, c->chunk, js_bool(false));
-            emit_op(c, OP_CONST, 0u, idx);
-            return;
-        }
-        case TOK_KW_NULL: {
-            lex_next(c->lx);
-            uint32_t idx = chunk_add_const(c->vm, c->chunk, js_null());
-            emit_op(c, OP_CONST, 0u, idx);
-            return;
-        }
-        case TOK_KW_UNDEFINED: {
-            lex_next(c->lx);
-            uint32_t idx = chunk_add_const(c->vm, c->chunk, js_undef());
-            emit_op(c, OP_CONST, 0u, idx);
-            return;
-        }
-        case TOK_KW_THIS:
-            lex_next(c->lx);
-            emit_op(c, OP_THIS, 0u, 0u);
-            return;
-        case TOK_KW_FUNCTION: {
-            lex_next(c->lx);
-            if (c->lx->cur.kind == TOK_IDENT) lex_next(c->lx); /* optional expr name */
-            match_tok(c, TOK_LPAREN);
-            const char *ps[16];
-            size_t pl[16];
-            size_t pcnt = 0u;
-            while (c->lx->cur.kind == TOK_IDENT && pcnt < 16u) {
-                ps[pcnt] = c->lx->cur.start;
-                pl[pcnt] = c->lx->cur.len;
-                ++pcnt;
-                lex_next(c->lx);
-                if (!match_tok(c, TOK_COMMA)) break;
-            }
-            match_tok(c, TOK_RPAREN);
-            compile_function_body(c, ps, pl, pcnt, false);
-            return;
-        }
-        case TOK_LPAREN: {
-            if (is_paren_arrow_ahead(c->lx)) {
-                lex_next(c->lx); /* '(' */
-                const char *ps[16];
-                size_t pl[16];
-                size_t pcnt = 0u;
-                while (c->lx->cur.kind == TOK_IDENT && pcnt < 16u) {
-                    ps[pcnt] = c->lx->cur.start;
-                    pl[pcnt] = c->lx->cur.len;
-                    ++pcnt;
-                    lex_next(c->lx);
-                    if (!match_tok(c, TOK_COMMA)) break;
-                }
-                match_tok(c, TOK_RPAREN);
-                match_tok(c, TOK_ARROW);
-                bool concise = (c->lx->cur.kind != TOK_LBRACE);
-                compile_function_body(c, ps, pl, pcnt, concise);
-                return;
-            }
-            lex_next(c->lx);
-            compile_expr(c);
-            match_tok(c, TOK_RPAREN);
-            return;
-        }
-        case TOK_LBRACKET: {
-            lex_next(c->lx);
-            uint32_t cnt = 0u;
-            while (c->lx->cur.kind != TOK_RBRACKET && c->lx->cur.kind != TOK_EOF) {
-                compile_assign(c);
-                ++cnt;
-                if (!match_tok(c, TOK_COMMA)) break;
-            }
-            match_tok(c, TOK_RBRACKET);
-            emit_op(c, OP_NEW_ARRAY, 0u, cnt);
-            return;
-        }
-        case TOK_LBRACE: {
-            lex_next(c->lx);
-            uint32_t pairs = 0u;
-            while (c->lx->cur.kind != TOK_RBRACE && c->lx->cur.kind != TOK_EOF) {
-                JsToken kt = c->lx->cur;
-                JsVal key_str = js_undef();
-                if (kt.kind == TOK_STRING) {
-                    key_str = kt.str_val;
-                    lex_next(c->lx);
-                } else if (kt.kind == TOK_NUMBER) {
-                    char nb[64];
-                    js_format_number(kt.num_val, nb, sizeof(nb));
-                    key_str = js_mk_str(c->vm, nb);
-                    lex_next(c->lx);
-                } else {
-                    /* Identifier or keyword property name */
-                    key_str = js_mk_str_n(c->vm, kt.start, kt.len);
-                    lex_next(c->lx);
-                }
-                uint32_t kidx = chunk_add_const(c->vm, c->chunk, key_str);
-                emit_op(c, OP_CONST, 0u, kidx);
+    }
+    if (vm->host.set_document_title) {
+        vm->host.set_document_title(vm->host.userdata, s);
+    }
+    JS_FreeCString(ctx, s);
+    return JS_UNDEFINED;
+}
 
-                if (match_tok(c, TOK_COLON)) {
-                    compile_assign(c);
-                } else if (c->lx->cur.kind == TOK_LPAREN) {
-                    /* Method shorthand: { foo(a) { ... } } */
-                    lex_next(c->lx);
-                    const char *ps[16]; size_t pl[16]; size_t pcnt = 0u;
-                    while (c->lx->cur.kind == TOK_IDENT && pcnt < 16u) {
-                        ps[pcnt] = c->lx->cur.start; pl[pcnt] = c->lx->cur.len; ++pcnt;
-                        lex_next(c->lx);
-                        if (!match_tok(c, TOK_COMMA)) break;
-                    }
-                    match_tok(c, TOK_RPAREN);
-                    compile_function_body(c, ps, pl, pcnt, false);
-                } else {
-                    /* Shorthand property: { x } */
-                    uint32_t enc = 0u;
-                    if (resolve_lexical(c, kt.start, kt.len, &enc)) {
-                        emit_op(c, OP_GET_LOCAL, 0u, enc);
-                    } else {
-                        emit_op(c, OP_GET_GLOBAL, 0u, kidx);
-                    }
-                }
-                ++pairs;
-                if (!match_tok(c, TOK_COMMA)) break;
-            }
-            match_tok(c, TOK_RBRACE);
-            emit_op(c, OP_NEW_OBJECT, 0u, pairs);
-            return;
+static ArcrDomNode *find_by_id_rec(const ArcrDocument *doc, ArcrDomNode *n, ArcrAtom id_atom) {
+    if (!doc || !n) return NULL;
+    if (n->kind == ARCR_NODE_ELEMENT && n->id == id_atom) return n;
+    for (ArcrDomNode *c = n->first_child; c != NULL; c = c->next_sibling) {
+        ArcrDomNode *f = find_by_id_rec(doc, c, id_atom);
+        if (f) return f;
+    }
+    return NULL;
+}
+
+static JSValue b_get_by_id(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || !vm->host.doc->root || argc < 1) return JS_NewUint32(ctx, 0u);
+    size_t len = 0u;
+    const char *s = JS_ToCStringLen(ctx, &len, argv[0]);
+    if (!s) return JS_NewUint32(ctx, 0u);
+    uint32_t res_uid = 0u;
+    if (len > 0u) {
+        ArcrAtom ia = arcr_atom_intern(vm->host.doc->atoms, s, len);
+        ArcrDomNode *f = find_by_id_rec(vm->host.doc, vm->host.doc->root, ia);
+        if (f) {
+            if (js_uid_ensure_cap(vm, f->node_uid)) vm->uid_table[f->node_uid] = f;
+            res_uid = f->node_uid;
         }
-        case TOK_IDENT:
-        case TOK_KW_OF: {
-            lex_next(c->lx);
-            /* Single-param arrow function: `x => expr` */
-            if (c->lx->cur.kind == TOK_ARROW) {
-                lex_next(c->lx);
-                const char *ps[1] = { tk.start };
-                size_t pl[1]      = { tk.len };
-                bool concise      = (c->lx->cur.kind != TOK_LBRACE);
-                compile_function_body(c, ps, pl, 1u, concise);
-                return;
-            }
-            uint32_t enc = 0u;
-            if (resolve_lexical(c, tk.start, tk.len, &enc)) {
-                emit_op(c, OP_GET_LOCAL, 0u, enc);
-            } else {
-                uint32_t gidx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, tk.start, tk.len));
-                emit_op(c, OP_GET_GLOBAL, 0u, gidx);
-            }
-            return;
+    }
+    JS_FreeCString(ctx, s);
+    return JS_NewUint32(ctx, res_uid);
+}
+
+static void query_sel_rec(ArcrJsVm *vm, ArcrDomNode *n, bool skip_self,
+                          const char *sel, size_t sel_len, bool first_only,
+                          JSContext *ctx, JSValue arr, uint32_t *io_cnt) {
+    if (!vm || !n || (first_only && *io_cnt > 0u)) return;
+    if (!skip_self && n->kind == ARCR_NODE_ELEMENT && !js_node_is_fragment(vm, n)) {
+        if (js_match_selector_list(vm->host.doc, n, sel, sel_len)) {
+            if (js_uid_ensure_cap(vm, n->node_uid)) vm->uid_table[n->node_uid] = n;
+            JS_SetPropertyUint32(ctx, arr, (*io_cnt)++, JS_NewUint32(ctx, n->node_uid));
+            if (first_only) return;
         }
-        default: {
-            lex_next(c->lx);
-            uint32_t idx = chunk_add_const(c->vm, c->chunk, js_undef());
-            emit_op(c, OP_CONST, 0u, idx);
-            return;
-        }
+    }
+    for (ArcrDomNode *c = n->first_child; c != NULL; c = c->next_sibling) {
+        query_sel_rec(vm, c, false, sel, sel_len, first_only, ctx, arr, io_cnt);
+        if (first_only && *io_cnt > 0u) return;
     }
 }
 
-/* Helper to convert the just-emitted lvalue load at top of `chunk->code` into an assignment */
-static JsOpCode map_compound_op(JsTokKind tk) {
-    switch (tk) {
-        case TOK_ADD_ASSIGN: return OP_ADD;
-        case TOK_SUB_ASSIGN: return OP_SUB;
-        case TOK_MUL_ASSIGN: return OP_MUL;
-        case TOK_DIV_ASSIGN: return OP_DIV;
-        case TOK_MOD_ASSIGN: return OP_MOD;
-        default: return OP_ADD;
+static JSValue b_query_selector(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    JSValue arr = JS_NewArray(ctx);
+    if (!vm || !vm->host.doc || argc < 3) return arr;
+    uint32_t scope_uid = 0u;
+    (void)JS_ToUint32(ctx, &scope_uid, argv[0]);
+    size_t slen = 0u;
+    const char *sel = JS_ToCStringLen(ctx, &slen, argv[1]);
+    bool first_only = JS_ToBool(ctx, argv[2]) > 0;
+    if (!sel) return arr;
+
+    ArcrDomNode *scope = js_dom_find_uid(vm, scope_uid);
+    uint32_t cnt = 0u;
+    if (scope) {
+        query_sel_rec(vm, scope, true, sel, slen, first_only, ctx, arr, &cnt);
     }
+    JS_FreeCString(ctx, sel);
+    return arr;
 }
 
-static void compile_postfix_and_call(JsCompiler *c) {
-    compile_primary(c);
-    for (;;) {
-        if (match_tok(c, TOK_DOT)) {
-            JsToken prop = c->lx->cur;
-            lex_next(c->lx);
-            uint32_t pidx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, prop.start, prop.len));
-            if (match_tok(c, TOK_LPAREN)) {
-                uint8_t argc = compile_arg_list(c);
-                emit_op(c, OP_CALL_METHOD, argc, pidx);
-            } else {
-                emit_op(c, OP_GET_PROP, 0u, pidx);
-            }
-        } else if (match_tok(c, TOK_LBRACKET)) {
-            compile_expr(c);
-            match_tok(c, TOK_RBRACKET);
-            emit_op(c, OP_GET_INDEX, 0u, 0u);
-        } else if (match_tok(c, TOK_LPAREN)) {
-            uint8_t argc = compile_arg_list(c);
-            emit_op(c, OP_CALL, argc, argc);
-        } else if (!c->lx->cur.newline_before &&
-                   (c->lx->cur.kind == TOK_INC || c->lx->cur.kind == TOK_DEC)) {
-            bool is_inc = (c->lx->cur.kind == TOK_INC);
-            lex_next(c->lx);
-            if (c->chunk->code_len == 0u) break;
-            JsInst last = c->chunk->code[c->chunk->code_len - 1u];
-            uint32_t one_idx = chunk_add_const(c->vm, c->chunk, js_num(1.0));
-            if (last.op == OP_GET_LOCAL || last.op == OP_GET_GLOBAL) {
-                emit_op(c, OP_POS, 0u, 0u);
-                emit_op(c, OP_DUP, 0u, 0u);
-                emit_op(c, OP_CONST, 0u, one_idx);
-                emit_op(c, is_inc ? OP_ADD : OP_SUB, 0u, 0u);
-                emit_op(c, (last.op == OP_GET_LOCAL) ? OP_SET_LOCAL : OP_SET_GLOBAL, 0u, last.arg);
-                emit_op(c, OP_POP, 0u, 0u);
-            } else if (last.op == OP_GET_PROP) {
-                c->chunk->code_len--; /* pop OP_GET_PROP; receiver is on stack */
-                emit_op(c, OP_DUP, 0u, 0u);
-                emit_op(c, OP_GET_PROP, 0u, last.arg);
-                emit_op(c, OP_POS, 0u, 0u);
-                emit_op(c, OP_SWAP, 0u, 0u); /* [old_num, obj] */
-                emit_op(c, OP_DUP2, 0u, 0u); /* [old_num, obj, old_num, obj] */
-                emit_op(c, OP_POP, 0u, 0u);  /* [old_num, obj, old_num] */
-                emit_op(c, OP_CONST, 0u, one_idx);
-                emit_op(c, is_inc ? OP_ADD : OP_SUB, 0u, 0u);
-                emit_op(c, OP_SET_PROP, 0u, last.arg);
-                emit_op(c, OP_POP, 0u, 0u);
-            } else if (last.op == OP_GET_INDEX) {
-                c->chunk->code_len--; /* [obj, idx] on stack */
-                emit_op(c, OP_DUP2, 0u, 0u);
-                emit_op(c, OP_GET_INDEX, 0u, 0u);
-                emit_op(c, OP_POS, 0u, 0u);
-                emit_op(c, OP_CONST, 0u, one_idx);
-                emit_op(c, is_inc ? OP_ADD : OP_SUB, 0u, 0u);
-                emit_op(c, OP_SET_INDEX, 0u, 0u);
-                emit_op(c, OP_CONST, 0u, one_idx);
-                emit_op(c, is_inc ? OP_SUB : OP_ADD, 0u, 0u); /* return previous value */
-            }
-            break;
+static void query_tag_or_cls_rec(ArcrJsVm *vm, ArcrDomNode *n, bool skip_self,
+                                 bool is_tag, const char *q, size_t qlen, bool match_all_tags,
+                                 JSContext *ctx, JSValue arr, uint32_t *io_cnt) {
+    if (!vm || !n) return;
+    if (!skip_self && n->kind == ARCR_NODE_ELEMENT && !js_node_is_fragment(vm, n)) {
+        bool ok = false;
+        if (is_tag) {
+            const char *tn = arcr_atom_cstr(vm->host.doc->atoms, n->tag);
+            ok = match_all_tags || (tn && arcr_str_eq_nocase_n(tn, strlen(tn), q, qlen));
         } else {
+            ok = true;
+            size_t i = 0u;
+            bool any_tok = false;
+            while (i < qlen) {
+                while (i < qlen && is_html_space(q[i])) ++i;
+                size_t st = i;
+                while (i < qlen && !is_html_space(q[i])) ++i;
+                if (i > st) {
+                    any_tok = true;
+                    ArcrAtom ca = arcr_atom_intern(vm->host.doc->atoms, q + st, i - st);
+                    if (!js_elem_has_class(n, ca)) { ok = false; break; }
+                }
+            }
+            if (!any_tok) ok = false;
+        }
+        if (ok) {
+            if (js_uid_ensure_cap(vm, n->node_uid)) vm->uid_table[n->node_uid] = n;
+            JS_SetPropertyUint32(ctx, arr, (*io_cnt)++, JS_NewUint32(ctx, n->node_uid));
+        }
+    }
+    for (ArcrDomNode *c = n->first_child; c != NULL; c = c->next_sibling) {
+        query_tag_or_cls_rec(vm, c, false, is_tag, q, qlen, match_all_tags, ctx, arr, io_cnt);
+    }
+}
+
+static JSValue b_get_by_tag_or_cls(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    JSValue arr = JS_NewArray(ctx);
+    if (!vm || !vm->host.doc || argc < 3) return arr;
+    uint32_t scope_uid = 0u;
+    (void)JS_ToUint32(ctx, &scope_uid, argv[0]);
+    bool is_tag = JS_ToBool(ctx, argv[1]) > 0;
+    size_t qlen = 0u;
+    const char *q = JS_ToCStringLen(ctx, &qlen, argv[2]);
+    if (!q) return arr;
+
+    ArcrDomNode *scope = js_dom_find_uid(vm, scope_uid);
+    uint32_t cnt = 0u;
+    bool all_tags = is_tag && qlen == 1u && q[0] == '*';
+    if (scope) {
+        query_tag_or_cls_rec(vm, scope, true, is_tag, q, qlen, all_tags, ctx, arr, &cnt);
+    }
+    JS_FreeCString(ctx, q);
+    return arr;
+}
+
+static JSValue b_matches_or_closest(JSContext *ctx, JSValueConst this_val,
+                                    int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 3) return JS_NewUint32(ctx, 0u);
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    size_t slen = 0u;
+    const char *sel = JS_ToCStringLen(ctx, &slen, argv[1]);
+    bool is_closest = JS_ToBool(ctx, argv[2]) > 0;
+    if (!sel) return JS_NewUint32(ctx, 0u);
+
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    uint32_t hit_uid = 0u;
+    for (ArcrDomNode *cur = n; cur != NULL; cur = is_closest ? cur->parent : NULL) {
+        if (cur->kind == ARCR_NODE_ELEMENT && !js_node_is_fragment(vm, cur) &&
+            js_match_selector_list(vm->host.doc, cur, sel, slen)) {
+            if (js_uid_ensure_cap(vm, cur->node_uid)) vm->uid_table[cur->node_uid] = cur;
+            hit_uid = cur->node_uid;
             break;
         }
+        if (!is_closest) break;
     }
+    JS_FreeCString(ctx, sel);
+    return JS_NewUint32(ctx, hit_uid);
 }
 
-static void compile_unary(JsCompiler *c) {
-    JsTokKind k = c->lx->cur.kind;
-    if (k == TOK_BANG || k == TOK_MINUS || k == TOK_PLUS || k == TOK_KW_TYPEOF || k == TOK_KW_VOID) {
-        lex_next(c->lx);
-        if (k == TOK_KW_TYPEOF && c->lx->cur.kind == TOK_IDENT) {
-            /* Safe `typeof undeclaredVar` -> "undefined" */
-            JsToken id = c->lx->cur;
-            uint32_t enc = 0u;
-            if (!resolve_lexical(c, id.start, id.len, &enc)) {
-                JsLexer save = *c->lx;
-                lex_next(&save);
-                if (save.cur.kind != TOK_DOT && save.cur.kind != TOK_LBRACKET && save.cur.kind != TOK_LPAREN) {
-                    *c->lx = save;
-                    uint32_t gidx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, id.start, id.len));
-                    emit_op(c, OP_GET_GLOBAL, 1u /* silent_undef */, gidx);
-                    emit_op(c, OP_TYPEOF, 0u, 0u);
-                    return;
+static JSValue b_contains(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 2) return JS_FALSE;
+    uint32_t a = 0u, b = 0u;
+    (void)JS_ToUint32(ctx, &a, argv[0]);
+    (void)JS_ToUint32(ctx, &b, argv[1]);
+    ArcrDomNode *na = js_dom_find_uid(vm, a);
+    ArcrDomNode *nb = js_dom_find_uid(vm, b);
+    if (!na || !nb) return JS_FALSE;
+    return JS_NewBool(ctx, js_is_ancestor_or_self(na, nb));
+}
+
+static ArcrDomNode *find_prev_sibling_safe(const ArcrDomNode *n) {
+    if (!n || !n->parent) return NULL;
+    if (n->prev_sibling) return n->prev_sibling;
+    ArcrDomNode *prev = NULL;
+    for (ArcrDomNode *c = n->parent->first_child; c != NULL && c != n; c = c->next_sibling) {
+        prev = c;
+    }
+    return prev;
+}
+
+static JSValue b_nav(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 2) return JS_NewUint32(ctx, 0u);
+    uint32_t uid = 0u;
+    int32_t op = 0;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    (void)JS_ToInt32(ctx, &op, argv[1]);
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    if (!n) return JS_NewUint32(ctx, 0u);
+
+    ArcrDomNode *r = NULL;
+    switch (op) {
+        case 0: r = n->parent; break; /* parentNode */
+        case 1: r = (n->parent && n->parent->kind == ARCR_NODE_ELEMENT &&
+                     !js_node_is_fragment(vm, n->parent)) ? n->parent : NULL; break; /* parentElement */
+        case 2: r = n->first_child; break;
+        case 3: r = n->last_child; break;
+        case 4:
+            for (ArcrDomNode *c = n->first_child; c; c = c->next_sibling) {
+                if (c->kind == ARCR_NODE_ELEMENT) { r = c; break; }
+            }
+            break;
+        case 5:
+            for (ArcrDomNode *c = n->first_child; c; c = c->next_sibling) {
+                if (c->kind == ARCR_NODE_ELEMENT) r = c;
+            }
+            break;
+        case 6: r = n->next_sibling; break;
+        case 7: r = find_prev_sibling_safe(n); break;
+        case 8:
+            for (ArcrDomNode *c = n->next_sibling; c; c = c->next_sibling) {
+                if (c->kind == ARCR_NODE_ELEMENT) { r = c; break; }
+            }
+            break;
+        case 9:
+            if (n->parent) {
+                for (ArcrDomNode *c = n->parent->first_child; c && c != n; c = c->next_sibling) {
+                    if (c->kind == ARCR_NODE_ELEMENT) r = c;
+                }
+            }
+            break;
+        default: break;
+    }
+    if (r && js_uid_ensure_cap(vm, r->node_uid)) vm->uid_table[r->node_uid] = r;
+    return JS_NewUint32(ctx, r ? r->node_uid : 0u);
+}
+
+static JSValue b_child_uids(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    JSValue arr = JS_NewArray(ctx);
+    if (!vm || argc < 2) return arr;
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    bool elems_only = JS_ToBool(ctx, argv[1]) > 0;
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    if (!n) return arr;
+
+    uint32_t idx = 0u;
+    for (ArcrDomNode *c = n->first_child; c != NULL; c = c->next_sibling) {
+        if (elems_only && c->kind != ARCR_NODE_ELEMENT) continue;
+        if (js_uid_ensure_cap(vm, c->node_uid)) vm->uid_table[c->node_uid] = c;
+        JS_SetPropertyUint32(ctx, arr, idx++, JS_NewUint32(ctx, c->node_uid));
+    }
+    return arr;
+}
+
+static JSValue b_ancestor_chain(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    JSValue arr = JS_NewArray(ctx);
+    if (!vm || argc < 1) return arr;
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    uint32_t idx = 0u;
+    for (ArcrDomNode *cur = n; cur != NULL; cur = cur->parent) {
+        if (js_uid_ensure_cap(vm, cur->node_uid)) vm->uid_table[cur->node_uid] = cur;
+        JS_SetPropertyUint32(ctx, arr, idx++, JS_NewUint32(ctx, cur->node_uid));
+    }
+    return arr;
+}
+
+static JSValue b_create_node(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 2) return JS_NewUint32(ctx, 0u);
+    int32_t kind = 0;
+    (void)JS_ToInt32(ctx, &kind, argv[0]);
+    if (kind == 11) {
+        ArcrDomNode *f = js_dom_create_fragment(vm);
+        return JS_NewUint32(ctx, f ? f->node_uid : 0u);
+    }
+    size_t len = 0u;
+    const char *s = JS_ToCStringLen(ctx, &len, argv[1]);
+    if (!s) return JS_NewUint32(ctx, 0u);
+
+    ArcrDomNode *n = NULL;
+    if (kind == 1)      n = js_dom_create_element(vm, s, len);
+    else if (kind == 3) n = js_dom_create_text(vm, s, len);
+    else if (kind == 8) n = js_dom_create_comment(vm, s, len);
+    JS_FreeCString(ctx, s);
+    return JS_NewUint32(ctx, n ? n->node_uid : 0u);
+}
+
+static JSValue b_insert_before(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 3) return JS_UNDEFINED;
+    uint32_t p_uid = 0u, c_uid = 0u, r_uid = 0u;
+    (void)JS_ToUint32(ctx, &p_uid, argv[0]);
+    (void)JS_ToUint32(ctx, &c_uid, argv[1]);
+    (void)JS_ToUint32(ctx, &r_uid, argv[2]);
+    ArcrDomNode *p = js_dom_find_uid(vm, p_uid);
+    ArcrDomNode *c = js_dom_find_uid(vm, c_uid);
+    ArcrDomNode *r = r_uid ? js_dom_find_uid(vm, r_uid) : NULL;
+    if (p && c) {
+        js_dom_insert_before_raw(vm, p, c, r);
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue b_remove_node(JSContext *ctx, JSValueConst this_val,
+                             int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 1) return JS_UNDEFINED;
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    if (n && n != vm->host.doc->root) {
+        js_dom_unlink(vm->host.doc, n);
+    }
+    return JS_UNDEFINED;
+}
+
+static ArcrDomNode *js_clone_node_rec(ArcrJsVm *vm, const ArcrDomNode *src, bool deep) {
+    if (!vm || !vm->host.doc || !src) return NULL;
+    ArcrDocument *doc = vm->host.doc;
+    ArcrDomNode *dst = NULL;
+    if (js_node_is_fragment(vm, src)) {
+        dst = js_dom_create_fragment(vm);
+    } else if (src->kind == ARCR_NODE_ELEMENT) {
+        const char *tn = arcr_atom_cstr(doc->atoms, src->tag);
+        dst = js_dom_create_element(vm, tn ? tn : "div", tn ? strlen(tn) : 3u);
+        if (dst) {
+            for (const ArcrAttr *a = src->first_attr; a != NULL; a = a->next) {
+                const char *an = arcr_atom_cstr(doc->atoms, a->name);
+                const char *av = a->value ? a->value : "";
+                if (an) js_dom_set_attr(doc, dst, an, strlen(an), av, strlen(av));
+            }
+            if (src->input_value) js_dom_set_input_val(doc, dst, src->input_value);
+            dst->state_flags = src->state_flags & (uint32_t)ARCR_STATE_CHECKED;
+        }
+    } else if (src->kind == ARCR_NODE_TEXT) {
+        dst = js_dom_create_text(vm, src->text, src->text_len);
+    } else if (src->kind == ARCR_NODE_COMMENT) {
+        dst = js_dom_create_comment(vm, src->text, src->text_len);
+    }
+    if (dst && deep) {
+        for (const ArcrDomNode *c = src->first_child; c != NULL; c = c->next_sibling) {
+            ArcrDomNode *cc = js_clone_node_rec(vm, c, true);
+            if (cc) js_dom_insert_before_raw(vm, dst, cc, NULL);
+        }
+    }
+    return dst;
+}
+
+static JSValue b_clone_node(JSContext *ctx, JSValueConst this_val,
+                            int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 2) return JS_NewUint32(ctx, 0u);
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    bool deep = JS_ToBool(ctx, argv[1]) > 0;
+    ArcrDomNode *src = js_dom_find_uid(vm, uid);
+    ArcrDomNode *cl  = js_clone_node_rec(vm, src, deep);
+    return JS_NewUint32(ctx, cl ? cl->node_uid : 0u);
+}
+
+static JSValue b_get_text(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 1) return JS_NewString(ctx, "");
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    if (!n) return JS_NewString(ctx, "");
+    if (n->kind == ARCR_NODE_TEXT || n->kind == ARCR_NODE_COMMENT) {
+        return JS_NewStringLen(ctx, n->text ? n->text : "", n->text_len);
+    }
+    JsByteBuf b = {0};
+    js_collect_text_rec(n, &b);
+    JSValue ret = JS_NewStringLen(ctx, b.data ? b.data : "", b.len);
+    free(b.data);
+    return ret;
+}
+
+static void js_detach_children_only(ArcrDocument *doc, ArcrDomNode *el) {
+    if (!el) return;
+    ArcrDomNode *c = el->first_child;
+    while (c) {
+        ArcrDomNode *nxt = c->next_sibling;
+        c->parent       = NULL;
+        c->prev_sibling = NULL;
+        c->next_sibling = NULL;
+        if (doc) {
+            if (doc->focused_node == c) doc->focused_node = NULL;
+            if (doc->hovered_node == c) doc->hovered_node = NULL;
+        }
+        c = nxt;
+    }
+    el->first_child = NULL;
+    el->last_child  = NULL;
+    if (doc) doc->dom_dirty = true;
+}
+
+static JSValue b_set_text(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 2) return JS_UNDEFINED;
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    size_t len = 0u;
+    const char *s = JS_ToCStringLen(ctx, &len, argv[1]);
+    if (!s) return JS_EXCEPTION;
+
+    ArcrDocument *doc = vm->host.doc;
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    if (n) {
+        if (n->kind == ARCR_NODE_TEXT || n->kind == ARCR_NODE_COMMENT) {
+            n->text     = arcr_arena_strdup(&doc->arena, s, len);
+            n->text_len = len;
+            doc->dom_dirty = true;
+        } else {
+            js_detach_children_only(doc, n);
+            n->text     = NULL;
+            n->text_len = 0u;
+            if (len > 0u) {
+                ArcrDomNode *tn = js_dom_create_text(vm, s, len);
+                if (tn) js_dom_insert_before_raw(vm, n, tn, NULL);
+            }
+            if (n->kind == ARCR_NODE_ELEMENT) {
+                const char *tname = arcr_atom_cstr(doc->atoms, n->tag);
+                if (arcr_str_eq_nocase(tname, "title")) {
+                    doc->title = arcr_arena_strdup(&doc->arena, s, len);
+                    if (vm->host.set_document_title) {
+                        vm->host.set_document_title(vm->host.userdata, s);
+                    }
+                } else if (arcr_str_eq_nocase(tname, "textarea")) {
+                    js_dom_set_input_val(doc, n, s);
+                } else if (arcr_str_eq_nocase(tname, "style") && js_node_in_doc_root(doc, n)) {
+                    js_dom_append_style_block(doc, s, len);
                 }
             }
         }
-        compile_unary(c);
-        if (k == TOK_BANG)      emit_op(c, OP_NOT, 0u, 0u);
-        else if (k == TOK_MINUS)emit_op(c, OP_NEG, 0u, 0u);
-        else if (k == TOK_PLUS) emit_op(c, OP_POS, 0u, 0u);
-        else if (k == TOK_KW_TYPEOF) emit_op(c, OP_TYPEOF, 0u, 0u);
-        else if (k == TOK_KW_VOID) {
-            emit_op(c, OP_POP, 0u, 0u);
-            emit_op(c, OP_CONST, 0u, chunk_add_const(c->vm, c->chunk, js_undef()));
-        }
-        return;
     }
-    if (k == TOK_INC || k == TOK_DEC) {
-        bool is_inc = (k == TOK_INC);
-        lex_next(c->lx);
-        compile_postfix_and_call(c);
-        if (c->chunk->code_len > 0u) {
-            JsInst last = c->chunk->code[c->chunk->code_len - 1u];
-            uint32_t one_idx = chunk_add_const(c->vm, c->chunk, js_num(1.0));
-            if (last.op == OP_GET_LOCAL || last.op == OP_GET_GLOBAL) {
-                emit_op(c, OP_CONST, 0u, one_idx);
-                emit_op(c, is_inc ? OP_ADD : OP_SUB, 0u, 0u);
-                emit_op(c, (last.op == OP_GET_LOCAL) ? OP_SET_LOCAL : OP_SET_GLOBAL, 0u, last.arg);
-            } else if (last.op == OP_GET_PROP) {
-                c->chunk->code_len--;
-                emit_op(c, OP_DUP, 0u, 0u);
-                emit_op(c, OP_GET_PROP, 0u, last.arg);
-                emit_op(c, OP_CONST, 0u, one_idx);
-                emit_op(c, is_inc ? OP_ADD : OP_SUB, 0u, 0u);
-                emit_op(c, OP_SET_PROP, 0u, last.arg);
-            } else if (last.op == OP_GET_INDEX) {
-                c->chunk->code_len--;
-                emit_op(c, OP_DUP2, 0u, 0u);
-                emit_op(c, OP_GET_INDEX, 0u, 0u);
-                emit_op(c, OP_CONST, 0u, one_idx);
-                emit_op(c, is_inc ? OP_ADD : OP_SUB, 0u, 0u);
-                emit_op(c, OP_SET_INDEX, 0u, 0u);
-            }
-        }
-        return;
-    }
-    if (match_tok(c, TOK_KW_NEW)) {
-        compile_primary(c);
-        while (match_tok(c, TOK_DOT)) {
-            JsToken prop = c->lx->cur; lex_next(c->lx);
-            emit_op(c, OP_GET_PROP, 0u, chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, prop.start, prop.len)));
-        }
-        uint8_t argc = 0u;
-        if (match_tok(c, TOK_LPAREN)) argc = compile_arg_list(c);
-        emit_op(c, OP_CALL, 1u /* is_new */, argc);
-        return;
-    }
-    compile_postfix_and_call(c);
+    JS_FreeCString(ctx, s);
+    return JS_UNDEFINED;
 }
 
-static int binop_prec(JsTokKind k) {
-    switch (k) {
-        case TOK_STAR: case TOK_SLASH: case TOK_PERCENT: return 10;
-        case TOK_PLUS: case TOK_MINUS: return 9;
-        case TOK_SHL:  case TOK_SHR:   return 8;
-        case TOK_LT:   case TOK_LTE: case TOK_GT: case TOK_GTE: return 7;
-        case TOK_EQ:   case TOK_NEQ: case TOK_SEQ: case TOK_SNEQ: return 6;
-        case TOK_BIT_AND: return 5;
-        case TOK_BIT_XOR: return 4;
-        case TOK_BIT_OR:  return 3;
-        case TOK_AND:     return 2;
-        case TOK_OR: case TOK_NULLISH: return 1;
-        default: return 0;
-    }
+static JSValue b_get_html(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 2) return JS_NewString(ctx, "");
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    bool outer = JS_ToBool(ctx, argv[1]) > 0;
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    if (!n) return JS_NewString(ctx, "");
+
+    JsByteBuf b = {0};
+    js_serialize_node_rec(vm, vm->host.doc, n, outer, &b);
+    JSValue ret = JS_NewStringLen(ctx, b.data ? b.data : "", b.len);
+    free(b.data);
+    return ret;
 }
 
-static void compile_binary_prec(JsCompiler *c, int min_prec) {
-    compile_unary(c);
-    for (;;) {
-        JsTokKind op = c->lx->cur.kind;
-        int prec = binop_prec(op);
-        if (prec < min_prec || prec == 0) break;
-        lex_next(c->lx);
+static JSValue b_set_inner_html(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 2) return JS_UNDEFINED;
+    uint32_t uid = 0u;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    size_t len = 0u;
+    const char *html = JS_ToCStringLen(ctx, &len, argv[1]);
+    if (!html) return JS_EXCEPTION;
 
-        if (op == TOK_AND) {
-            size_t j_end = emit_op(c, OP_JMP_IF_FALSE, 0u, 0u);
-            emit_op(c, OP_POP, 0u, 0u);
-            compile_binary_prec(c, prec + 1);
-            patch_jump(c, j_end);
-            continue;
-        }
-        if (op == TOK_OR || op == TOK_NULLISH) {
-            size_t j_end = emit_op(c, OP_JMP_IF_TRUE, 0u, 0u);
-            emit_op(c, OP_POP, 0u, 0u);
-            compile_binary_prec(c, prec + 1);
-            patch_jump(c, j_end);
-            continue;
-        }
-
-        compile_binary_prec(c, prec + 1);
-        switch (op) {
-            case TOK_STAR:    emit_op(c, OP_MUL, 0u, 0u); break;
-            case TOK_SLASH:   emit_op(c, OP_DIV, 0u, 0u); break;
-            case TOK_PERCENT: emit_op(c, OP_MOD, 0u, 0u); break;
-            case TOK_PLUS:    emit_op(c, OP_ADD, 0u, 0u); break;
-            case TOK_MINUS:   emit_op(c, OP_SUB, 0u, 0u); break;
-            case TOK_SHL:     emit_op(c, OP_SHL, 0u, 0u); break;
-            case TOK_SHR:     emit_op(c, OP_SHR, 0u, 0u); break;
-            case TOK_LT:      emit_op(c, OP_LT,  0u, 0u); break;
-            case TOK_LTE:     emit_op(c, OP_LTE, 0u, 0u); break;
-            case TOK_GT:      emit_op(c, OP_GT,  0u, 0u); break;
-            case TOK_GTE:     emit_op(c, OP_GTE, 0u, 0u); break;
-            case TOK_EQ:      emit_op(c, OP_EQ,  0u, 0u); break;
-            case TOK_NEQ:     emit_op(c, OP_NEQ, 0u, 0u); break;
-            case TOK_SEQ:     emit_op(c, OP_STRICT_EQ, 0u, 0u); break;
-            case TOK_SNEQ:    emit_op(c, OP_STRICT_NEQ, 0u, 0u); break;
-            case TOK_BIT_AND: emit_op(c, OP_BIT_AND, 0u, 0u); break;
-            case TOK_BIT_XOR: emit_op(c, OP_BIT_XOR, 0u, 0u); break;
-            case TOK_BIT_OR:  emit_op(c, OP_BIT_OR,  0u, 0u); break;
-            default: break;
-        }
-    }
-}
-
-static bool is_assign_tok(JsTokKind k) {
-    return k == TOK_ASSIGN || k == TOK_ADD_ASSIGN || k == TOK_SUB_ASSIGN ||
-           k == TOK_MUL_ASSIGN || k == TOK_DIV_ASSIGN || k == TOK_MOD_ASSIGN;
-}
-
-static void compile_assign(JsCompiler *c) {
-    compile_binary_prec(c, 1);
-
-    if (match_tok(c, TOK_QUESTION)) {
-        size_t j_false = emit_op(c, OP_JMP_IF_FALSE, 0u, 0u);
-        emit_op(c, OP_POP, 0u, 0u);
-        compile_assign(c);
-        size_t j_done = emit_op(c, OP_JMP, 0u, 0u);
-        patch_jump(c, j_false);
-        emit_op(c, OP_POP, 0u, 0u);
-        match_tok(c, TOK_COLON);
-        compile_assign(c);
-        patch_jump(c, j_done);
-        return;
-    }
-
-    JsTokKind ak = c->lx->cur.kind;
-    if (is_assign_tok(ak) && c->chunk->code_len > 0u) {
-        lex_next(c->lx);
-        JsInst lhs = c->chunk->code[c->chunk->code_len - 1u];
-        if (ak == TOK_ASSIGN) {
-            c->chunk->code_len--;
-            compile_assign(c);
-            if (lhs.op == OP_GET_LOCAL)       emit_op(c, OP_SET_LOCAL, 0u, lhs.arg);
-            else if (lhs.op == OP_GET_GLOBAL) emit_op(c, OP_SET_GLOBAL, 0u, lhs.arg);
-            else if (lhs.op == OP_GET_PROP)   emit_op(c, OP_SET_PROP, 0u, lhs.arg);
-            else if (lhs.op == OP_GET_INDEX)  emit_op(c, OP_SET_INDEX, 0u, 0u);
-        } else {
-            JsOpCode math_op = map_compound_op(ak);
-            if (lhs.op == OP_GET_LOCAL || lhs.op == OP_GET_GLOBAL) {
-                compile_assign(c);
-                emit_op(c, math_op, 0u, 0u);
-                emit_op(c, (lhs.op == OP_GET_LOCAL) ? OP_SET_LOCAL : OP_SET_GLOBAL, 0u, lhs.arg);
-            } else if (lhs.op == OP_GET_PROP) {
-                c->chunk->code_len--;
-                emit_op(c, OP_DUP, 0u, 0u);
-                emit_op(c, OP_GET_PROP, 0u, lhs.arg);
-                compile_assign(c);
-                emit_op(c, math_op, 0u, 0u);
-                emit_op(c, OP_SET_PROP, 0u, lhs.arg);
-            } else if (lhs.op == OP_GET_INDEX) {
-                c->chunk->code_len--;
-                emit_op(c, OP_DUP2, 0u, 0u);
-                emit_op(c, OP_GET_INDEX, 0u, 0u);
-                compile_assign(c);
-                emit_op(c, math_op, 0u, 0u);
-                emit_op(c, OP_SET_INDEX, 0u, 0u);
-            }
-        }
-    }
-}
-
-static void compile_expr(JsCompiler *c) {
-    compile_assign(c);
-    while (match_tok(c, TOK_COMMA)) {
-        emit_op(c, OP_POP, 0u, 0u);
-        compile_assign(c);
-    }
-}
-
-static void compile_var_decl(JsCompiler *c, bool consume_semi) {
-    lex_next(c->lx); /* var / let / const */
-    do {
-        if (c->lx->cur.kind != TOK_IDENT) break;
-        JsToken id = c->lx->cur;
-        lex_next(c->lx);
-
-        bool use_local = (c->is_function || c->scope_depth > 0);
-        int slot = -1;
-        uint32_t gidx = 0u;
-        if (use_local) {
-            slot = declare_local(c, id.start, id.len);
-        } else {
-            gidx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, id.start, id.len));
-        }
-
-        if (match_tok(c, TOK_ASSIGN)) {
-            compile_assign(c);
-        } else {
-            emit_op(c, OP_CONST, 0u, chunk_add_const(c->vm, c->chunk, js_undef()));
-        }
-
-        if (use_local) {
-            emit_op(c, OP_SET_LOCAL, 0u, (uint32_t)slot);
-            emit_op(c, OP_POP, 0u, 0u);
-        } else {
-            emit_op(c, OP_SET_GLOBAL, 0u, gidx);
-            emit_op(c, OP_POP, 0u, 0u);
-        }
-    } while (match_tok(c, TOK_COMMA));
-    if (consume_semi) consume_semi_optional(c);
-}
-
-static void compile_stmt(JsCompiler *c) {
-    if (c->had_error) return;
-    JsTokKind k = c->lx->cur.kind;
-
-    if (k == TOK_SEMI) { lex_next(c->lx); return; }
-
-    if (k == TOK_LBRACE) {
-        lex_next(c->lx);
-        int prev_depth = c->scope_depth++;
-        while (c->lx->cur.kind != TOK_RBRACE && c->lx->cur.kind != TOK_EOF && !c->had_error) {
-            compile_stmt(c);
-        }
-        match_tok(c, TOK_RBRACE);
-        pop_locals_to_depth(c, prev_depth);
-        c->scope_depth = prev_depth;
-        return;
-    }
-
-    if (k == TOK_KW_VAR || k == TOK_KW_LET || k == TOK_KW_CONST) {
-        compile_var_decl(c, true);
-        return;
-    }
-
-    if (k == TOK_KW_FUNCTION) {
-        lex_next(c->lx);
-        JsToken name = c->lx->cur;
-        bool has_name = (name.kind == TOK_IDENT);
-        if (has_name) lex_next(c->lx);
-
-        bool use_local = (c->is_function || c->scope_depth > 0);
-        int slot = -1;
-        uint32_t gidx = 0u;
-        if (has_name) {
-            if (use_local) slot = declare_local(c, name.start, name.len);
-            else gidx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, name.start, name.len));
-        }
-
-        match_tok(c, TOK_LPAREN);
-        const char *ps[16]; size_t pl[16]; size_t pcnt = 0u;
-        while (c->lx->cur.kind == TOK_IDENT && pcnt < 16u) {
-            ps[pcnt] = c->lx->cur.start; pl[pcnt] = c->lx->cur.len; ++pcnt;
-            lex_next(c->lx);
-            if (!match_tok(c, TOK_COMMA)) break;
-        }
-        match_tok(c, TOK_RPAREN);
-        compile_function_body(c, ps, pl, pcnt, false);
-
-        if (has_name) {
-            if (use_local) emit_op(c, OP_SET_LOCAL, 0u, (uint32_t)slot);
-            else           emit_op(c, OP_SET_GLOBAL, 0u, gidx);
-            emit_op(c, OP_POP, 0u, 0u);
-        } else {
-            emit_op(c, OP_POP, 0u, 0u);
-        }
-        return;
-    }
-
-    if (k == TOK_KW_IF) {
-        lex_next(c->lx);
-        match_tok(c, TOK_LPAREN);
-        compile_expr(c);
-        match_tok(c, TOK_RPAREN);
-
-        size_t j_else = emit_op(c, OP_JMP_IF_FALSE, 0u, 0u);
-        emit_op(c, OP_POP, 0u, 0u);
-        compile_stmt(c);
-
-        if (match_tok(c, TOK_KW_ELSE)) {
-            size_t j_end = emit_op(c, OP_JMP, 0u, 0u);
-            patch_jump(c, j_else);
-            emit_op(c, OP_POP, 0u, 0u);
-            compile_stmt(c);
-            patch_jump(c, j_end);
-        } else {
-            size_t j_end = emit_op(c, OP_JMP, 0u, 0u);
-            patch_jump(c, j_else);
-            emit_op(c, OP_POP, 0u, 0u);
-            patch_jump(c, j_end);
-        }
-        return;
-    }
-
-    if (k == TOK_KW_WHILE) {
-        lex_next(c->lx);
-        size_t loop_start = c->chunk->code_len;
-        match_tok(c, TOK_LPAREN);
-        compile_expr(c);
-        match_tok(c, TOK_RPAREN);
-
-        size_t j_exit = emit_op(c, OP_JMP_IF_FALSE, 0u, 0u);
-        emit_op(c, OP_POP, 0u, 0u);
-
-        if (c->loop_depth < ARCR_ARRAY_LEN(c->loops)) {
-            JsLoopPatch *lp = &c->loops[c->loop_depth++];
-            memset(lp, 0, sizeof(*lp));
-            lp->continue_ip = loop_start;
-            compile_stmt(c);
-            emit_op(c, OP_JMP, 0u, (uint32_t)loop_start);
-            patch_jump(c, j_exit);
-            emit_op(c, OP_POP, 0u, 0u);
-            for (size_t i = 0u; i < lp->break_count; ++i) patch_jump(c, lp->break_patches[i]);
-            --c->loop_depth;
-        }
-        return;
-    }
-
-    if (k == TOK_KW_FOR) {
-        lex_next(c->lx);
-        match_tok(c, TOK_LPAREN);
-        int prev_depth = c->scope_depth++;
-
-        /* Check for `for (const/let/var x of iterable)` */
-        bool is_for_of = false;
-        JsToken iter_var = {0};
-        if (c->lx->cur.kind == TOK_KW_CONST || c->lx->cur.kind == TOK_KW_LET || c->lx->cur.kind == TOK_KW_VAR) {
-            JsLexer probe = *c->lx;
-            lex_next(&probe);
-            if (probe.cur.kind == TOK_IDENT) {
-                iter_var = probe.cur;
-                lex_next(&probe);
-                if (probe.cur.kind == TOK_KW_OF) {
-                    is_for_of = true;
-                    *c->lx = probe;
-                    lex_next(c->lx); /* consume 'of' */
-                }
-            }
-        }
-
-        if (is_for_of) {
-            int slot_arr  = declare_local(c, "$arr", 4u);
-            int slot_idx  = declare_local(c, "$idx", 4u);
-            int slot_item = declare_local(c, iter_var.start, iter_var.len);
-
-            compile_expr(c);
-            emit_op(c, OP_SET_LOCAL, 0u, (uint32_t)slot_arr);
-            emit_op(c, OP_POP, 0u, 0u);
-            match_tok(c, TOK_RPAREN);
-
-            emit_op(c, OP_CONST, 0u, chunk_add_const(c->vm, c->chunk, js_num(0.0)));
-            emit_op(c, OP_SET_LOCAL, 0u, (uint32_t)slot_idx);
-            emit_op(c, OP_POP, 0u, 0u);
-
-            uint32_t len_pidx = chunk_add_const(c->vm, c->chunk, js_mk_str_n(c->vm, "length", 6u));
-            uint32_t one_cidx = chunk_add_const(c->vm, c->chunk, js_num(1.0));
-
-            size_t cond_ip = c->chunk->code_len;
-            emit_op(c, OP_GET_LOCAL, 0u, (uint32_t)slot_idx);
-            emit_op(c, OP_GET_LOCAL, 0u, (uint32_t)slot_arr);
-            emit_op(c, OP_GET_PROP, 0u, len_pidx);
-            emit_op(c, OP_LT, 0u, 0u);
-            size_t j_exit = emit_op(c, OP_JMP_IF_FALSE, 0u, 0u);
-            emit_op(c, OP_POP, 0u, 0u);
-
-            /* item = arr[idx] */
-            emit_op(c, OP_GET_LOCAL, 0u, (uint32_t)slot_arr);
-            emit_op(c, OP_GET_LOCAL, 0u, (uint32_t)slot_idx);
-            emit_op(c, OP_GET_INDEX, 0u, 0u);
-            emit_op(c, OP_SET_LOCAL, 0u, (uint32_t)slot_item);
-            emit_op(c, OP_POP, 0u, 0u);
-
-            if (c->loop_depth < ARCR_ARRAY_LEN(c->loops)) {
-                JsLoopPatch *lp = &c->loops[c->loop_depth++];
-                memset(lp, 0, sizeof(*lp));
-                lp->cont_uses_patches = true;
-                compile_stmt(c);
-
-                for (size_t i = 0u; i < lp->cont_count; ++i) patch_jump(c, lp->cont_patches[i]);
-                emit_op(c, OP_GET_LOCAL, 0u, (uint32_t)slot_idx);
-                emit_op(c, OP_CONST, 0u, one_cidx);
-                emit_op(c, OP_ADD, 0u, 0u);
-                emit_op(c, OP_SET_LOCAL, 0u, (uint32_t)slot_idx);
-                emit_op(c, OP_POP, 0u, 0u);
-                emit_op(c, OP_JMP, 0u, (uint32_t)cond_ip);
-
-                patch_jump(c, j_exit);
-                emit_op(c, OP_POP, 0u, 0u);
-                for (size_t i = 0u; i < lp->break_count; ++i) patch_jump(c, lp->break_patches[i]);
-                --c->loop_depth;
-            }
-            pop_locals_to_depth(c, prev_depth);
-            c->scope_depth = prev_depth;
-            return;
-        }
-
-        /* Standard C-style `for (init; cond; step)` */
-        if (c->lx->cur.kind == TOK_SEMI) {
-            lex_next(c->lx);
-        } else if (c->lx->cur.kind == TOK_KW_VAR || c->lx->cur.kind == TOK_KW_LET || c->lx->cur.kind == TOK_KW_CONST) {
-            compile_var_decl(c, false);
-            match_tok(c, TOK_SEMI);
-        } else {
-            compile_expr(c);
-            emit_op(c, OP_POP, 0u, 0u);
-            match_tok(c, TOK_SEMI);
-        }
-
-        size_t cond_ip = c->chunk->code_len;
-        size_t j_exit  = 0u;
-        bool   has_cond = (c->lx->cur.kind != TOK_SEMI);
-        if (has_cond) {
-            compile_expr(c);
-            j_exit = emit_op(c, OP_JMP_IF_FALSE, 0u, 0u);
-            emit_op(c, OP_POP, 0u, 0u);
-        }
-        match_tok(c, TOK_SEMI);
-
-        size_t step_ip = cond_ip;
-        if (c->lx->cur.kind != TOK_RPAREN) {
-            size_t j_body = emit_op(c, OP_JMP, 0u, 0u);
-            step_ip = c->chunk->code_len;
-            compile_expr(c);
-            emit_op(c, OP_POP, 0u, 0u);
-            emit_op(c, OP_JMP, 0u, (uint32_t)cond_ip);
-            patch_jump(c, j_body);
-        }
-        match_tok(c, TOK_RPAREN);
-
-        if (c->loop_depth < ARCR_ARRAY_LEN(c->loops)) {
-            JsLoopPatch *lp = &c->loops[c->loop_depth++];
-            memset(lp, 0, sizeof(*lp));
-            lp->continue_ip = step_ip;
-            compile_stmt(c);
-            emit_op(c, OP_JMP, 0u, (uint32_t)step_ip);
-            if (has_cond) {
-                patch_jump(c, j_exit);
-                emit_op(c, OP_POP, 0u, 0u);
-            }
-            for (size_t i = 0u; i < lp->break_count; ++i) patch_jump(c, lp->break_patches[i]);
-            --c->loop_depth;
-        }
-        pop_locals_to_depth(c, prev_depth);
-        c->scope_depth = prev_depth;
-        return;
-    }
-
-    if (k == TOK_KW_BREAK) {
-        lex_next(c->lx);
-        consume_semi_optional(c);
-        if (c->loop_depth > 0u) {
-            JsLoopPatch *lp = &c->loops[c->loop_depth - 1u];
-            if (lp->break_count < ARCR_ARRAY_LEN(lp->break_patches)) {
-                lp->break_patches[lp->break_count++] = emit_op(c, OP_JMP, 0u, 0u);
-            }
-        }
-        return;
-    }
-
-    if (k == TOK_KW_CONTINUE) {
-        lex_next(c->lx);
-        consume_semi_optional(c);
-        if (c->loop_depth > 0u) {
-            JsLoopPatch *lp = &c->loops[c->loop_depth - 1u];
-            if (lp->cont_uses_patches) {
-                if (lp->cont_count < ARCR_ARRAY_LEN(lp->cont_patches)) {
-                    lp->cont_patches[lp->cont_count++] = emit_op(c, OP_JMP, 0u, 0u);
+    ArcrDomNode *n = js_dom_find_uid(vm, uid);
+    if (n && (n->kind == ARCR_NODE_ELEMENT || n->kind == ARCR_NODE_DOCUMENT)) {
+        js_detach_children_only(vm->host.doc, n);
+        n->text     = NULL;
+        n->text_len = 0u;
+        if (len > 0u) {
+            if (n->kind == ARCR_NODE_ELEMENT &&
+                arcr_str_eq_nocase(arcr_atom_cstr(vm->host.doc->atoms, n->tag), "style")) {
+                n->text     = arcr_arena_strdup(&vm->host.doc->arena, html, len);
+                n->text_len = len;
+                if (js_node_in_doc_root(vm->host.doc, n)) {
+                    js_dom_append_style_block(vm->host.doc, html, len);
                 }
             } else {
-                emit_op(c, OP_JMP, 0u, (uint32_t)lp->continue_ip);
+                js_parse_html_fragment(vm, n, html, len);
             }
         }
-        return;
+        vm->host.doc->dom_dirty = true;
+    }
+    JS_FreeCString(ctx, html);
+    return JS_UNDEFINED;
+}
+
+static JSValue b_attr_op(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 2) return JS_NULL;
+    uint32_t uid = 0u;
+    int32_t op = 0;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    (void)JS_ToInt32(ctx, &op, argv[1]);
+    ArcrDomNode *el = js_dom_find_uid(vm, uid);
+    if (!el || el->kind != ARCR_NODE_ELEMENT || js_node_is_fragment(vm, el)) {
+        return (op == 3) ? JS_NewArray(ctx) : ((op == 2) ? JS_FALSE : JS_NULL);
     }
 
-    if (k == TOK_KW_RETURN) {
-        lex_next(c->lx);
-        if (c->lx->cur.kind == TOK_SEMI || c->lx->cur.kind == TOK_RBRACE ||
-            c->lx->cur.kind == TOK_EOF || c->lx->cur.newline_before) {
-            emit_op(c, OP_CONST, 0u, chunk_add_const(c->vm, c->chunk, js_undef()));
+    if (op == 3) { /* getAttributeNames */
+        JSValue arr = JS_NewArray(ctx);
+        uint32_t idx = 0u;
+        for (const ArcrAttr *a = el->first_attr; a != NULL; a = a->next) {
+            const char *an = arcr_atom_cstr(vm->host.doc->atoms, a->name);
+            if (an) JS_SetPropertyUint32(ctx, arr, idx++, JS_NewString(ctx, an));
+        }
+        return arr;
+    }
+
+    if (argc < 3) return JS_NULL;
+    size_t nlen = 0u;
+    const char *name = JS_ToCStringLen(ctx, &nlen, argv[2]);
+    if (!name) return JS_EXCEPTION;
+
+    JSValue ret = JS_UNDEFINED;
+    if (op == 0) { /* get */
+        const char *v = js_dom_get_attr(vm->host.doc, el, name);
+        ret = v ? JS_NewString(ctx, v) : JS_NULL;
+    } else if (op == 1 && argc >= 4) { /* set */
+        size_t vlen = 0u;
+        const char *val = JS_ToCStringLen(ctx, &vlen, argv[3]);
+        if (val) {
+            js_dom_set_attr(vm->host.doc, el, name, nlen, val, vlen);
+            JS_FreeCString(ctx, val);
+        }
+    } else if (op == 2) { /* has */
+        ret = JS_NewBool(ctx, js_dom_get_attr(vm->host.doc, el, name) != NULL);
+    } else if (op == 4) { /* remove */
+        js_dom_remove_attr(vm->host.doc, el, name);
+    }
+    JS_FreeCString(ctx, name);
+    return ret;
+}
+
+static JSValue b_form_state(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 2) return JS_UNDEFINED;
+    uint32_t uid = 0u;
+    int32_t op = 0;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    (void)JS_ToInt32(ctx, &op, argv[1]);
+    ArcrDomNode *el = js_dom_find_uid(vm, uid);
+    if (!el || el->kind != ARCR_NODE_ELEMENT) {
+        return (op == 0) ? JS_NewString(ctx, "") : JS_FALSE;
+    }
+
+    if (op == 0) { /* get value */
+        if (el->input_value) return JS_NewString(ctx, el->input_value);
+        const char *av = js_dom_get_attr(vm->host.doc, el, "value");
+        return JS_NewString(ctx, av ? av : "");
+    }
+    if (op == 1 && argc >= 3) { /* set value */
+        const char *s = JS_ToCString(ctx, argv[2]);
+        if (s) {
+            js_dom_set_input_val(vm->host.doc, el, s);
+            JS_FreeCString(ctx, s);
+        }
+        return JS_UNDEFINED;
+    }
+    if (op == 2) { /* get checked */
+        return JS_NewBool(ctx, (el->state_flags & (uint32_t)ARCR_STATE_CHECKED) != 0u);
+    }
+    if (op == 3 && argc >= 3) { /* set checked */
+        if (JS_ToBool(ctx, argv[2]) > 0) el->state_flags |= (uint32_t)ARCR_STATE_CHECKED;
+        else el->state_flags &= ~((uint32_t)ARCR_STATE_CHECKED);
+        vm->host.doc->dom_dirty = true;
+        return JS_UNDEFINED;
+    }
+    if (op == 4 && argc >= 3) { /* focus / blur */
+        bool want = JS_ToBool(ctx, argv[2]) > 0;
+        if (want) {
+            if (vm->host.doc->focused_node && vm->host.doc->focused_node != el) {
+                vm->host.doc->focused_node->state_flags &= ~((uint32_t)ARCR_STATE_FOCUS);
+            }
+            vm->host.doc->focused_node = el;
+            el->state_flags |= (uint32_t)ARCR_STATE_FOCUS;
+        } else if (vm->host.doc->focused_node == el) {
+            el->state_flags &= ~((uint32_t)ARCR_STATE_FOCUS);
+            vm->host.doc->focused_node = NULL;
+        }
+        vm->host.doc->dom_dirty = true;
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue b_computed_info(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    JSValue o = JS_NewObject(ctx);
+    int32_t vw = (vm && vm->host.viewport_width > 0) ? vm->host.viewport_width : 1280;
+    uint32_t uid = 0u;
+    if (argc >= 1) (void)JS_ToUint32(ctx, &uid, argv[0]);
+    ArcrDomNode *el = vm ? js_dom_find_uid(vm, uid) : NULL;
+
+    int32_t w = vw, h = 24, fpx = 16;
+    const char *disp = "block";
+    const char *pos  = "static";
+    char color_s[32] = "rgb(15, 23, 42)";
+    char bg_s[32]    = "rgba(0, 0, 0, 0)";
+    double opac      = 1.0;
+
+    if (el && el->surface && el->surface->width > 0) {
+        w = el->surface->width;
+        h = el->surface->height;
+    } else if (el && vm && vm->host.doc) {
+        const char *wa = js_dom_get_attr(vm->host.doc, el, "width");
+        const char *ha = js_dom_get_attr(vm->host.doc, el, "height");
+        int32_t pw = 0, ph = 0;
+        if (wa && arcr_parse_i32(wa, strlen(wa), &pw) && pw > 0) w = pw;
+        if (ha && arcr_parse_i32(ha, strlen(ha), &ph) && ph > 0) h = ph;
+    }
+    if (el && el->computed_style) {
+        const ArcrComputedStyle *cs = el->computed_style;
+        if (cs->width_spec > 0) w = cs->width_spec;
+        else if (cs->width_spec < 0) w = (vw * (-cs->width_spec)) / 100;
+        if (cs->height_px > 0) h = cs->height_px;
+        fpx  = cs->font_px > 0 ? cs->font_px : 16;
+        opac = (double)cs->opacity / 255.0;
+        if (cs->display == ARCR_DISPLAY_NONE) { disp = "none"; w = 0; h = 0; }
+        else if (cs->display == ARCR_DISPLAY_FLEX) disp = "flex";
+        else if (cs->display == ARCR_DISPLAY_GRID) disp = "grid";
+        else if (cs->display == ARCR_DISPLAY_INLINE) disp = "inline";
+        else if (cs->display == ARCR_DISPLAY_INLINE_BLOCK) disp = "inline-block";
+
+        if (cs->position == ARCR_POS_RELATIVE) pos = "relative";
+        else if (cs->position == ARCR_POS_ABSOLUTE) pos = "absolute";
+        else if (cs->position == ARCR_POS_FIXED) pos = "fixed";
+        else if (cs->position == ARCR_POS_STICKY) pos = "sticky";
+
+        snprintf(color_s, sizeof(color_s), "rgb(%u, %u, %u)",
+                 (cs->color_argb >> 16) & 0xFFu, (cs->color_argb >> 8) & 0xFFu, cs->color_argb & 0xFFu);
+        uint32_t ba = (cs->bg_argb >> 24) & 0xFFu;
+        if (ba == 255u) {
+            snprintf(bg_s, sizeof(bg_s), "rgb(%u, %u, %u)",
+                     (cs->bg_argb >> 16) & 0xFFu, (cs->bg_argb >> 8) & 0xFFu, cs->bg_argb & 0xFFu);
         } else {
-            compile_expr(c);
+            snprintf(bg_s, sizeof(bg_s), "rgba(%u, %u, %u, %.2f)",
+                     (cs->bg_argb >> 16) & 0xFFu, (cs->bg_argb >> 8) & 0xFFu, cs->bg_argb & 0xFFu,
+                     (double)ba / 255.0);
         }
-        consume_semi_optional(c);
-        emit_op(c, OP_RETURN, 0u, 0u);
-        return;
     }
+    JS_SetPropertyStr(ctx, o, "width", JS_NewInt32(ctx, w));
+    JS_SetPropertyStr(ctx, o, "height", JS_NewInt32(ctx, h));
+    JS_SetPropertyStr(ctx, o, "fontSize", JS_NewInt32(ctx, fpx));
+    JS_SetPropertyStr(ctx, o, "display", JS_NewString(ctx, disp));
+    JS_SetPropertyStr(ctx, o, "position", JS_NewString(ctx, pos));
+    JS_SetPropertyStr(ctx, o, "color", JS_NewString(ctx, color_s));
+    JS_SetPropertyStr(ctx, o, "backgroundColor", JS_NewString(ctx, bg_s));
+    JS_SetPropertyStr(ctx, o, "opacity", JS_NewFloat64(ctx, opac));
+    return o;
+}
 
-    if (k == TOK_KW_THROW) {
-        lex_next(c->lx);
-        compile_expr(c);
-        consume_semi_optional(c);
-        emit_op(c, OP_THROW, 0u, 0u);
-        return;
+/* Host & Environment Bridge Calls */
+static JSValue b_console_log(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.console_log || argc < 1) return JS_UNDEFINED;
+    const char *s = JS_ToCString(ctx, argv[0]);
+    if (s) {
+        vm->host.console_log(vm->host.userdata, s);
+        JS_FreeCString(ctx, s);
     }
+    return JS_UNDEFINED;
+}
 
-    if (k == TOK_KW_TRY) {
-        lex_next(c->lx);
-        size_t try_inst = emit_op(c, OP_TRY_PUSH, 0u, 0u);
-        compile_stmt(c); /* try block */
-        emit_op(c, OP_TRY_POP, 0u, 0u);
-        size_t j_after_catch = emit_op(c, OP_JMP, 0u, 0u);
+static JSValue b_env_info(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    JSValue o = JS_NewObject(ctx);
+    const char *url = "about:blank";
+    if (vm && vm->host.get_current_url) {
+        const char *u = vm->host.get_current_url(vm->host.userdata);
+        if (u && u[0] != '\0') url = u;
+    }
+    JS_SetPropertyStr(ctx, o, "url", JS_NewString(ctx, url));
+    JS_SetPropertyStr(ctx, o, "width", JS_NewInt32(ctx, (vm && vm->host.viewport_width > 0) ? vm->host.viewport_width : 1280));
+    JS_SetPropertyStr(ctx, o, "height", JS_NewInt32(ctx, (vm && vm->host.viewport_height > 0) ? vm->host.viewport_height : 720));
+    JS_SetPropertyStr(ctx, o, "prefersDark", JS_NewBool(ctx, vm ? vm->host.prefers_dark : false));
+    uint64_t now_us = arcr_platform_monotonic_usec();
+    double rel_ms = (vm && now_us >= vm->boot_usec) ? ((double)(now_us - vm->boot_usec) * 0.001) : 0.0;
+    JS_SetPropertyStr(ctx, o, "nowMs", JS_NewFloat64(ctx, rel_ms));
+    return o;
+}
 
-        patch_jump(c, try_inst);
-        if (match_tok(c, TOK_KW_CATCH)) {
-            int prev_depth = c->scope_depth++;
-            if (match_tok(c, TOK_LPAREN)) {
-                if (c->lx->cur.kind == TOK_IDENT) {
-                    int eslot = declare_local(c, c->lx->cur.start, c->lx->cur.len);
-                    lex_next(c->lx);
-                    emit_op(c, OP_SET_LOCAL, 0u, (uint32_t)eslot);
-                }
-                match_tok(c, TOK_RPAREN);
-            }
-            emit_op(c, OP_POP, 0u, 0u);
-            compile_stmt(c);
-            pop_locals_to_depth(c, prev_depth);
-            c->scope_depth = prev_depth;
+static JSValue b_navigate(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.navigate_to || argc < 1) return JS_UNDEFINED;
+    const char *u = JS_ToCString(ctx, argv[0]);
+    if (u) {
+        vm->host.navigate_to(vm->host.userdata, u);
+        JS_FreeCString(ctx, u);
+    }
+    return JS_UNDEFINED;
+}
+
+static JSValue b_storage_op(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || argc < 2) return JS_NULL;
+    int32_t op = 0;
+    (void)JS_ToInt32(ctx, &op, argv[0]);
+    const char *key = JS_ToCString(ctx, argv[1]);
+    if (!key) return JS_EXCEPTION;
+
+    JSValue ret = JS_UNDEFINED;
+    if (op == 0) { /* get */
+        char buf[1024];
+        buf[0] = '\0';
+        if (vm->host.storage_get && vm->host.storage_get(vm->host.userdata, key, buf, sizeof(buf))) {
+            ret = JS_NewString(ctx, buf);
         } else {
-            emit_op(c, OP_POP, 0u, 0u);
+            ret = JS_NULL;
         }
-        patch_jump(c, j_after_catch);
-        if (match_tok(c, TOK_KW_FINALLY)) {
-            compile_stmt(c);
+    } else if (op == 1 && argc >= 3) { /* set / delete */
+        if (JS_IsNull(argv[2]) || JS_IsUndefined(argv[2])) {
+            if (vm->host.storage_set) vm->host.storage_set(vm->host.userdata, key, NULL);
+        } else {
+            const char *val = JS_ToCString(ctx, argv[2]);
+            if (val) {
+                if (vm->host.storage_set) vm->host.storage_set(vm->host.userdata, key, val);
+                JS_FreeCString(ctx, val);
+            }
         }
-        return;
     }
-
-    /* Expression statement */
-    compile_expr(c);
-    emit_op(c, OP_POP, 0u, 0u);
-    consume_semi_optional(c);
+    JS_FreeCString(ctx, key);
+    return ret;
 }
 
-static JsChunk *compile_script_to_chunk(ArcrJsVm *vm, const char *code, size_t code_len) {
-    JsChunk *ch = alloc_chunk(vm);
-    if (!ch) return NULL;
-
-    JsLexer lx;
-    memset(&lx, 0, sizeof(lx));
-    lx.vm  = vm;
-    lx.src = code;
-    lx.len = code_len;
-    lex_next(&lx);
-
-    JsCompiler comp;
-    memset(&comp, 0, sizeof(comp));
-    comp.vm          = vm;
-    comp.lx          = &lx;
-    comp.chunk       = ch;
-    comp.is_function = false;
-    comp.scope_depth = 0;
-
-    while (lx.cur.kind != TOK_EOF && !comp.had_error) {
-        compile_stmt(&comp);
+static JSValue b_http_fetch(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    JSValue res = JS_NewObject(ctx);
+    if (!vm || !vm->host.http_fetch || argc < 4) {
+        JS_SetPropertyStr(ctx, res, "ok", JS_FALSE);
+        JS_SetPropertyStr(ctx, res, "status", JS_NewInt32(ctx, 0));
+        return res;
     }
-    emit_op(&comp, OP_HALT, 0u, 0u);
-    return comp.had_error ? NULL : ch;
+
+    const char *url    = JS_ToCString(ctx, argv[0]);
+    const char *method = JS_ToCString(ctx, argv[1]);
+    size_t body_len    = 0u;
+    const char *body   = JS_IsNull(argv[2]) || JS_IsUndefined(argv[2])
+                             ? NULL
+                             : JS_ToCStringLen(ctx, &body_len, argv[2]);
+    const char *ctype  = JS_IsNull(argv[3]) || JS_IsUndefined(argv[3])
+                             ? NULL
+                             : JS_ToCString(ctx, argv[3]);
+
+    int status = 0;
+    char resp_ct[256] = {0};
+    uint8_t *resp_bytes = NULL;
+    size_t resp_len = 0u;
+
+    /* Pause synchronous script deadline while performing network I/O */
+    bool prev_armed = vm->interrupt_armed;
+    vm->interrupt_armed = false;
+
+    bool net_ok = false;
+    if (url && method) {
+        net_ok = vm->host.http_fetch(vm->host.userdata, url, method,
+                                     body, body_len, ctype,
+                                     &status, resp_ct, sizeof(resp_ct),
+                                     &resp_bytes, &resp_len);
+    }
+
+    if (prev_armed) {
+        vm->deadline_usec   = arcr_platform_monotonic_usec() + ARCR_JS_TURN_DEADLINE_USEC;
+        vm->interrupt_armed = true;
+    }
+
+    JS_SetPropertyStr(ctx, res, "netOk", JS_NewBool(ctx, net_ok));
+    JS_SetPropertyStr(ctx, res, "status", JS_NewInt32(ctx, status));
+    JS_SetPropertyStr(ctx, res, "contentType", JS_NewString(ctx, resp_ct));
+    JSValue ab = JS_NewArrayBufferCopy(ctx, resp_bytes ? resp_bytes : (const uint8_t *)"", resp_len);
+    JS_SetPropertyStr(ctx, res, "buffer", ab);
+
+    if (resp_bytes) {
+        if (vm->host.http_free) vm->host.http_free(vm->host.userdata, resp_bytes);
+        else free(resp_bytes);
+    }
+    if (url)    JS_FreeCString(ctx, url);
+    if (method) JS_FreeCString(ctx, method);
+    if (body)   JS_FreeCString(ctx, body);
+    if (ctype)  JS_FreeCString(ctx, ctype);
+    return res;
 }
 
-/* =========================================================================
- * 7. Built-in Globals, Array/String Methods, Live DOM & <canvas> 2D Dispatch
- * ========================================================================= */
-static bool vm_invoke_callable(ArcrJsVm *vm, JsVal callee, JsVal this_val,
-                               const JsVal *args, size_t argc, JsVal *out_ret);
-
-static JsEnv *alloc_env(ArcrJsVm *vm, JsEnv *parent, size_t slots) {
-    size_t n = (slots > 0u) ? slots : 1u;
-    JsEnv *e = (JsEnv *)vm_alloc(vm, sizeof(JsEnv) + n * sizeof(JsVal), sizeof(void *));
-    if (!e) return NULL;
-    e->parent     = parent;
-    e->slot_count = n;
-    for (size_t i = 0u; i < n; ++i) e->slots[i] = js_undef();
-    return e;
+static JSValue b_random_bytes(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_UNDEFINED;
+    size_t byte_off = 0u, byte_len = 0u, bpe = 0u;
+    JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[0], &byte_off, &byte_len, &bpe);
+    if (!JS_IsException(ab)) {
+        size_t total = 0u;
+        uint8_t *ptr = JS_GetArrayBuffer(ctx, &total, ab);
+        if (ptr && byte_off + byte_len <= total && byte_len <= 65536u) {
+            if (!arcr_platform_csprng_bytes(ptr + byte_off, byte_len)) {
+                uint64_t seed = arcr_platform_monotonic_usec() ^ 0x9E3779B97F4A7C15ULL;
+                for (size_t i = 0u; i < byte_len; ++i) {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    ptr[byte_off + i] = (uint8_t)(seed & 0xFFu);
+                }
+            }
+        }
+        JS_FreeValue(ctx, ab);
+    } else {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+    }
+    return JS_DupValue(ctx, argv[0]);
 }
 
-static JsVal *env_slot_ptr(JsEnv *env, uint32_t encoded) {
-    uint16_t depth = (uint16_t)(encoded >> 16);
-    uint16_t slot  = (uint16_t)(encoded & 0xFFFFu);
-    JsEnv *cur = env;
-    while (depth > 0u && cur) { cur = cur->parent; --depth; }
-    if (!cur || slot >= cur->slot_count) return NULL;
-    return &cur->slots[slot];
+static JSValue b_clipboard_op(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    if (argc < 1) return JS_NewString(ctx, "");
+    if (JS_ToBool(ctx, argv[0]) > 0 && argc >= 2) {
+        const char *s = JS_ToCString(ctx, argv[1]);
+        if (s) {
+            (void)arcr_platform_clipboard_set_utf8(s);
+            JS_FreeCString(ctx, s);
+        }
+        return JS_TRUE;
+    }
+    char buf[4096];
+    buf[0] = '\0';
+    (void)arcr_platform_clipboard_get_utf8(buf, sizeof(buf));
+    return JS_NewString(ctx, buf);
 }
 
-static void vm_storage_set_local(ArcrJsVm *vm, const char *k, const char *v) {
-    if (!k) return;
-    if (vm->host_cb.storage_set) {
-        vm->host_cb.storage_set(vm->host_cb.userdata, k, v);
-    }
-    size_t free_i = JS_MAX_STORAGE_ENTRIES;
-    for (size_t i = 0u; i < JS_MAX_STORAGE_ENTRIES; ++i) {
-        if (!vm->local_storage[i].in_use) {
-            if (free_i == JS_MAX_STORAGE_ENTRIES) free_i = i;
-            continue;
-        }
-        if (strcmp(vm->local_storage[i].key, k) == 0) {
-            if (!v) { vm->local_storage[i].in_use = false; return; }
-            arcr_str_copy(vm->local_storage[i].val, sizeof(vm->local_storage[i].val), v);
-            return;
-        }
-    }
-    if (!v) return;
-    if (free_i == JS_MAX_STORAGE_ENTRIES) free_i = 0u;
-    vm->local_storage[free_i].in_use = true;
-    arcr_str_copy(vm->local_storage[free_i].key, sizeof(vm->local_storage[free_i].key), k);
-    arcr_str_copy(vm->local_storage[free_i].val, sizeof(vm->local_storage[free_i].val), v);
+static JSValue b_mark_dirty(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val; (void)argc; (void)argv;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (vm && vm->host.doc) vm->host.doc->dom_dirty = true;
+    return JS_UNDEFINED;
 }
 
-static bool vm_storage_get_local(ArcrJsVm *vm, const char *k, char *out_v, size_t cap) {
-    if (!k || !out_v || cap == 0u) return false;
-    if (vm->host_cb.storage_get && vm->host_cb.storage_get(vm->host_cb.userdata, k, out_v, cap)) {
-        return true;
-    }
-    for (size_t i = 0u; i < JS_MAX_STORAGE_ENTRIES; ++i) {
-        if (vm->local_storage[i].in_use && strcmp(vm->local_storage[i].key, k) == 0) {
-            arcr_str_copy(out_v, cap, vm->local_storage[i].val);
-            return true;
-        }
-    }
-    return false;
-}
+/* Canvas 2D C Bridge Operations */
+static JSValue b_canvas_cmd(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    (void)this_val;
+    ArcrJsVm *vm = vm_from_ctx(ctx);
+    if (!vm || !vm->host.doc || argc < 2) return JS_UNDEFINED;
+    uint32_t uid = 0u;
+    int32_t op = 0;
+    (void)JS_ToUint32(ctx, &uid, argv[0]);
+    (void)JS_ToInt32(ctx, &op, argv[1]);
 
-static JsVal vm_get_prop(ArcrJsVm *vm, JsVal obj, const char *prop) {
-    ArcrDocument *doc = vm->host_cb.doc;
-
-    if (obj.kind == JS_VAL_STRING && obj.as.str) {
-        if (strcmp(prop, "length") == 0) return js_num((double)obj.as.str->len);
-        return js_undef();
+    if (op == 100) { /* createGradient(isRadial, x0,y0,r0,x1,y1,r1) -> gradId */
+        if (vm->grad_count >= vm->grad_cap) {
+            int32_t ncap = vm->grad_cap ? vm->grad_cap * 2 : 16;
+            CanvasGrad *ng = (CanvasGrad *)realloc(vm->grads, (size_t)ncap * sizeof(CanvasGrad));
+            if (!ng) return JS_NewInt32(ctx, -1);
+            vm->grads    = ng;
+            vm->grad_cap = ncap;
+        }
+        int32_t id = vm->grad_count++;
+        CanvasGrad *g = &vm->grads[id];
+        memset(g, 0, sizeof(*g));
+        g->active    = true;
+        g->is_radial = (argc >= 3) && (JS_ToBool(ctx, argv[2]) > 0);
+        if (argc >= 9) {
+            (void)JS_ToFloat64(ctx, &g->x0, argv[3]);
+            (void)JS_ToFloat64(ctx, &g->y0, argv[4]);
+            (void)JS_ToFloat64(ctx, &g->r0, argv[5]);
+            (void)JS_ToFloat64(ctx, &g->x1, argv[6]);
+            (void)JS_ToFloat64(ctx, &g->y1, argv[7]);
+            (void)JS_ToFloat64(ctx, &g->r1, argv[8]);
+        }
+        return JS_NewInt32(ctx, id);
     }
-    if (obj.kind == JS_VAL_ARRAY && obj.as.arr) {
-        if (strcmp(prop, "length") == 0) return js_num((double)obj.as.arr->len);
-        return js_undef();
-    }
-    if (obj.kind == JS_VAL_OBJECT && obj.as.obj) {
-        JsVal out = js_undef();
-        if (js_obj_get(obj.as.obj, prop, &out)) return out;
-        return js_undef();
-    }
-
-    if (obj.kind == JS_VAL_BUILTIN_OBJ) {
-        JsBuiltinId bid = (JsBuiltinId)obj.as.u32;
-        if (bid == JS_BUILTIN_MATH) {
-            if (strcmp(prop, "PI") == 0)    return js_num(JS_PI_CONST);
-            if (strcmp(prop, "E") == 0)     return js_num(2.718281828459045);
-            if (strcmp(prop, "SQRT2") == 0) return js_num(1.4142135623730951);
-            return js_undef();
+    if (op == 101 && argc >= 5) { /* addColorStop(gradId, offset, colorStr) */
+        int32_t gid = -1;
+        double off = 0.0;
+        (void)JS_ToInt32(ctx, &gid, argv[2]);
+        (void)JS_ToFloat64(ctx, &off, argv[3]);
+        const char *cs = JS_ToCString(ctx, argv[4]);
+        if (cs && gid >= 0 && gid < vm->grad_count && vm->grads[gid].stop_count < ARCR_GRAD_MAX_STOPS) {
+            CanvasGrad *g = &vm->grads[gid];
+            g->stops[g->stop_count].offset = ARCR_CLAMP(off, 0.0, 1.0);
+            g->stops[g->stop_count].argb   = js_parse_css_color(cs);
+            g->stop_count++;
         }
-        if (bid == JS_BUILTIN_WINDOW) {
-            if (strcmp(prop, "document") == 0)     { JsVal v = {JS_VAL_BUILTIN_OBJ, {.u32 = JS_BUILTIN_DOCUMENT}}; return v; }
-            if (strcmp(prop, "location") == 0)     { JsVal v = {JS_VAL_BUILTIN_OBJ, {.u32 = JS_BUILTIN_LOCATION}}; return v; }
-            if (strcmp(prop, "localStorage") == 0) { JsVal v = {JS_VAL_BUILTIN_OBJ, {.u32 = JS_BUILTIN_LOCALSTORAGE}}; return v; }
-            if (strcmp(prop, "console") == 0)      { JsVal v = {JS_VAL_BUILTIN_OBJ, {.u32 = JS_BUILTIN_CONSOLE}}; return v; }
-            if (strcmp(prop, "performance") == 0)  { JsVal v = {JS_VAL_BUILTIN_OBJ, {.u32 = JS_BUILTIN_PERFORMANCE}}; return v; }
-            if (strcmp(prop, "innerWidth") == 0)   return js_num(1024.0);
-            if (strcmp(prop, "innerHeight") == 0)  return js_num(768.0);
-            JsVal gv = js_undef();
-            if (js_obj_get(vm->globals, prop, &gv)) return gv;
-            return js_undef();
-        }
-        if (bid == JS_BUILTIN_LOCATION) {
-            if (strcmp(prop, "href") == 0) return js_mk_str(vm, vm->location_href);
-            return js_undef();
-        }
-        if (bid == JS_BUILTIN_DOCUMENT) {
-            if (strcmp(prop, "title") == 0) {
-                if (doc && doc->title && doc->title[0] != '\0') return js_mk_str(vm, doc->title);
-                return js_mk_str(vm, vm->doc_title);
-            }
-            if (strcmp(prop, "body") == 0) {
-                if (!doc) return js_null();
-                js_dom_ensure_uids(doc);
-                return doc->body ? js_dom_node(doc->body->node_uid) : js_null();
-            }
-            if (strcmp(prop, "documentElement") == 0) {
-                if (!doc || !doc->root) return js_null();
-                js_dom_ensure_uids(doc);
-                for (ArcrDomNode *ch = doc->root->first_child; ch != NULL; ch = ch->next_sibling) {
-                    if (ch->kind == ARCR_NODE_ELEMENT) return js_dom_node(ch->node_uid);
-                }
-                return js_null();
-            }
-            if (strcmp(prop, "location") == 0) {
-                JsVal v = {JS_VAL_BUILTIN_OBJ, {.u32 = JS_BUILTIN_LOCATION}};
-                return v;
-            }
-            return js_undef();
-        }
+        if (cs) JS_FreeCString(ctx, cs);
+        return JS_UNDEFINED;
     }
 
-    if (obj.kind == JS_VAL_DOM_NODE && doc) {
-        ArcrDomNode *el = js_dom_find_uid(vm, doc, obj.as.u32);
-        if (!el) return js_undef();
-        if (strcmp(prop, "id") == 0) {
-            const char *idv = (el->id != ARCR_ATOM_NULL) ? arcr_atom_cstr(doc->atoms, el->id) : "";
-            return js_mk_str(vm, idv ? idv : "");
-        }
-        if (strcmp(prop, "tagName") == 0 || strcmp(prop, "nodeName") == 0) {
-            const char *tg = arcr_atom_cstr(doc->atoms, el->tag);
-            char up[64];
-            size_t i = 0u;
-            if (tg) {
-                for (; tg[i] != '\0' && i + 1u < sizeof(up); ++i) {
-                    char c = tg[i];
-                    up[i] = (c >= 'a' && c <= 'z') ? (char)(c - 'a' + 'A') : c;
-                }
-            }
-            up[i] = '\0';
-            return js_mk_str(vm, up);
-        }
-        if (strcmp(prop, "className") == 0) {
-            const char *cv = js_dom_get_attr(doc, el, "class");
-            return js_mk_str(vm, cv ? cv : "");
-        }
-        if (strcmp(prop, "textContent") == 0 || strcmp(prop, "innerText") == 0) {
-            size_t tlen = js_dom_collect_text(el, NULL, 0u, 0u);
-            char *buf = (char *)arcr_arena_alloc(&vm->temp_arena, tlen + 1u, 1u);
-            if (!buf) return js_mk_str(vm, "");
-            js_dom_collect_text(el, buf, tlen + 1u, 0u);
-            buf[tlen] = '\0';
-            return js_mk_str_n(vm, buf, tlen);
-        }
-        if (strcmp(prop, "innerHTML") == 0) {
-            size_t hlen = js_dom_serialize_children(doc, el, NULL, 0u, 0u);
-            char *buf = (char *)arcr_arena_alloc(&vm->temp_arena, hlen + 1u, 1u);
-            if (!buf) return js_mk_str(vm, "");
-            js_dom_serialize_children(doc, el, buf, hlen + 1u, 0u);
-            return js_mk_str_n(vm, buf, hlen);
-        }
-        if (strcmp(prop, "value") == 0) {
-            if (el->input_value) return js_mk_str(vm, el->input_value);
-            const char *va = js_dom_get_attr(doc, el, "value");
-            return js_mk_str(vm, va ? va : "");
-        }
-        if (strcmp(prop, "checked") == 0) {
-            return js_bool((el->state_flags & ARCR_STATE_CHECKED) != 0u);
-        }
-        if (strcmp(prop, "style") == 0) {
-            JsVal sv; memset(&sv, 0, sizeof(sv)); sv.kind = JS_VAL_DOM_STYLE; sv.as.u32 = el->node_uid;
-            return sv;
-        }
-        if (strcmp(prop, "classList") == 0) {
-            JsVal cv; memset(&cv, 0, sizeof(cv)); cv.kind = JS_VAL_DOM_CLASSLIST; cv.as.u32 = el->node_uid;
-            return cv;
-        }
-        if (strcmp(prop, "parentElement") == 0 || strcmp(prop, "parentNode") == 0) {
-            if (el->parent && el->parent->kind == ARCR_NODE_ELEMENT) {
-                return js_dom_node(el->parent->node_uid);
-            }
-            return js_null();
-        }
-        if (strcmp(prop, "children") == 0) {
-            JsArray *ca = js_alloc_array(vm, 4u);
-            if (!ca) return js_undef();
-            for (ArcrDomNode *ch = el->first_child; ch != NULL; ch = ch->next_sibling) {
-                if (ch->kind == ARCR_NODE_ELEMENT) js_array_push(vm, ca, js_dom_node(ch->node_uid));
-            }
-            JsVal av; memset(&av, 0, sizeof(av)); av.kind = JS_VAL_ARRAY; av.as.arr = ca;
-            return av;
-        }
-        if (strcmp(prop, "width") == 0 || strcmp(prop, "height") == 0) {
-            const char *av = js_dom_get_attr(doc, el, prop);
-            int32_t iv = (strcmp(prop, "width") == 0) ? 300 : 150;
-            if (av) arcr_parse_i32(av, strlen(av), &iv);
-            return js_num((double)iv);
-        }
-    }
+    ArcrDomSurface *surf = js_canvas_get_surf(vm, uid);
+    Canvas2DCtx *c = js_get_canvas_ctx(vm, uid);
+    if (!surf || !c) return JS_UNDEFINED;
 
-    if (obj.kind == JS_VAL_DOM_STYLE && doc) {
-        ArcrDomNode *el = js_dom_find_uid(vm, doc, obj.as.u32);
-        char val_buf[256];
-        js_style_get_prop(doc, el, prop, val_buf, sizeof(val_buf));
-        return js_mk_str(vm, val_buf);
-    }
+    double a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0, a4 = 0.0, a5 = 0.0;
+    if (argc >= 3 && JS_IsNumber(argv[2])) (void)JS_ToFloat64(ctx, &a0, argv[2]);
+    if (argc >= 4 && JS_IsNumber(argv[3])) (void)JS_ToFloat64(ctx, &a1, argv[3]);
+    if (argc >= 5 && JS_IsNumber(argv[4])) (void)JS_ToFloat64(ctx, &a2, argv[4]);
+    if (argc >= 6 && JS_IsNumber(argv[5])) (void)JS_ToFloat64(ctx, &a3, argv[5]);
+    if (argc >= 7 && JS_IsNumber(argv[6])) (void)JS_ToFloat64(ctx, &a4, argv[6]);
+    if (argc >= 8 && JS_IsNumber(argv[7])) (void)JS_ToFloat64(ctx, &a5, argv[7]);
 
-    if (obj.kind == JS_VAL_DOM_CLASSLIST && doc) {
-        ArcrDomNode *el = js_dom_find_uid(vm, doc, obj.as.u32);
-        if (el && strcmp(prop, "length") == 0) return js_num((double)el->class_count);
-    }
-
-    if (obj.kind == JS_VAL_CANVAS_CTX2D && obj.as.ctx2d) {
-        if (strcmp(prop, "lineWidth") == 0) return js_num((double)obj.as.ctx2d->line_width);
-        if (strcmp(prop, "fillStyle") == 0 || strcmp(prop, "strokeStyle") == 0) {
-            uint32_t c = (prop[0] == 'f') ? obj.as.ctx2d->fill_argb : obj.as.ctx2d->stroke_argb;
-            char hex[16];
-            snprintf(hex, sizeof(hex), "#%02x%02x%02x",
-                     (unsigned)((c >> 16) & 0xFFu), (unsigned)((c >> 8) & 0xFFu), (unsigned)(c & 0xFFu));
-            return js_mk_str(vm, hex);
+    switch (op) {
+        case 0: { /* resize / ensure (w, h) */
+            int32_t nw = (int32_t)a0, nh = (int32_t)a1;
+            ArcrDomNode *el = js_dom_find_uid(vm, uid);
+            if (el && nw > 0 && nh > 0) (void)js_dom_ensure_surface(vm, el, nw, nh);
+            break;
         }
-    }
-    return js_undef();
-}
-
-static void vm_set_prop(ArcrJsVm *vm, JsVal obj, const char *prop, JsVal val) {
-    ArcrDocument *doc = vm->host_cb.doc;
-    char tmp[512];
-
-    if (obj.kind == JS_VAL_OBJECT && obj.as.obj) {
-        js_obj_set(vm, obj.as.obj, prop, val);
-        return;
-    }
-    if (obj.kind == JS_VAL_ARRAY && obj.as.arr && strcmp(prop, "length") == 0) {
-        int32_t nl = (int32_t)js_to_number(val);
-        if (nl >= 0 && (size_t)nl < obj.as.arr->len) obj.as.arr->len = (size_t)nl;
-        return;
-    }
-
-    if (obj.kind == JS_VAL_BUILTIN_OBJ) {
-        JsBuiltinId bid = (JsBuiltinId)obj.as.u32;
-        if (bid == JS_BUILTIN_DOCUMENT && strcmp(prop, "title") == 0) {
-            const char *s = js_to_cstr_buf(vm, val, tmp, sizeof(tmp));
-            arcr_str_copy(vm->doc_title, sizeof(vm->doc_title), s);
-            if (doc) {
-                doc->title     = arcr_arena_strdup(&doc->arena, s, strlen(s));
-                doc->dom_dirty = true;
-            }
-            if (vm->host_cb.set_document_title) {
-                vm->host_cb.set_document_title(vm->host_cb.userdata, s);
-            }
-            return;
-        }
-        if ((bid == JS_BUILTIN_LOCATION && strcmp(prop, "href") == 0) ||
-            (bid == JS_BUILTIN_WINDOW && strcmp(prop, "location") == 0)) {
-            const char *s = js_to_cstr_buf(vm, val, tmp, sizeof(tmp));
-            arcr_str_copy(vm->location_href, sizeof(vm->location_href), s);
-            if (vm->host_cb.navigate_to) {
-                vm->host_cb.navigate_to(vm->host_cb.userdata, s);
-            }
-            return;
-        }
-        if (bid == JS_BUILTIN_WINDOW) {
-            js_obj_set(vm, vm->globals, prop, val);
-            return;
-        }
-    }
-
-    if (obj.kind == JS_VAL_DOM_NODE && doc) {
-        ArcrDomNode *el = js_dom_find_uid(vm, doc, obj.as.u32);
-        if (!el) return;
-        const char *s = js_to_cstr_buf(vm, val, tmp, sizeof(tmp));
-        if (strcmp(prop, "id") == 0) {
-            js_dom_set_attr(doc, el, "id", 2u, s, strlen(s));
-        } else if (strcmp(prop, "className") == 0) {
-            js_dom_set_attr(doc, el, "class", 5u, s, strlen(s));
-        } else if (strcmp(prop, "textContent") == 0 || strcmp(prop, "innerText") == 0) {
-            js_dom_clear_children(doc, el);
-            size_t slen = strlen(s);
-            if (slen > 0u) {
-                ArcrDomNode *tn = js_dom_create_text(doc, s, slen);
-                if (tn) js_dom_append_child(doc, el, tn);
-            }
-            doc->dom_dirty = true;
-        } else if (strcmp(prop, "innerHTML") == 0) {
-            js_dom_parse_fragment(doc, el, s, strlen(s));
-        } else if (strcmp(prop, "value") == 0) {
-            size_t slen = strlen(s);
-            if (!el->input_value || slen + 1u > el->input_cap) {
-                size_t ncap = (slen + 64u);
-                char *nb = (char *)arcr_arena_alloc(&doc->arena, ncap, 1u);
-                if (nb) { el->input_value = nb; el->input_cap = ncap; }
-            }
-            if (el->input_value) arcr_str_copy(el->input_value, el->input_cap, s);
-            js_dom_set_attr(doc, el, "value", 5u, s, slen);
-        } else if (strcmp(prop, "checked") == 0) {
-            if (js_is_truthy(val)) el->state_flags |= ARCR_STATE_CHECKED;
-            else                   el->state_flags &= ~ARCR_STATE_CHECKED;
-            doc->dom_dirty = true;
-        } else if (strcmp(prop, "width") == 0 || strcmp(prop, "height") == 0) {
-            js_dom_set_attr(doc, el, prop, strlen(prop), s, strlen(s));
-        }
-        return;
-    }
-
-    if (obj.kind == JS_VAL_DOM_STYLE && doc) {
-        ArcrDomNode *el = js_dom_find_uid(vm, doc, obj.as.u32);
-        const char *s = js_to_cstr_buf(vm, val, tmp, sizeof(tmp));
-        js_style_set_prop(doc, el, prop, s);
-        return;
-    }
-
-    if (obj.kind == JS_VAL_CANVAS_CTX2D && obj.as.ctx2d) {
-        if (strcmp(prop, "fillStyle") == 0) {
-            const char *s = js_to_cstr_buf(vm, val, tmp, sizeof(tmp));
-            obj.as.ctx2d->fill_argb = js_parse_css_color(s, obj.as.ctx2d->fill_argb);
-        } else if (strcmp(prop, "strokeStyle") == 0) {
-            const char *s = js_to_cstr_buf(vm, val, tmp, sizeof(tmp));
-            obj.as.ctx2d->stroke_argb = js_parse_css_color(s, obj.as.ctx2d->stroke_argb);
-        } else if (strcmp(prop, "lineWidth") == 0) {
-            double lw = js_to_number(val);
-            if (!js_num_is_nan(lw) && lw > 0.0) obj.as.ctx2d->line_width = (float)lw;
-        }
-    }
-}
-
-static JsVal vm_call_method(ArcrJsVm *vm, JsVal recv, const char *mname,
-                            const JsVal *args, size_t argc) {
-    ArcrDocument *doc = vm->host_cb.doc;
-    char tmp1[512], tmp2[512];
-
-    /* 1. Built-in singleton objects */
-    if (recv.kind == JS_VAL_BUILTIN_OBJ) {
-        JsBuiltinId bid = (JsBuiltinId)recv.as.u32;
-        if (bid == JS_BUILTIN_CONSOLE) {
-            if (strcmp(mname, "log") == 0 || strcmp(mname, "warn") == 0 ||
-                strcmp(mname, "error") == 0 || strcmp(mname, "info") == 0) {
-                char line[1024];
-                size_t pos = 0u;
-                line[0] = '\0';
-                for (size_t i = 0u; i < argc; ++i) {
-                    if (i > 0u && pos + 1u < sizeof(line)) line[pos++] = ' ';
-                    const char *s = js_to_cstr_buf(vm, args[i], tmp1, sizeof(tmp1));
-                    size_t sl = strlen(s);
-                    if (pos + sl >= sizeof(line)) sl = (sizeof(line) - 1u > pos) ? (sizeof(line) - 1u - pos) : 0u;
-                    if (sl > 0u) { memcpy(line + pos, s, sl); pos += sl; }
-                }
-                line[pos] = '\0';
-                if (vm->host_cb.console_log) {
-                    vm->host_cb.console_log(vm->host_cb.userdata, line);
-                }
-            }
-            return js_undef();
-        }
-        if (bid == JS_BUILTIN_MATH) {
-            double x = (argc > 0u) ? js_to_number(args[0]) : js_make_nan();
-            double y = (argc > 1u) ? js_to_number(args[1]) : js_make_nan();
-            if (strcmp(mname, "floor") == 0)  return js_num(js_math_floor(x));
-            if (strcmp(mname, "ceil") == 0)   return js_num(js_math_ceil(x));
-            if (strcmp(mname, "round") == 0)  return js_num(js_math_round(x));
-            if (strcmp(mname, "trunc") == 0)  return js_num(js_math_trunc(x));
-            if (strcmp(mname, "abs") == 0)    return js_num(js_math_abs(x));
-            if (strcmp(mname, "sqrt") == 0)   return js_num(js_math_sqrt(x));
-            if (strcmp(mname, "sin") == 0)    return js_num(js_math_sin(x));
-            if (strcmp(mname, "cos") == 0)    return js_num(js_math_cos(x));
-            if (strcmp(mname, "pow") == 0)    return js_num(js_math_pow(x, y));
-            if (strcmp(mname, "log") == 0)    return js_num(js_math_ln(x));
-            if (strcmp(mname, "exp") == 0)    return js_num(js_math_exp(x));
-            if (strcmp(mname, "random") == 0) {
-                uint64_t r = js_next_rand_u64(vm) >> 11;
-                return js_num((double)r * (1.0 / 9007199254740992.0));
-            }
-            if (strcmp(mname, "min") == 0) {
-                if (argc == 0u) return js_num(1e308 * 10.0);
-                double best = x;
-                for (size_t i = 1u; i < argc; ++i) {
-                    double v = js_to_number(args[i]);
-                    if (js_num_is_nan(v)) return js_num(v);
-                    if (v < best) best = v;
-                }
-                return js_num(best);
-            }
-            if (strcmp(mname, "max") == 0) {
-                if (argc == 0u) return js_num(-1e308 * 10.0);
-                double best = x;
-                for (size_t i = 1u; i < argc; ++i) {
-                    double v = js_to_number(args[i]);
-                    if (js_num_is_nan(v)) return js_num(v);
-                    if (v > best) best = v;
-                }
-                return js_num(best);
-            }
-            return js_undef();
-        }
-        if (bid == JS_BUILTIN_JSON) {
-            if (strcmp(mname, "stringify") == 0) {
-                if (argc == 0u || args[0].kind == JS_VAL_UNDEFINED) return js_undef();
-                JsonBuf jb = {0};
-                json_stringify_rec(vm, args[0], &jb, 0);
-                return js_mk_str_n(vm, jb.buf ? jb.buf : "null", jb.len);
-            }
-            if (strcmp(mname, "parse") == 0 && argc > 0u) {
-                const char *src = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                if (args[0].kind == JS_VAL_STRING && args[0].as.str) src = args[0].as.str->data;
-                JsonParser jp = { vm, src, strlen(src), 0u, true };
-                JsVal res = jp_parse_value(&jp, 0);
-                jp_skip_ws(&jp);
-                if (!jp.ok || jp.pos != jp.len) {
-                    vm->thrown_val = js_mk_str(vm, "SyntaxError: Invalid JSON");
-                    vm->has_exception = true;
-                    return js_undef();
-                }
-                return res;
-            }
-        }
-        if (bid == JS_BUILTIN_PERFORMANCE && strcmp(mname, "now") == 0) {
-            uint64_t now_us = arcr_platform_monotonic_usec();
-            return js_num((double)(now_us - vm->start_monotonic_usec) / 1000.0);
-        }
-        if (bid == JS_BUILTIN_DATE && strcmp(mname, "now") == 0) {
-            return js_num((double)arcr_platform_wall_epoch_sec() * 1000.0);
-        }
-        if (bid == JS_BUILTIN_LOCALSTORAGE) {
-            if (strcmp(mname, "getItem") == 0 && argc > 0u) {
-                const char *k = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                if (vm_storage_get_local(vm, k, tmp2, sizeof(tmp2))) return js_mk_str(vm, tmp2);
-                return js_null();
-            }
-            if (strcmp(mname, "setItem") == 0 && argc >= 2u) {
-                const char *k = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                const char *v = js_to_cstr_buf(vm, args[1], tmp2, sizeof(tmp2));
-                vm_storage_set_local(vm, k, v);
-                return js_undef();
-            }
-            if (strcmp(mname, "removeItem") == 0 && argc > 0u) {
-                const char *k = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                vm_storage_set_local(vm, k, NULL);
-                return js_undef();
-            }
-            if (strcmp(mname, "clear") == 0) {
-                memset(vm->local_storage, 0, sizeof(vm->local_storage));
-                return js_undef();
-            }
-        }
-        if (bid == JS_BUILTIN_LOCATION && (strcmp(mname, "assign") == 0 || strcmp(mname, "replace") == 0) && argc > 0u) {
-            const char *u = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            arcr_str_copy(vm->location_href, sizeof(vm->location_href), u);
-            if (vm->host_cb.navigate_to) vm->host_cb.navigate_to(vm->host_cb.userdata, u);
-            return js_undef();
-        }
-        if (bid == JS_BUILTIN_ARRAY_CTOR && strcmp(mname, "isArray") == 0) {
-            return js_bool(argc > 0u && args[0].kind == JS_VAL_ARRAY);
-        }
-        if (bid == JS_BUILTIN_OBJECT_CTOR && strcmp(mname, "keys") == 0 && argc > 0u) {
-            JsArray *ka = js_alloc_array(vm, 4u);
-            if (ka && args[0].kind == JS_VAL_OBJECT && args[0].as.obj) {
-                for (size_t i = 0u; i < args[0].as.obj->len; ++i) {
-                    js_array_push(vm, ka, js_mk_str(vm, args[0].as.obj->props[i].key));
-                }
-            }
-            JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_ARRAY; v.as.arr = ka;
-            return v;
-        }
-        if (bid == JS_BUILTIN_DOCUMENT) {
-            if (!doc) return js_null();
-            js_dom_ensure_uids(doc);
-            if (strcmp(mname, "getElementById") == 0 && argc > 0u) {
-                const char *id_s = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                if (!id_s || id_s[0] == '\0') return js_null();
-                ArcrAtom ia = arcr_atom_intern(doc->atoms, id_s, strlen(id_s));
-                ArcrDomNode *hit = js_dom_find_by_id_rec(doc->root, ia);
-                return hit ? js_dom_node(hit->node_uid) : js_null();
-            }
-            if (strcmp(mname, "querySelector") == 0 && argc > 0u) {
-                const char *sel = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                ArcrDomNode *hit = NULL;
-                size_t cnt = 0u;
-                js_query_walk(doc, doc->root, doc->root, sel, &hit, &cnt, 1u);
-                return (cnt > 0u && hit) ? js_dom_node(hit->node_uid) : js_null();
-            }
-            if (strcmp(mname, "querySelectorAll") == 0 && argc > 0u) {
-                const char *sel = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                ArcrDomNode *hits[128];
-                size_t cnt = 0u;
-                js_query_walk(doc, doc->root, doc->root, sel, hits, &cnt, ARCR_ARRAY_LEN(hits));
-                JsArray *arr = js_alloc_array(vm, cnt);
-                for (size_t i = 0u; arr && i < cnt; ++i) {
-                    js_array_push(vm, arr, js_dom_node(hits[i]->node_uid));
-                }
-                JsVal av; memset(&av, 0, sizeof(av)); av.kind = JS_VAL_ARRAY; av.as.arr = arr;
-                return av;
-            }
-            if (strcmp(mname, "createElement") == 0 && argc > 0u) {
-                const char *tg = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                ArcrDomNode *el = js_dom_create_element(doc, tg, strlen(tg));
-                if (el) js_dom_register_detached(vm, doc, el);
-                return el ? js_dom_node(el->node_uid) : js_null();
-            }
-            if (strcmp(mname, "createTextNode") == 0 && argc > 0u) {
-                const char *tx = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-                ArcrDomNode *tn = js_dom_create_text(doc, tx, strlen(tx));
-                if (tn) js_dom_register_detached(vm, doc, tn);
-                return tn ? js_dom_node(tn->node_uid) : js_null();
-            }
-            return js_undef();
-        }
-    }
-
-    /* 2. DOM Element Methods */
-    if (recv.kind == JS_VAL_DOM_NODE && doc) {
-        ArcrDomNode *el = js_dom_find_uid(vm, doc, recv.as.u32);
-        if (!el) return js_undef();
-        if (strcmp(mname, "getAttribute") == 0 && argc > 0u) {
-            const char *k = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            const char *v = js_dom_get_attr(doc, el, k);
-            return v ? js_mk_str(vm, v) : js_null();
-        }
-        if (strcmp(mname, "setAttribute") == 0 && argc >= 2u) {
-            const char *k = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            const char *v = js_to_cstr_buf(vm, args[1], tmp2, sizeof(tmp2));
-            js_dom_set_attr(doc, el, k, strlen(k), v, strlen(v));
-            return js_undef();
-        }
-        if (strcmp(mname, "hasAttribute") == 0 && argc > 0u) {
-            const char *k = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            return js_bool(js_dom_get_attr(doc, el, k) != NULL);
-        }
-        if (strcmp(mname, "appendChild") == 0 && argc > 0u && args[0].kind == JS_VAL_DOM_NODE) {
-            ArcrDomNode *ch = js_dom_find_uid(vm, doc, args[0].as.u32);
-            if (ch) js_dom_append_child(doc, el, ch);
-            return args[0];
-        }
-        if (strcmp(mname, "remove") == 0) {
-            js_dom_unlink(el);
-            js_dom_register_detached(vm, doc, el);
-            doc->dom_dirty = true;
-            return js_undef();
-        }
-        if (strcmp(mname, "querySelector") == 0 && argc > 0u) {
-            const char *sel = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            ArcrDomNode *hit = NULL; size_t cnt = 0u;
-            js_query_walk(doc, el, el, sel, &hit, &cnt, 1u);
-            return (cnt > 0u && hit) ? js_dom_node(hit->node_uid) : js_null();
-        }
-        if (strcmp(mname, "querySelectorAll") == 0 && argc > 0u) {
-            const char *sel = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            ArcrDomNode *hits[128]; size_t cnt = 0u;
-            js_query_walk(doc, el, el, sel, hits, &cnt, ARCR_ARRAY_LEN(hits));
-            JsArray *arr = js_alloc_array(vm, cnt);
-            for (size_t i = 0u; arr && i < cnt; ++i) js_array_push(vm, arr, js_dom_node(hits[i]->node_uid));
-            JsVal av; memset(&av, 0, sizeof(av)); av.kind = JS_VAL_ARRAY; av.as.arr = arr;
-            return av;
-        }
-        if (strcmp(mname, "addEventListener") == 0 && argc >= 2u) {
-            const char *ev = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            for (size_t i = 0u; i < JS_MAX_EVENT_LISTENERS; ++i) {
-                if (!vm->listeners[i].active) {
-                    vm->listeners[i].active   = true;
-                    vm->listeners[i].node_uid = el->node_uid;
-                    arcr_str_copy(vm->listeners[i].event_type, sizeof(vm->listeners[i].event_type), ev);
-                    vm->listeners[i].callback = args[1];
-                    break;
-                }
-            }
-            return js_undef();
-        }
-        if (strcmp(mname, "getContext") == 0 && argc > 0u) {
-            const char *kind = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            if (arcr_str_eq_nocase(kind, "2d")) {
-                js_ensure_canvas_surface(doc, el);
-                JsCanvasCtx2D *ctx = (JsCanvasCtx2D *)vm_alloc(vm, sizeof(JsCanvasCtx2D), sizeof(void *));
-                if (!ctx) return js_null();
-                memset(ctx, 0, sizeof(*ctx));
-                ctx->node_uid    = el->node_uid;
-                ctx->fill_argb   = 0xFF000000u;
-                ctx->stroke_argb = 0xFF000000u;
-                ctx->line_width  = 1.0f;
-                JsVal cv; memset(&cv, 0, sizeof(cv)); cv.kind = JS_VAL_CANVAS_CTX2D; cv.as.ctx2d = ctx;
-                return cv;
-            }
-            return js_null();
-        }
-        return js_undef();
-    }
-
-    /* 3. DOM classList Methods */
-    if (recv.kind == JS_VAL_DOM_CLASSLIST && doc) {
-        ArcrDomNode *el = js_dom_find_uid(vm, doc, recv.as.u32);
-        if (!el || argc == 0u) return js_undef();
-        const char *cls = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-        if (cls[0] == '\0') return js_bool(false);
-        ArcrAtom ca = arcr_atom_intern(doc->atoms, cls, strlen(cls));
-
-        int idx = -1;
-        for (uint32_t i = 0u; i < el->class_count; ++i) {
-            if (el->classes[i] == ca) { idx = (int)i; break; }
-        }
-        if (strcmp(mname, "contains") == 0) return js_bool(idx >= 0);
-        if (strcmp(mname, "add") == 0) {
-            if (idx < 0 && el->class_count < ARCR_MAX_INLINE_CLASSES) {
-                el->classes[el->class_count++] = ca;
-                js_dom_sync_class_attr(doc, el);
-                js_recompute_subtree_bloom(el);
-            }
-            return js_undef();
-        }
-        if (strcmp(mname, "remove") == 0) {
-            if (idx >= 0) {
-                for (uint32_t k = (uint32_t)idx + 1u; k < el->class_count; ++k) {
-                    el->classes[k - 1u] = el->classes[k];
-                }
-                el->class_count--;
-                js_dom_sync_class_attr(doc, el);
-                js_recompute_subtree_bloom(el);
-            }
-            return js_undef();
-        }
-        if (strcmp(mname, "toggle") == 0) {
-            if (idx >= 0) {
-                for (uint32_t k = (uint32_t)idx + 1u; k < el->class_count; ++k) {
-                    el->classes[k - 1u] = el->classes[k];
-                }
-                el->class_count--;
-                js_dom_sync_class_attr(doc, el);
-                js_recompute_subtree_bloom(el);
-                return js_bool(false);
-            }
-            if (el->class_count < ARCR_MAX_INLINE_CLASSES) {
-                el->classes[el->class_count++] = ca;
-                js_dom_sync_class_attr(doc, el);
-                js_recompute_subtree_bloom(el);
-                return js_bool(true);
-            }
-            return js_bool(false);
-        }
-    }
-
-    /* 4. HTML5 <canvas> 2D Context Methods */
-    if (recv.kind == JS_VAL_CANVAS_CTX2D && recv.as.ctx2d && doc) {
-        JsCanvasCtx2D *ctx = recv.as.ctx2d;
-        ArcrDomNode *cel   = js_dom_find_uid(vm, doc, ctx->node_uid);
-        ArcrDomSurface *sf = js_ensure_canvas_surface(doc, cel);
-        if (!sf) return js_undef();
-        doc->dom_dirty = true;
-
-        if (strcmp(mname, "fillRect") == 0 && argc >= 4u) {
-            canvas_fill_rect(sf, js_to_number(args[0]), js_to_number(args[1]),
-                             js_to_number(args[2]), js_to_number(args[3]), ctx->fill_argb, false);
-        } else if (strcmp(mname, "clearRect") == 0 && argc >= 4u) {
-            canvas_fill_rect(sf, js_to_number(args[0]), js_to_number(args[1]),
-                             js_to_number(args[2]), js_to_number(args[3]), 0u, true);
-        } else if (strcmp(mname, "strokeRect") == 0 && argc >= 4u) {
-            float x = (float)js_to_number(args[0]), y = (float)js_to_number(args[1]);
-            float w = (float)js_to_number(args[2]), h = (float)js_to_number(args[3]);
-            canvas_draw_segment(sf, x, y, x + w, y, ctx->line_width, ctx->stroke_argb);
-            canvas_draw_segment(sf, x + w, y, x + w, y + h, ctx->line_width, ctx->stroke_argb);
-            canvas_draw_segment(sf, x + w, y + h, x, y + h, ctx->line_width, ctx->stroke_argb);
-            canvas_draw_segment(sf, x, y + h, x, y, ctx->line_width, ctx->stroke_argb);
-        } else if (strcmp(mname, "beginPath") == 0) {
-            ctx->path_len = 0u;
-        } else if (strcmp(mname, "moveTo") == 0 && argc >= 2u) {
-            if (ctx->path_len < ARCR_ARRAY_LEN(ctx->path_x)) {
-                ctx->path_x[ctx->path_len]    = (float)js_to_number(args[0]);
-                ctx->path_y[ctx->path_len]    = (float)js_to_number(args[1]);
-                ctx->path_move[ctx->path_len] = 1u;
-                ctx->path_len++;
-            }
-        } else if (strcmp(mname, "lineTo") == 0 && argc >= 2u) {
-            if (ctx->path_len < ARCR_ARRAY_LEN(ctx->path_x)) {
-                uint8_t mv = (ctx->path_len == 0u) ? 1u : 0u;
-                ctx->path_x[ctx->path_len]    = (float)js_to_number(args[0]);
-                ctx->path_y[ctx->path_len]    = (float)js_to_number(args[1]);
-                ctx->path_move[ctx->path_len] = mv;
-                ctx->path_len++;
-            }
-        } else if (strcmp(mname, "closePath") == 0) {
-            if (ctx->path_len > 1u && ctx->path_len < ARCR_ARRAY_LEN(ctx->path_x)) {
-                size_t sub = ctx->path_len - 1u;
-                while (sub > 0u && ctx->path_move[sub] == 0u) --sub;
-                ctx->path_x[ctx->path_len]    = ctx->path_x[sub];
-                ctx->path_y[ctx->path_len]    = ctx->path_y[sub];
-                ctx->path_move[ctx->path_len] = 0u;
-                ctx->path_len++;
-            }
-        } else if (strcmp(mname, "arc") == 0 && argc >= 5u) {
-            double cx = js_to_number(args[0]), cy = js_to_number(args[1]);
-            double r  = js_to_number(args[2]);
-            double a0 = js_to_number(args[3]), a1 = js_to_number(args[4]);
-            if (r > 0.0) {
-                int segs = 32;
-                for (int i = 0; i <= segs && ctx->path_len < ARCR_ARRAY_LEN(ctx->path_x); ++i) {
-                    double t = a0 + (a1 - a0) * ((double)i / (double)segs);
-                    ctx->path_x[ctx->path_len]    = (float)(cx + r * js_math_cos(t));
-                    ctx->path_y[ctx->path_len]    = (float)(cy + r * js_math_sin(t));
-                    ctx->path_move[ctx->path_len] = (i == 0 && ctx->path_len == 0u) ? 1u : 0u;
-                    ctx->path_len++;
-                }
-            }
-        } else if (strcmp(mname, "stroke") == 0) {
-            canvas_stroke_path(sf, ctx);
-        } else if (strcmp(mname, "fill") == 0) {
-            canvas_fill_path(sf, ctx);
-        }
-        return js_undef();
-    }
-
-    /* 5. Array Prototype Methods */
-    if (recv.kind == JS_VAL_ARRAY && recv.as.arr) {
-        JsArray *a = recv.as.arr;
-        if (strcmp(mname, "push") == 0) {
-            for (size_t i = 0u; i < argc; ++i) js_array_push(vm, a, args[i]);
-            return js_num((double)a->len);
-        }
-        if (strcmp(mname, "pop") == 0) {
-            return (a->len > 0u) ? a->items[--a->len] : js_undef();
-        }
-        if (strcmp(mname, "join") == 0) {
-            const char *sep = (argc > 0u && args[0].kind != JS_VAL_UNDEFINED)
-                                  ? js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1))
-                                  : ",";
-            size_t seplen = strlen(sep);
-            JsonBuf jb = {0};
-            for (size_t i = 0u; i < a->len; ++i) {
-                if (i > 0u) jbuf_append(&vm->temp_arena, &jb, sep, seplen);
-                if (a->items[i].kind != JS_VAL_NULL && a->items[i].kind != JS_VAL_UNDEFINED) {
-                    const char *is = js_to_cstr_buf(vm, a->items[i], tmp2, sizeof(tmp2));
-                    jbuf_append(&vm->temp_arena, &jb, is, strlen(is));
-                }
-            }
-            return js_mk_str_n(vm, jb.buf ? jb.buf : "", jb.len);
-        }
-        if (strcmp(mname, "slice") == 0) {
-            int32_t len = (int32_t)a->len;
-            int32_t s = (argc > 0u) ? (int32_t)js_to_number(args[0]) : 0;
-            int32_t e = (argc > 1u && args[1].kind != JS_VAL_UNDEFINED) ? (int32_t)js_to_number(args[1]) : len;
-            if (s < 0) s = ARCR_MAX(0, len + s);
-            if (e < 0) e = ARCR_MAX(0, len + e);
-            if (e > len) e = len;
-            JsArray *na = js_alloc_array(vm, (e > s) ? (size_t)(e - s) : 4u);
-            for (int32_t i = s; na && i < e; ++i) js_array_push(vm, na, a->items[i]);
-            JsVal v; memset(&v, 0, sizeof(v)); v.kind = JS_VAL_ARRAY; v.as.arr = na;
-            return v;
-        }
-        if (strcmp(mname, "indexOf") == 0 && argc > 0u) {
-            for (size_t i = 0u; i < a->len; ++i) {
-                if (js_strict_equal(a->items[i], args[0])) return js_num((double)i);
-            }
-            return js_num(-1.0);
-        }
-        if (strcmp(mname, "includes") == 0 && argc > 0u) {
-            for (size_t i = 0u; i < a->len; ++i) {
-                if (js_strict_equal(a->items[i], args[0])) return js_bool(true);
-            }
-            return js_bool(false);
-        }
-        if ((strcmp(mname, "forEach") == 0 || strcmp(mname, "map") == 0 || strcmp(mname, "filter") == 0) && argc > 0u) {
-            int mode = (mname[0] == 'm') ? 1 : (mname[1] == 'i') ? 2 : 0;
-            JsArray *out_arr = (mode > 0) ? js_alloc_array(vm, a->len) : NULL;
-            size_t snap_len = a->len;
-            for (size_t i = 0u; i < snap_len; ++i) {
-                JsVal cb_args[3] = { a->items[i], js_num((double)i), recv };
-                JsVal rval = js_undef();
-                if (!vm_invoke_callable(vm, args[0], js_undef(), cb_args, 3u, &rval)) break;
-                if (mode == 1 && out_arr) js_array_push(vm, out_arr, rval);
-                else if (mode == 2 && out_arr && js_is_truthy(rval)) js_array_push(vm, out_arr, a->items[i]);
-            }
-            if (mode == 0) return js_undef();
-            JsVal rv; memset(&rv, 0, sizeof(rv)); rv.kind = JS_VAL_ARRAY; rv.as.arr = out_arr;
-            return rv;
-        }
-    }
-
-    /* 6. String Prototype Methods */
-    if (recv.kind == JS_VAL_STRING && recv.as.str) {
-        const char *s = recv.as.str->data;
-        size_t slen   = recv.as.str->len;
-        if (strcmp(mname, "slice") == 0 || strcmp(mname, "substring") == 0) {
-            bool is_sub = (mname[1] == 'u');
-            int32_t len = (int32_t)slen;
-            int32_t st  = (argc > 0u) ? (int32_t)js_to_number(args[0]) : 0;
-            int32_t en  = (argc > 1u && args[1].kind != JS_VAL_UNDEFINED) ? (int32_t)js_to_number(args[1]) : len;
-            if (is_sub) {
-                if (st < 0) st = 0;
-                if (en < 0) en = 0;
-                if (st > en) { int32_t t = st; st = en; en = t; }
-            } else {
-                if (st < 0) st = ARCR_MAX(0, len + st);
-                if (en < 0) en = ARCR_MAX(0, len + en);
-            }
-            st = ARCR_CLAMP(st, 0, len);
-            en = ARCR_CLAMP(en, 0, len);
-            return (en > st) ? js_mk_str_n(vm, s + st, (size_t)(en - st)) : js_mk_str_n(vm, "", 0u);
-        }
-        if (strcmp(mname, "indexOf") == 0 && argc > 0u) {
-            const char *sub = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            const char *hit = strstr(s, sub);
-            return hit ? js_num((double)(hit - s)) : js_num(-1.0);
-        }
-        if (strcmp(mname, "includes") == 0 && argc > 0u) {
-            const char *sub = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            return js_bool(strstr(s, sub) != NULL);
-        }
-        if (strcmp(mname, "startsWith") == 0 && argc > 0u) {
-            const char *pre = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            size_t pl = strlen(pre);
-            return js_bool(pl <= slen && memcmp(s, pre, pl) == 0);
-        }
-        if (strcmp(mname, "endsWith") == 0 && argc > 0u) {
-            const char *suf = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            size_t fl = strlen(suf);
-            return js_bool(fl <= slen && memcmp(s + slen - fl, suf, fl) == 0);
-        }
-        if (strcmp(mname, "trim") == 0) {
-            const char *p = s; size_t l = slen;
-            arcr_str_trim_view(&p, &l);
-            return js_mk_str_n(vm, p, l);
-        }
-        if (strcmp(mname, "toLowerCase") == 0 || strcmp(mname, "toUpperCase") == 0) {
-            bool up = (mname[2] == 'U');
-            char *nb = (char *)arcr_arena_alloc(&vm->temp_arena, slen + 1u, 1u);
-            if (!nb) return recv;
-            for (size_t i = 0u; i < slen; ++i) {
-                char c = s[i];
-                if (up && c >= 'a' && c <= 'z') nb[i] = (char)(c - 'a' + 'A');
-                else if (!up && c >= 'A' && c <= 'Z') nb[i] = (char)(c - 'A' + 'a');
-                else nb[i] = c;
-            }
-            nb[slen] = '\0';
-            return js_mk_str_n(vm, nb, slen);
-        }
-        if ((strcmp(mname, "replace") == 0 || strcmp(mname, "replaceAll") == 0) && argc >= 2u) {
-            bool all = (mname[7] == 'A');
-            const char *pat = js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1));
-            const char *rep = js_to_cstr_buf(vm, args[1], tmp2, sizeof(tmp2));
-            size_t plen = strlen(pat), rlen = strlen(rep);
-            if (plen == 0u) return recv;
-            JsonBuf jb = {0};
-            const char *cur = s;
-            for (;;) {
-                const char *hit = strstr(cur, pat);
-                if (!hit) { jbuf_append(&vm->temp_arena, &jb, cur, strlen(cur)); break; }
-                jbuf_append(&vm->temp_arena, &jb, cur, (size_t)(hit - cur));
-                jbuf_append(&vm->temp_arena, &jb, rep, rlen);
-                cur = hit + plen;
-                if (!all) { jbuf_append(&vm->temp_arena, &jb, cur, strlen(cur)); break; }
-            }
-            return js_mk_str_n(vm, jb.buf ? jb.buf : "", jb.len);
-        }
-        if (strcmp(mname, "split") == 0) {
-            JsArray *arr = js_alloc_array(vm, 4u);
-            if (!arr) return js_undef();
-            const char *sep = (argc > 0u) ? js_to_cstr_buf(vm, args[0], tmp1, sizeof(tmp1)) : NULL;
-            if (!sep) {
-                js_array_push(vm, arr, recv);
-            } else if (sep[0] == '\0') {
-                for (size_t i = 0u; i < slen; ++i) js_array_push(vm, arr, js_mk_str_n(vm, s + i, 1u));
-            } else {
-                size_t seplen = strlen(sep);
-                const char *cur = s;
-                for (;;) {
-                    const char *hit = strstr(cur, sep);
-                    if (!hit) { js_array_push(vm, arr, js_mk_str(vm, cur)); break; }
-                    js_array_push(vm, arr, js_mk_str_n(vm, cur, (size_t)(hit - cur)));
-                    cur = hit + seplen;
-                }
-            }
-            JsVal av; memset(&av, 0, sizeof(av)); av.kind = JS_VAL_ARRAY; av.as.arr = arr;
-            return av;
-        }
-        if (strcmp(mname, "charAt") == 0) {
-            int32_t idx = (argc > 0u) ? (int32_t)js_to_number(args[0]) : 0;
-            if (idx < 0 || (size_t)idx >= slen) return js_mk_str_n(vm, "", 0u);
-            return js_mk_str_n(vm, s + idx, 1u);
-        }
-        if (strcmp(mname, "charCodeAt") == 0) {
-            int32_t idx = (argc > 0u) ? (int32_t)js_to_number(args[0]) : 0;
-            if (idx < 0 || (size_t)idx >= slen) return js_num(js_make_nan());
-            return js_num((double)(unsigned char)s[idx]);
-        }
-    }
-
-    /* 7. User Object Method Call (`obj.fn(...)`) */
-    if (recv.kind == JS_VAL_OBJECT && recv.as.obj) {
-        JsVal fn_val = js_undef();
-        if (js_obj_get(recv.as.obj, mname, &fn_val)) {
-            JsVal ret = js_undef();
-            (void)vm_invoke_callable(vm, fn_val, recv, args, argc, &ret);
-            return ret;
-        }
-    }
-    if (strcmp(mname, "toString") == 0) {
-        return js_to_string_val(vm, recv);
-    }
-    return js_undef();
-}
-
-/* =========================================================================
- * 8. Bytecode Virtual Machine Executor, Event Dispatcher & Module VTable
- * ========================================================================= */
-typedef struct JsCallFrame {
-    JsChunk *chunk;
-    JsEnv   *env;
-    JsVal    this_val;
-    size_t   ip;
-    size_t   base_sp;
-} JsCallFrame;
-
-static JsVal vm_call_native_fn(ArcrJsVm *vm, JsNativeFnId nid, const JsVal *args, size_t argc) {
-    char tmp[256];
-    switch (nid) {
-        case JS_NAT_PARSE_INT: {
-            if (argc == 0u) return js_num(js_make_nan());
-            const char *s = js_to_cstr_buf(vm, args[0], tmp, sizeof(tmp));
-            size_t len = strlen(s);
-            arcr_str_trim_view(&s, &len);
-            if (len == 0u) return js_num(js_make_nan());
-            int radix = (argc > 1u) ? (int)js_to_number(args[1]) : 0;
-            size_t i = 0u;
-            double sign = 1.0;
-            if (s[i] == '-') { sign = -1.0; ++i; }
-            else if (s[i] == '+') { ++i; }
-            if ((radix == 0 || radix == 16) && i + 2u <= len &&
-                s[i] == '0' && (s[i + 1u] == 'x' || s[i + 1u] == 'X')) {
-                radix = 16;
-                i += 2u;
-            }
-            if (radix == 0) radix = 10;
-            if (radix < 2 || radix > 36) return js_num(js_make_nan());
-            double val = 0.0;
-            bool any = false;
-            while (i < len) {
-                char c = s[i++];
-                int d = -1;
-                if (c >= '0' && c <= '9') d = c - '0';
-                else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
-                else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
-                if (d < 0 || d >= radix) break;
-                val = val * (double)radix + (double)d;
-                any = true;
-            }
-            return any ? js_num(sign * val) : js_num(js_make_nan());
-        }
-        case JS_NAT_PARSE_FLOAT: {
-            if (argc == 0u) return js_num(js_make_nan());
-            const char *s = js_to_cstr_buf(vm, args[0], tmp, sizeof(tmp));
-            return js_num(js_parse_float_str(s, strlen(s), true));
-        }
-        case JS_NAT_IS_NAN:
-            return js_bool(argc == 0u || js_num_is_nan(js_to_number(args[0])));
-        case JS_NAT_IS_FINITE: {
-            if (argc == 0u) return js_bool(false);
-            double n = js_to_number(args[0]);
-            return js_bool(!js_num_is_nan(n) && !js_num_is_inf(n));
-        }
-        case JS_NAT_NUMBER:
-            return (argc == 0u) ? js_num(0.0) : js_num(js_to_number(args[0]));
-        case JS_NAT_STRING:
-            return (argc == 0u) ? js_mk_str_n(vm, "", 0u) : js_to_string_val(vm, args[0]);
-        case JS_NAT_BOOLEAN:
-            return js_bool(argc > 0u && js_is_truthy(args[0]));
-        case JS_NAT_EVENT_PREVENT_DEFAULT:
-            if (vm->active_ev_prevented) *vm->active_ev_prevented = true;
-            return js_undef();
-        case JS_NAT_EVENT_STOP_PROP:
-            if (vm->active_ev_stopped) *vm->active_ev_stopped = true;
-            return js_undef();
-    }
-    return js_undef();
-}
-
-static bool vm_run_frames(ArcrJsVm *vm, JsChunk *entry_chunk, JsEnv *entry_env,
-                          JsVal entry_this, JsVal *out_ret) {
-    JsCallFrame frames[JS_MAX_CALL_DEPTH];
-    size_t fdepth = 0u;
-    size_t saved_try_depth = vm->try_depth;
-    size_t entry_sp        = vm->sp;
-
-    frames[0].chunk    = entry_chunk;
-    frames[0].env      = entry_env;
-    frames[0].this_val = entry_this;
-    frames[0].ip       = 0u;
-    frames[0].base_sp  = entry_sp;
-    fdepth             = 1u;
-
-    #define VM_PUSH(v) do { JsVal _vp = (v); if (vm->sp >= JS_MAX_STACK_SLOTS) { vm->sp = entry_sp; vm->try_depth = saved_try_depth; return false; } vm->stack[vm->sp++] = _vp; } while (0)
-    #define VM_POP()   ((vm->sp > 0u) ? vm->stack[--vm->sp] : js_undef())
-    #define VM_PEEK(k) ((vm->sp > (k)) ? vm->stack[vm->sp - 1u - (k)] : js_undef())
-
-    while (fdepth > 0u) {
-        if (vm->has_exception) {
-            if (vm->try_depth > saved_try_depth) {
-                JsTryFrame tf = vm->try_stack[--vm->try_depth];
-                fdepth = tf.frame_depth;
-                vm->sp = tf.stack_sp;
-                frames[fdepth - 1u].chunk = tf.chunk;
-                frames[fdepth - 1u].env   = tf.env;
-                frames[fdepth - 1u].ip    = tf.catch_ip;
-                vm->has_exception         = false;
-                VM_PUSH(vm->thrown_val);
-                continue;
-            }
-            vm->sp        = entry_sp;
-            vm->try_depth = saved_try_depth;
-            return false;
-        }
-
-        if (vm->fuel == 0u) {
-            vm->sp        = entry_sp;
-            vm->try_depth = saved_try_depth;
-            return false; /* Instruction fuel exhausted: abort infinite loop safely! */
-        }
-        --vm->fuel;
-
-        JsCallFrame *fr = &frames[fdepth - 1u];
-        if (fr->ip >= fr->chunk->code_len) {
-            if (fdepth == 1u) break;
-            --fdepth;
-            continue;
-        }
-        JsInst ins = fr->chunk->code[fr->ip++];
-
-        switch ((JsOpCode)ins.op) {
-            case OP_CONST:
-                VM_PUSH((ins.arg < fr->chunk->const_len) ? fr->chunk->consts[ins.arg] : js_undef());
-                break;
-            case OP_POP:
-                (void)VM_POP();
-                break;
-            case OP_DUP:
-                VM_PUSH(VM_PEEK(0u));
-                break;
-            case OP_DUP2: {
-                JsVal b = VM_PEEK(0u);
-                JsVal a = VM_PEEK(1u);
-                VM_PUSH(a);
-                VM_PUSH(b);
-                break;
-            }
-            case OP_SWAP:
-                if (vm->sp >= 2u) {
-                    JsVal t = vm->stack[vm->sp - 1u];
-                    vm->stack[vm->sp - 1u] = vm->stack[vm->sp - 2u];
-                    vm->stack[vm->sp - 2u] = t;
-                }
-                break;
-            case OP_THIS:
-                VM_PUSH(fr->this_val);
-                break;
-            case OP_GET_LOCAL: {
-                JsVal *sl = env_slot_ptr(fr->env, ins.arg);
-                VM_PUSH(sl ? *sl : js_undef());
-                break;
-            }
-            case OP_SET_LOCAL: {
-                JsVal v = VM_PEEK(0u);
-                JsVal *sl = env_slot_ptr(fr->env, ins.arg);
-                if (sl) *sl = v;
-                break;
-            }
-            case OP_GET_GLOBAL: {
-                const char *gname = (ins.arg < fr->chunk->const_len && fr->chunk->consts[ins.arg].kind == JS_VAL_STRING)
-                                        ? fr->chunk->consts[ins.arg].as.str->data : "";
-                JsVal gv = js_undef();
-                if (!js_obj_get(vm->globals, gname, &gv) && ins.aux == 0u) {
-                    gv = js_undef();
-                }
-                VM_PUSH(gv);
-                break;
-            }
-            case OP_SET_GLOBAL: {
-                const char *gname = (ins.arg < fr->chunk->const_len && fr->chunk->consts[ins.arg].kind == JS_VAL_STRING)
-                                        ? fr->chunk->consts[ins.arg].as.str->data : "";
-                js_obj_set(vm, vm->globals, gname, VM_PEEK(0u));
-                break;
-            }
-            case OP_GET_PROP: {
-                JsVal recv = VM_POP();
-                const char *pname = (ins.arg < fr->chunk->const_len && fr->chunk->consts[ins.arg].kind == JS_VAL_STRING)
-                                        ? fr->chunk->consts[ins.arg].as.str->data : "";
-                VM_PUSH(vm_get_prop(vm, recv, pname));
-                break;
-            }
-            case OP_SET_PROP: {
-                JsVal val  = VM_POP();
-                JsVal recv = VM_POP();
-                const char *pname = (ins.arg < fr->chunk->const_len && fr->chunk->consts[ins.arg].kind == JS_VAL_STRING)
-                                        ? fr->chunk->consts[ins.arg].as.str->data : "";
-                vm_set_prop(vm, recv, pname, val);
-                VM_PUSH(val);
-                break;
-            }
-            case OP_GET_INDEX: {
-                JsVal idx = VM_POP();
-                JsVal obj = VM_POP();
-                if (obj.kind == JS_VAL_ARRAY && obj.as.arr) {
-                    int32_t i = (int32_t)js_to_number(idx);
-                    if (i >= 0 && (size_t)i < obj.as.arr->len) VM_PUSH(obj.as.arr->items[i]);
-                    else VM_PUSH(js_undef());
-                } else if (obj.kind == JS_VAL_STRING && obj.as.str) {
-                    int32_t i = (int32_t)js_to_number(idx);
-                    if (i >= 0 && (size_t)i < obj.as.str->len)
-                        VM_PUSH(js_mk_str_n(vm, obj.as.str->data + i, 1u));
-                    else VM_PUSH(js_undef());
+        case 1: /* setFillStyle / setStrokeStyle */
+            if (argc >= 4) {
+                bool is_stroke = JS_ToBool(ctx, argv[2]) > 0;
+                if (JS_IsNumber(argv[3])) {
+                    int32_t gid = -1;
+                    (void)JS_ToInt32(ctx, &gid, argv[3]);
+                    if (is_stroke) c->stroke_grad_id = gid;
+                    else c->fill_grad_id = gid;
                 } else {
-                    char kb[128];
-                    const char *ks = js_to_cstr_buf(vm, idx, kb, sizeof(kb));
-                    VM_PUSH(vm_get_prop(vm, obj, ks));
-                }
-                break;
-            }
-            case OP_SET_INDEX: {
-                JsVal val = VM_POP();
-                JsVal idx = VM_POP();
-                JsVal obj = VM_POP();
-                if (obj.kind == JS_VAL_ARRAY && obj.as.arr) {
-                    int32_t i = (int32_t)js_to_number(idx);
-                    if (i >= 0 && i < 65536) {
-                        while (obj.as.arr->len <= (size_t)i) {
-                            if (!js_array_push(vm, obj.as.arr, js_undef())) break;
-                        }
-                        if ((size_t)i < obj.as.arr->len) obj.as.arr->items[i] = val;
-                    }
-                } else {
-                    char kb[128];
-                    const char *ks = js_to_cstr_buf(vm, idx, kb, sizeof(kb));
-                    vm_set_prop(vm, obj, ks, val);
-                }
-                VM_PUSH(val);
-                break;
-            }
-            case OP_ADD: {
-                JsVal b = VM_POP();
-                JsVal a = VM_POP();
-                if (a.kind == JS_VAL_STRING || b.kind == JS_VAL_STRING ||
-                    a.kind == JS_VAL_ARRAY  || b.kind == JS_VAL_ARRAY) {
-                    char ta[512], tb[512];
-                    const char *sa = js_to_cstr_buf(vm, a, ta, sizeof(ta));
-                    const char *sb = js_to_cstr_buf(vm, b, tb, sizeof(tb));
-                    size_t la = strlen(sa), lb = strlen(sb);
-                    JsString *st = (JsString *)vm_alloc(vm, sizeof(JsString) + la + lb + 1u, sizeof(void *));
-                    if (st) {
-                        st->len = la + lb;
-                        if (la > 0u) memcpy(st->data, sa, la);
-                        if (lb > 0u) memcpy(st->data + la, sb, lb);
-                        st->data[la + lb] = '\0';
-                        JsVal sv; memset(&sv, 0, sizeof(sv)); sv.kind = JS_VAL_STRING; sv.as.str = st;
-                        VM_PUSH(sv);
-                    } else {
-                        VM_PUSH(js_undef());
-                    }
-                } else {
-                    VM_PUSH(js_num(js_to_number(a) + js_to_number(b)));
-                }
-                break;
-            }
-            case OP_SUB: { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num(js_to_number(a) - js_to_number(b))); break; }
-            case OP_MUL: { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num(js_to_number(a) * js_to_number(b))); break; }
-            case OP_DIV: { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num(js_to_number(a) / js_to_number(b))); break; }
-            case OP_MOD: { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num(js_math_fmod(js_to_number(a), js_to_number(b)))); break; }
-            case OP_NEG: { JsVal a = VM_POP(); VM_PUSH(js_num(-js_to_number(a))); break; }
-            case OP_POS: { JsVal a = VM_POP(); VM_PUSH(js_num(js_to_number(a))); break; }
-            case OP_NOT: { JsVal a = VM_POP(); VM_PUSH(js_bool(!js_is_truthy(a))); break; }
-            case OP_TYPEOF: {
-                JsVal a = VM_POP();
-                const char *ts = "object";
-                switch (a.kind) {
-                    case JS_VAL_UNDEFINED: ts = "undefined"; break;
-                    case JS_VAL_BOOL:      ts = "boolean"; break;
-                    case JS_VAL_NUMBER:    ts = "number"; break;
-                    case JS_VAL_STRING:    ts = "string"; break;
-                    case JS_VAL_FUNCTION:
-                    case JS_VAL_NATIVE_FN: ts = "function"; break;
-                    default:               ts = "object"; break;
-                }
-                VM_PUSH(js_mk_str(vm, ts));
-                break;
-            }
-            case OP_EQ:         { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_bool(js_loose_equal(a, b))); break; }
-            case OP_NEQ:        { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_bool(!js_loose_equal(a, b))); break; }
-            case OP_STRICT_EQ:  { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_bool(js_strict_equal(a, b))); break; }
-            case OP_STRICT_NEQ: { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_bool(!js_strict_equal(a, b))); break; }
-            case OP_LT:
-            case OP_LTE:
-            case OP_GT:
-            case OP_GTE: {
-                JsVal b = VM_POP(), a = VM_POP();
-                bool res = false;
-                if (a.kind == JS_VAL_STRING && b.kind == JS_VAL_STRING && a.as.str && b.as.str) {
-                    int cmp = strcmp(a.as.str->data, b.as.str->data);
-                    if (ins.op == OP_LT) res = (cmp < 0);
-                    else if (ins.op == OP_LTE) res = (cmp <= 0);
-                    else if (ins.op == OP_GT) res = (cmp > 0);
-                    else res = (cmp >= 0);
-                } else {
-                    double na = js_to_number(a), nb = js_to_number(b);
-                    if (!js_num_is_nan(na) && !js_num_is_nan(nb)) {
-                        if (ins.op == OP_LT) res = (na < nb);
-                        else if (ins.op == OP_LTE) res = (na <= nb);
-                        else if (ins.op == OP_GT) res = (na > nb);
-                        else res = (na >= nb);
+                    const char *cs = JS_ToCString(ctx, argv[3]);
+                    if (cs) {
+                        uint32_t col = js_parse_css_color(cs);
+                        if (is_stroke) { c->cur.stroke_argb = col; c->stroke_grad_id = -1; }
+                        else { c->cur.fill_argb = col; c->fill_grad_id = -1; }
+                        JS_FreeCString(ctx, cs);
                     }
                 }
-                VM_PUSH(js_bool(res));
-                break;
             }
-            case OP_BIT_AND: { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num((double)((int32_t)js_to_number(a) & (int32_t)js_to_number(b)))); break; }
-            case OP_BIT_OR:  { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num((double)((int32_t)js_to_number(a) | (int32_t)js_to_number(b)))); break; }
-            case OP_BIT_XOR: { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num((double)((int32_t)js_to_number(a) ^ (int32_t)js_to_number(b)))); break; }
-            case OP_SHL:     { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num((double)((int32_t)js_to_number(a) << ((uint32_t)(int32_t)js_to_number(b) & 31u)))); break; }
-            case OP_SHR:     { JsVal b = VM_POP(), a = VM_POP(); VM_PUSH(js_num((double)((int32_t)js_to_number(a) >> ((uint32_t)(int32_t)js_to_number(b) & 31u)))); break; }
-            case OP_JMP:
-                fr->ip = (size_t)ins.arg;
-                break;
-            case OP_JMP_IF_FALSE:
-                if (!js_is_truthy(VM_PEEK(0u))) fr->ip = (size_t)ins.arg;
-                break;
-            case OP_JMP_IF_TRUE:
-                if (js_is_truthy(VM_PEEK(0u))) fr->ip = (size_t)ins.arg;
-                break;
-            case OP_CLOSURE: {
-                JsVal proto_v = (ins.arg < fr->chunk->const_len) ? fr->chunk->consts[ins.arg] : js_undef();
-                if (proto_v.kind == JS_VAL_FUNCTION && proto_v.as.fn) {
-                    JsFunc *nf = (JsFunc *)vm_alloc(vm, sizeof(JsFunc), sizeof(void *));
-                    if (nf) {
-                        nf->chunk        = proto_v.as.fn->chunk;
-                        nf->captured_env = fr->env;
-                        JsVal fv; memset(&fv, 0, sizeof(fv)); fv.kind = JS_VAL_FUNCTION; fv.as.fn = nf;
-                        VM_PUSH(fv);
-                    } else {
-                        VM_PUSH(js_undef());
-                    }
-                } else {
-                    VM_PUSH(js_undef());
-                }
-                break;
-            }
-            case OP_NEW_ARRAY: {
-                uint32_t cnt = ins.arg;
-                JsArray *arr = js_alloc_array(vm, cnt);
-                if (arr && vm->sp >= cnt) {
-                    size_t start = vm->sp - cnt;
-                    for (uint32_t i = 0u; i < cnt; ++i) js_array_push(vm, arr, vm->stack[start + i]);
-                    vm->sp = start;
-                }
-                JsVal av; memset(&av, 0, sizeof(av)); av.kind = JS_VAL_ARRAY; av.as.arr = arr;
-                VM_PUSH(av);
-                break;
-            }
-            case OP_NEW_OBJECT: {
-                uint32_t pairs = ins.arg;
-                JsObject *obj = js_alloc_object(vm, pairs);
-                if (obj && vm->sp >= pairs * 2u) {
-                    size_t start = vm->sp - pairs * 2u;
-                    for (uint32_t i = 0u; i < pairs; ++i) {
-                        JsVal kv = vm->stack[start + i * 2u];
-                        JsVal vv = vm->stack[start + i * 2u + 1u];
-                        if (kv.kind == JS_VAL_STRING && kv.as.str) {
-                            js_obj_set(vm, obj, kv.as.str->data, vv);
+            break;
+        case 2: c->cur.line_width   = ARCR_MAX(0.5, a0); break;
+        case 3: c->cur.global_alpha = ARCR_CLAMP(a0, 0.0, 1.0); break;
+        case 4: { /* setFont(str) */
+            if (argc >= 3) {
+                const char *fs = JS_ToCString(ctx, argv[2]);
+                if (fs) {
+                    c->cur.font_bold = (strstr(fs, "bold") != NULL || strstr(fs, "700") != NULL);
+                    c->cur.font_mono = (strstr(fs, "mono") != NULL);
+                    for (const char *p = fs; *p; ++p) {
+                        if (*p >= '0' && *p <= '9') {
+                            int px = atoi(p);
+                            if (px >= 6 && px <= 200) { c->cur.font_px = px; break; }
+                            while (*p >= '0' && *p <= '9') ++p;
+                            if (!*p) break;
                         }
                     }
-                    vm->sp = start;
+                    JS_FreeCString(ctx, fs);
                 }
-                JsVal ov; memset(&ov, 0, sizeof(ov)); ov.kind = JS_VAL_OBJECT; ov.as.obj = obj;
-                VM_PUSH(ov);
-                break;
             }
-            case OP_CALL: {
-                size_t argc = (size_t)ins.arg;
-                bool is_new = (ins.aux == 1u);
-                if (vm->sp < argc + 1u) { VM_PUSH(js_undef()); break; }
-                size_t fn_pos = vm->sp - argc - 1u;
-                JsVal callee  = vm->stack[fn_pos];
-                const JsVal *call_args = &vm->stack[fn_pos + 1u];
+            break;
+        }
+        case 5: /* save */
+            if (c->stack_top < ARCR_CANVAS_STACK_MAX) c->stack[c->stack_top++] = c->cur;
+            break;
+        case 6: /* restore */
+            if (c->stack_top > 0) c->cur = c->stack[--c->stack_top];
+            break;
+        case 7: /* translate */
+            c->cur.e += c->cur.a * a0 + c->cur.c * a1;
+            c->cur.f += c->cur.b * a0 + c->cur.d * a1;
+            break;
+        case 8: /* scale */
+            c->cur.a *= a0; c->cur.b *= a0;
+            c->cur.c *= a1; c->cur.d *= a1;
+            break;
+        case 9: { /* rotate */
+            double co = cos(a0), si = sin(a0);
+            double na = c->cur.a * co + c->cur.c * si;
+            double nb = c->cur.b * co + c->cur.d * si;
+            double nc = c->cur.a * (-si) + c->cur.c * co;
+            double nd = c->cur.b * (-si) + c->cur.d * co;
+            c->cur.a = na; c->cur.b = nb; c->cur.c = nc; c->cur.d = nd;
+            break;
+        }
+        case 10: /* setTransform */
+            c->cur.a = a0; c->cur.b = a1; c->cur.c = a2;
+            c->cur.d = a3; c->cur.e = a4; c->cur.f = a5;
+            break;
+        case 11: /* clearRect */ {
+            float fx0 = 0.0f, fy0 = 0.0f, fx1 = 0.0f, fy1 = 0.0f;
+            canvas_xfm_pt(&c->cur, a0, a1, &fx0, &fy0);
+            canvas_xfm_pt(&c->cur, a0 + a2, a1 + a3, &fx1, &fy1);
+            int32_t x0 = ARCR_CLAMP((int32_t)floorf(ARCR_MIN(fx0, fx1)), 0, surf->width);
+            int32_t x1 = ARCR_CLAMP((int32_t)ceilf(ARCR_MAX(fx0, fx1)),  0, surf->width);
+            int32_t y0 = ARCR_CLAMP((int32_t)floorf(ARCR_MIN(fy0, fy1)), 0, surf->height);
+            int32_t y1 = ARCR_CLAMP((int32_t)ceilf(ARCR_MAX(fy0, fy1)),  0, surf->height);
+            for (int32_t y = y0; y < y1; ++y) {
+                memset(surf->argb_pixels + (size_t)y * (size_t)surf->width + x0,
+                       0, (size_t)(x1 - x0) * sizeof(uint32_t));
+            }
+            vm->host.doc->dom_dirty = true;
+            break;
+        }
+        case 12: /* fillRect */ {
+            int32_t saved_cnt = c->pt_count;
+            c->pt_count = 0;
+            canvas_push_pt(c, a0,      a1,      true);
+            canvas_push_pt(c, a0 + a2, a1,      false);
+            canvas_push_pt(c, a0 + a2, a1 + a3, false);
+            canvas_push_pt(c, a0,      a1 + a3, false);
+            canvas_fill_current_path(vm, c, surf);
+            c->pt_count = saved_cnt;
+            vm->host.doc->dom_dirty = true;
+            break;
+        }
+        case 13: /* strokeRect */ {
+            float p0x, p0y, p1x, p1y, p2x, p2y, p3x, p3y;
+            canvas_xfm_pt(&c->cur, a0,      a1,      &p0x, &p0y);
+            canvas_xfm_pt(&c->cur, a0 + a2, a1,      &p1x, &p1y);
+            canvas_xfm_pt(&c->cur, a0 + a2, a1 + a3, &p2x, &p2y);
+            canvas_xfm_pt(&c->cur, a0,      a1 + a3, &p3x, &p3y);
+            uint32_t col = canvas_apply_alpha(c->cur.stroke_argb, c->cur.global_alpha);
+            float hw = (float)(c->cur.line_width * 0.5);
+            canvas_draw_thick_seg(surf, p0x, p0y, p1x, p1y, hw, col);
+            canvas_draw_thick_seg(surf, p1x, p1y, p2x, p2y, hw, col);
+            canvas_draw_thick_seg(surf, p2x, p2y, p3x, p3y, hw, col);
+            canvas_draw_thick_seg(surf, p3x, p3y, p0x, p0y, hw, col);
+            vm->host.doc->dom_dirty = true;
+            break;
+        }
+        case 14: c->pt_count = 0; break; /* beginPath */
+        case 15: canvas_push_pt(c, a0, a1, true); break;  /* moveTo */
+        case 16: canvas_push_pt(c, a0, a1, false); break; /* lineTo */
+        case 17: /* closePath */
+            if (c->pt_count > 0 && c->pt_count < ARCR_CANVAS_MAX_PTS) {
+                c->pts[c->pt_count].x       = c->sub_start_x;
+                c->pts[c->pt_count].y       = c->sub_start_y;
+                c->pts[c->pt_count].move_to = false;
+                c->pt_count++;
+            }
+            break;
+        case 18: /* rect(x,y,w,h) */
+            canvas_push_pt(c, a0,      a1,      true);
+            canvas_push_pt(c, a0 + a2, a1,      false);
+            canvas_push_pt(c, a0 + a2, a1 + a3, false);
+            canvas_push_pt(c, a0,      a1 + a3, false);
+            canvas_push_pt(c, a0,      a1,      false);
+            break;
+        case 19: { /* arc(cx, cy, r, a0, a1, ccw) */
+            double r = fabs(a2);
+            double st_a = a3, end_a = a4;
+            bool ccw = (argc >= 8) && (JS_ToBool(ctx, argv[7]) > 0);
+            double diff = end_a - st_a;
+            if (!ccw && diff < 0.0) diff += 2.0 * M_PI;
+            else if (ccw && diff > 0.0) diff -= 2.0 * M_PI;
+            int steps = ARCR_CLAMP((int)(fabs(diff) * ARCR_MAX(8.0, r * 0.5)), 8, 96);
+            for (int i = 0; i <= steps; ++i) {
+                double ang = st_a + diff * ((double)i / (double)steps);
+                canvas_push_pt(c, a0 + cos(ang) * r, a1 + sin(ang) * r,
+                               (i == 0 && c->pt_count == 0));
+            }
+            break;
+        }
+        case 20: /* fill */
+            canvas_fill_current_path(vm, c, surf);
+            vm->host.doc->dom_dirty = true;
+            break;
+        case 21: { /* stroke */
+            uint32_t col = canvas_apply_alpha(c->cur.stroke_argb, c->cur.global_alpha);
+            float hw = (float)(c->cur.line_width * 0.5);
+            for (int32_t i = 1; i < c->pt_count; ++i) {
+                if (!c->pts[i].move_to) {
+                    canvas_draw_thick_seg(surf, c->pts[i - 1].x, c->pts[i - 1].y,
+                                          c->pts[i].x, c->pts[i].y, hw, col);
+                }
+            }
+            vm->host.doc->dom_dirty = true;
+            break;
+        }
+        case 22: /* fillText / measureText */ {
+            if (argc < 4) break;
+            bool is_measure = JS_ToBool(ctx, argv[2]) > 0;
+            size_t tlen = 0u;
+            const char *txt = JS_ToCStringLen(ctx, &tlen, argv[3]);
+            if (!txt) break;
+            if (!vm->canvas_fonts) vm->canvas_fonts = arcr_font_system_create(NULL);
 
-                if (callee.kind == JS_VAL_FUNCTION && callee.as.fn && !is_new &&
-                    fdepth < JS_MAX_CALL_DEPTH) {
-                    JsChunk *fch = callee.as.fn->chunk;
-                    size_t nslots = ARCR_MAX((size_t)fch->local_count, (size_t)fch->param_count);
-                    JsEnv *fenv = alloc_env(vm, callee.as.fn->captured_env, nslots);
-                    if (!fenv) { vm->sp = fn_pos; VM_PUSH(js_undef()); break; }
-                    for (size_t i = 0u; i < argc && i < fch->param_count; ++i) {
-                        fenv->slots[i] = call_args[i];
+            double tx = (argc >= 5) ? a2 : 0.0;
+            double ty = (argc >= 6) ? a3 : 0.0;
+            float px = 0.0f, py = 0.0f;
+            canvas_xfm_pt(&c->cur, tx, ty, &px, &py);
+            int32_t cur_x = (int32_t)(px + 0.5f);
+            int32_t base_y = (int32_t)(py + 0.5f);
+            int32_t total_adv = 0;
+            uint32_t col = canvas_apply_alpha(c->cur.fill_argb, c->cur.global_alpha);
+            uint32_t base_a = (col >> 24) & 0xFFu;
+
+            size_t pos = 0u;
+            while (pos < tlen) {
+                uint32_t cp = 0u;
+                size_t step = arcr_utf8_decode_one(txt + pos, tlen - pos, &cp);
+                if (step == 0u) break;
+                pos += step;
+                ArcrGlyphMetrics gm;
+                memset(&gm, 0, sizeof(gm));
+                if (is_measure) {
+                    if (vm->canvas_fonts &&
+                        arcr_font_measure_glyph_ex(vm->canvas_fonts, cp, c->cur.font_px,
+                                                   c->cur.font_bold, c->cur.font_mono, &gm)) {
+                        total_adv += ARCR_MAX(1, gm.advance_px);
+                    } else {
+                        total_adv += ARCR_MAX(4, c->cur.font_px / 2);
                     }
-                    vm->sp = fn_pos;
-                    frames[fdepth].chunk    = fch;
-                    frames[fdepth].env      = fenv;
-                    frames[fdepth].this_val = js_undef();
-                    frames[fdepth].ip       = 0u;
-                    frames[fdepth].base_sp  = fn_pos;
-                    ++fdepth;
-                } else {
-                    JsVal args_copy[16];
-                    size_t c_argc = ARCR_MIN(argc, 16u);
-                    for (size_t i = 0u; i < c_argc; ++i) args_copy[i] = call_args[i];
-                    vm->sp = fn_pos;
-                    JsVal this_obj = js_undef();
-                    if (is_new) {
-                        JsObject *no = js_alloc_object(vm, 4u);
-                        this_obj.kind = JS_VAL_OBJECT;
-                        this_obj.as.obj = no;
+                } else if (vm->canvas_fonts) {
+                    const uint8_t *alpha = arcr_font_get_cached_glyph_ptr(
+                        vm->canvas_fonts, cp, c->cur.font_px,
+                        c->cur.font_bold, c->cur.font_mono, &gm, true);
+                    if (alpha && gm.width > 0 && gm.height > 0) {
+                        int32_t gx0 = cur_x + gm.bearing_x;
+                        int32_t gy0 = base_y - gm.bearing_y;
+                        for (int32_t gy = 0; gy < gm.height; ++gy) {
+                            int32_t dy = gy0 + gy;
+                            if (dy < 0 || dy >= surf->height) continue;
+                            uint32_t *row = surf->argb_pixels + (size_t)dy * (size_t)surf->width;
+                            for (int32_t gx = 0; gx < gm.width; ++gx) {
+                                int32_t dx = gx0 + gx;
+                                if (dx < 0 || dx >= surf->width) continue;
+                                uint8_t cov = alpha[(size_t)gy * (size_t)gm.width + (size_t)gx];
+                                if (cov > 0u) {
+                                    uint32_t ea = (base_a * (uint32_t)cov + 127u) / 255u;
+                                    canvas_blend_px(&row[dx], (col & 0x00FFFFFFu) | (ea << 24));
+                                }
+                            }
+                        }
                     }
-                    JsVal ret = js_undef();
-                    (void)vm_invoke_callable(vm, callee, this_obj, args_copy, c_argc, &ret);
-                    if (is_new && ret.kind == JS_VAL_UNDEFINED && this_obj.kind == JS_VAL_OBJECT) {
-                        ret = this_obj;
+                    cur_x += ARCR_MAX(1, gm.advance_px);
+                }
+            }
+            JS_FreeCString(ctx, txt);
+            if (is_measure) return JS_NewInt32(ctx, total_adv);
+            vm->host.doc->dom_dirty = true;
+            break;
+        }
+        case 23: { /* getImageData(x, y, w, h) -> ArrayBuffer of RGBA */
+            int32_t rx = (int32_t)a0, ry = (int32_t)a1;
+            int32_t rw = ARCR_CLAMP((int32_t)a2, 1, 4096);
+            int32_t rh = ARCR_CLAMP((int32_t)a3, 1, 4096);
+            size_t blen = (size_t)rw * (size_t)rh * 4u;
+            uint8_t *rgba = (uint8_t *)calloc(1u, blen);
+            if (!rgba) return JS_NULL;
+            for (int32_t y = 0; y < rh; ++y) {
+                int32_t sy = ry + y;
+                if (sy < 0 || sy >= surf->height) continue;
+                const uint32_t *srow = surf->argb_pixels + (size_t)sy * (size_t)surf->width;
+                for (int32_t x = 0; x < rw; ++x) {
+                    int32_t sx = rx + x;
+                    if (sx < 0 || sx >= surf->width) continue;
+                    uint32_t p = srow[sx];
+                    size_t o = ((size_t)y * (size_t)rw + (size_t)x) * 4u;
+                    rgba[o + 0u] = (uint8_t)((p >> 16) & 0xFFu);
+                    rgba[o + 1u] = (uint8_t)((p >> 8)  & 0xFFu);
+                    rgba[o + 2u] = (uint8_t)(p         & 0xFFu);
+                    rgba[o + 3u] = (uint8_t)((p >> 24) & 0xFFu);
+                }
+            }
+            JSValue ab = JS_NewArrayBufferCopy(ctx, rgba, blen);
+            free(rgba);
+            return ab;
+        }
+        case 24: { /* putImageData(uid, op, typedArray, dx, dy, w, h) */
+            if (argc < 7) break;
+            size_t boff = 0u, blen = 0u, bpe = 0u;
+            JSValue ab = JS_GetTypedArrayBuffer(ctx, argv[2], &boff, &blen, &bpe);
+            if (!JS_IsException(ab)) {
+                size_t tot = 0u;
+                const uint8_t *ptr = JS_GetArrayBuffer(ctx, &tot, ab);
+                int32_t dx = 0, dy = 0, rw = 0, rh = 0;
+                (void)JS_ToInt32(ctx, &dx, argv[3]);
+                (void)JS_ToInt32(ctx, &dy, argv[4]);
+                (void)JS_ToInt32(ctx, &rw, argv[5]);
+                (void)JS_ToInt32(ctx, &rh, argv[6]);
+                if (ptr && rw > 0 && rh > 0 && boff + (size_t)rw * (size_t)rh * 4u <= tot) {
+                    const uint8_t *rgba = ptr + boff;
+                    for (int32_t y = 0; y < rh; ++y) {
+                        int32_t ty = dy + y;
+                        if (ty < 0 || ty >= surf->height) continue;
+                        uint32_t *drow = surf->argb_pixels + (size_t)ty * (size_t)surf->width;
+                        for (int32_t x = 0; x < rw; ++x) {
+                            int32_t tx = dx + x;
+                            if (tx < 0 || tx >= surf->width) continue;
+                            size_t o = ((size_t)y * (size_t)rw + (size_t)x) * 4u;
+                            drow[tx] = ((uint32_t)rgba[o + 3u] << 24) |
+                                       ((uint32_t)rgba[o + 0u] << 16) |
+                                       ((uint32_t)rgba[o + 1u] << 8)  |
+                                       (uint32_t)rgba[o + 2u];
+                        }
                     }
-                    VM_PUSH(ret);
+                    vm->host.doc->dom_dirty = true;
                 }
-                break;
+                JS_FreeValue(ctx, ab);
+            } else {
+                JS_FreeValue(ctx, JS_GetException(ctx));
             }
-            case OP_CALL_METHOD: {
-                size_t argc = (size_t)ins.aux;
-                const char *mname = (ins.arg < fr->chunk->const_len && fr->chunk->consts[ins.arg].kind == JS_VAL_STRING)
-                                        ? fr->chunk->consts[ins.arg].as.str->data : "";
-                if (vm->sp < argc + 1u) { VM_PUSH(js_undef()); break; }
-                size_t recv_pos = vm->sp - argc - 1u;
-                JsVal recv      = vm->stack[recv_pos];
-                JsVal args_copy[16];
-                size_t c_argc = ARCR_MIN(argc, 16u);
-                for (size_t i = 0u; i < c_argc; ++i) args_copy[i] = vm->stack[recv_pos + 1u + i];
-                vm->sp = recv_pos;
-                JsVal res = vm_call_method(vm, recv, mname, args_copy, c_argc);
-                VM_PUSH(res);
-                break;
-            }
-            case OP_TRY_PUSH:
-                if (vm->try_depth < JS_MAX_TRY_DEPTH) {
-                    JsTryFrame *tf = &vm->try_stack[vm->try_depth++];
-                    tf->frame_depth = fdepth;
-                    tf->stack_sp    = vm->sp;
-                    tf->chunk       = fr->chunk;
-                    tf->env         = fr->env;
-                    tf->catch_ip    = (size_t)ins.arg;
+            break;
+        }
+        case 25: { /* drawImage(uid, op, srcUid, dx, dy, dw, dh) */
+            if (argc < 7) break;
+            uint32_t src_uid = (uint32_t)a0;
+            ArcrDomNode *sn = js_dom_find_uid(vm, src_uid);
+            if (sn && sn->surface && sn->surface->argb_pixels &&
+                sn->surface->width > 0 && sn->surface->height > 0) {
+                int32_t dx = (int32_t)a1, dy = (int32_t)a2;
+                int32_t dw = (a3 > 0.0) ? (int32_t)a3 : sn->surface->width;
+                int32_t dh = (a4 > 0.0) ? (int32_t)a4 : sn->surface->height;
+                for (int32_t y = 0; y < dh; ++y) {
+                    int32_t ty = dy + y;
+                    if (ty < 0 || ty >= surf->height) continue;
+                    int32_t sy = (int32_t)(((int64_t)y * sn->surface->height) / ARCR_MAX(1, dh));
+                    const uint32_t *srow = sn->surface->argb_pixels + (size_t)sy * (size_t)sn->surface->width;
+                    uint32_t *drow = surf->argb_pixels + (size_t)ty * (size_t)surf->width;
+                    for (int32_t x = 0; x < dw; ++x) {
+                        int32_t tx = dx + x;
+                        if (tx < 0 || tx >= surf->width) continue;
+                        int32_t sx = (int32_t)(((int64_t)x * sn->surface->width) / ARCR_MAX(1, dw));
+                        canvas_blend_px(&drow[tx], canvas_apply_alpha(srow[sx], c->cur.global_alpha));
+                    }
                 }
-                break;
-            case OP_TRY_POP:
-                if (vm->try_depth > saved_try_depth) --vm->try_depth;
-                break;
-            case OP_THROW:
-                vm->thrown_val    = VM_POP();
-                vm->has_exception = true;
-                break;
-            case OP_RETURN: {
-                JsVal rv = VM_POP();
-                vm->sp = fr->base_sp;
-                --fdepth;
-                if (fdepth == 0u) {
-                    if (out_ret) *out_ret = rv;
-                    vm->try_depth = saved_try_depth;
-                    return true;
-                }
-                VM_PUSH(rv);
-                break;
+                vm->host.doc->dom_dirty = true;
             }
-            case OP_HALT:
-                vm->sp        = entry_sp;
-                vm->try_depth = saved_try_depth;
-                if (out_ret) *out_ret = js_undef();
-                return true;
+            break;
         }
-    }
-
-    #undef VM_PUSH
-    #undef VM_POP
-    #undef VM_PEEK
-
-    vm->sp        = entry_sp;
-    vm->try_depth = saved_try_depth;
-    if (out_ret) *out_ret = js_undef();
-    return !vm->has_exception;
-}
-
-static bool vm_invoke_callable(ArcrJsVm *vm, JsVal callee, JsVal this_val,
-                               const JsVal *args, size_t argc, JsVal *out_ret) {
-    if (out_ret) *out_ret = js_undef();
-    if (callee.kind == JS_VAL_NATIVE_FN) {
-        JsVal r = vm_call_native_fn(vm, (JsNativeFnId)callee.as.u32, args, argc);
-        if (out_ret) *out_ret = r;
-        return !vm->has_exception;
-    }
-    if (callee.kind == JS_VAL_BUILTIN_OBJ) {
-        JsBuiltinId bid = (JsBuiltinId)callee.as.u32;
-        if (bid == JS_BUILTIN_NUMBER_CTOR) {
-            if (out_ret) *out_ret = (argc > 0u) ? js_num(js_to_number(args[0])) : js_num(0.0);
-            return true;
-        }
-        if (bid == JS_BUILTIN_STRING_CTOR) {
-            if (out_ret) *out_ret = (argc > 0u) ? js_to_string_val(vm, args[0]) : js_mk_str_n(vm, "", 0u);
-            return true;
-        }
-        if (bid == JS_BUILTIN_ARRAY_CTOR) {
-            JsArray *a = js_alloc_array(vm, (argc == 1u && args[0].kind == JS_VAL_NUMBER)
-                                                ? (size_t)ARCR_CLAMP((int32_t)args[0].as.num, 0, 4096) : argc);
-            if (a) {
-                if (argc == 1u && args[0].kind == JS_VAL_NUMBER) {
-                    int32_t cnt = ARCR_CLAMP((int32_t)args[0].as.num, 0, 4096);
-                    for (int32_t i = 0; i < cnt; ++i) js_array_push(vm, a, js_undef());
-                } else {
-                    for (size_t i = 0u; i < argc; ++i) js_array_push(vm, a, args[i]);
+        case 26: { /* toDataURL() */
+            uint8_t *png = NULL;
+            size_t png_len = 0u;
+            if (arcr_image_encode_png_mem(surf->argb_pixels, surf->width, surf->height,
+                                          surf->width, &png, &png_len) && png) {
+                char *uri = js_base64_encode_png_uri(png, png_len);
+                free(png);
+                if (uri) {
+                    JSValue v = JS_NewString(ctx, uri);
+                    free(uri);
+                    return v;
                 }
             }
-            if (out_ret) { out_ret->kind = JS_VAL_ARRAY; out_ret->as.arr = a; }
-            return true;
+            return JS_NewString(ctx, "data:image/png;base64,");
         }
-        if (bid == JS_BUILTIN_OBJECT_CTOR) {
-            JsObject *o = js_alloc_object(vm, 4u);
-            if (out_ret) { out_ret->kind = JS_VAL_OBJECT; out_ret->as.obj = o; }
-            return true;
-        }
-        return false;
+        default: break;
     }
-    if (callee.kind == JS_VAL_FUNCTION && callee.as.fn) {
-        JsChunk *ch = callee.as.fn->chunk;
-        size_t nslots = ARCR_MAX((size_t)ch->local_count, (size_t)ch->param_count);
-        JsEnv *env = alloc_env(vm, callee.as.fn->captured_env, nslots);
-        if (!env) return false;
-        for (size_t i = 0u; i < argc && i < ch->param_count; ++i) {
-            env->slots[i] = args[i];
-        }
-        return vm_run_frames(vm, ch, env, this_val, out_ret);
+    return JS_UNDEFINED;
+}
+
+static const JSCFunctionListEntry kBridgeFuncs[] = {
+    JS_CFUNC_DEF("allocNodeObj",     2, b_alloc_node_obj),
+    JS_CFUNC_DEF("nodeUidOf",        1, b_node_uid_of),
+    JS_CFUNC_DEF("nodeInfo",         1, b_node_info),
+    JS_CFUNC_DEF("docSpecialUids",   0, b_doc_special_uids),
+    JS_CFUNC_DEF("getTitle",         0, b_get_title),
+    JS_CFUNC_DEF("setTitle",         1, b_set_title),
+    JS_CFUNC_DEF("getById",          1, b_get_by_id),
+    JS_CFUNC_DEF("querySelector",    3, b_query_selector),
+    JS_CFUNC_DEF("getByTagOrCls",    3, b_get_by_tag_or_cls),
+    JS_CFUNC_DEF("matchesOrClosest", 3, b_matches_or_closest),
+    JS_CFUNC_DEF("contains",         2, b_contains),
+    JS_CFUNC_DEF("nav",              2, b_nav),
+    JS_CFUNC_DEF("childUids",        2, b_child_uids),
+    JS_CFUNC_DEF("ancestorChain",    1, b_ancestor_chain),
+    JS_CFUNC_DEF("createNode",       2, b_create_node),
+    JS_CFUNC_DEF("insertBefore",     3, b_insert_before),
+    JS_CFUNC_DEF("removeNode",       1, b_remove_node),
+    JS_CFUNC_DEF("cloneNode",        2, b_clone_node),
+    JS_CFUNC_DEF("getText",          1, b_get_text),
+    JS_CFUNC_DEF("setText",          2, b_set_text),
+    JS_CFUNC_DEF("getHtml",          2, b_get_html),
+    JS_CFUNC_DEF("setInnerHtml",     2, b_set_inner_html),
+    JS_CFUNC_DEF("attrOp",           4, b_attr_op),
+    JS_CFUNC_DEF("formState",        3, b_form_state),
+    JS_CFUNC_DEF("computedInfo",     1, b_computed_info),
+    JS_CFUNC_DEF("log",              1, b_console_log),
+    JS_CFUNC_DEF("envInfo",          0, b_env_info),
+    JS_CFUNC_DEF("navigate",         1, b_navigate),
+    JS_CFUNC_DEF("storageOp",        3, b_storage_op),
+    JS_CFUNC_DEF("httpFetch",        4, b_http_fetch),
+    JS_CFUNC_DEF("randomBytes",      1, b_random_bytes),
+    JS_CFUNC_DEF("clipboardOp",      2, b_clipboard_op),
+    JS_CFUNC_DEF("markDirty",        0, b_mark_dirty),
+    JS_CFUNC_DEF("canvasCmd",        9, b_canvas_cmd)
+};
+
+/* -------------------------------------------------------------------------
+ * 6. ES2026 Browser Web APIs Bootstrap (Chunked < 2400 chars for -Wpedantic)
+ * ------------------------------------------------------------------------- */
+static const char *const kWebBootstrapChunks[] = {
+    /* Chunk 0: Global aliases, Console & Event Hierarchy */
+    "(function(B){\n"
+    "'use strict';\n"
+    "const G = globalThis;\n"
+    "G.window = G; G.self = G; G.top = G; G.parent = G; G.frames = G;\n"
+    "const fmtVal = (v, depth = 0) => {\n"
+    "  if (v === undefined) return 'undefined';\n"
+    "  if (v === null) return 'null';\n"
+    "  if (typeof v === 'string') return depth > 0 ? JSON.stringify(v) : v;\n"
+    "  if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'bigint') return String(v);\n"
+    "  if (v instanceof Error) return (v.stack || (v.name + ': ' + v.message));\n"
+    "  if (typeof v === 'function') return '[Function ' + (v.name || 'anonymous') + ']';\n"
+    "  if (depth > 2) return '[Object]';\n"
+    "  if (Array.isArray(v)) return '[' + v.map(x => fmtVal(x, depth + 1)).join(', ') + ']';\n"
+    "  try { return JSON.stringify(v); } catch (_) { return String(v); }\n"
+    "};\n"
+    "const timersPerf = new Map();\n"
+    "const mkLog = (pfx) => (...args) => B.log((pfx ? pfx + ' ' : '') + args.map(a => fmtVal(a, 0)).join(' '));\n"
+    "G.console = {\n"
+    "  log: mkLog(''), info: mkLog('[INFO]'), warn: mkLog('[WARN]'),\n"
+    "  error: mkLog('[ERROR]'), debug: mkLog('[DEBUG]'), trace: mkLog('[TRACE]'),\n"
+    "  dir: (o) => B.log(fmtVal(o, 1)), clear: () => {}, group: mkLog('[GROUP]'), groupEnd: () => {},\n"
+    "  assert: (cond, ...rest) => { if (!cond) B.log('[ASSERT] ' + rest.map(a => fmtVal(a, 0)).join(' ')); },\n"
+    "  time: (l = 'default') => timersPerf.set(String(l), B.envInfo().nowMs),\n"
+    "  timeEnd: (l = 'default') => {\n"
+    "    const s = timersPerf.get(String(l)); timersPerf.delete(String(l));\n"
+    "    if (s !== undefined) B.log(l + ': ' + (B.envInfo().nowMs - s).toFixed(2) + 'ms');\n"
+    "  }\n"
+    "};\n",
+
+    /* Chunk 1: Event, CustomEvent, MouseEvent, KeyboardEvent, InputEvent, EventTarget */
+    "const evStore = new WeakMap();\n"
+    "class Event {\n"
+    "  constructor(type, init = {}) {\n"
+    "    this.type = String(type);\n"
+    "    this.bubbles = !!init.bubbles;\n"
+    "    this.cancelable = init.cancelable !== undefined ? !!init.cancelable : true;\n"
+    "    this.composed = !!init.composed;\n"
+    "    this.target = null; this.currentTarget = null; this.srcElement = null;\n"
+    "    this.eventPhase = 0; this.defaultPrevented = false; this.returnValue = true;\n"
+    "    this.isTrusted = false; this.timeStamp = B.envInfo().nowMs;\n"
+    "    this._stop = false; this._stopImm = false; this._path = [];\n"
+    "  }\n"
+    "  preventDefault() { if (this.cancelable) { this.defaultPrevented = true; this.returnValue = false; } }\n"
+    "  stopPropagation() { this._stop = true; }\n"
+    "  stopImmediatePropagation() { this._stop = true; this._stopImm = true; }\n"
+    "  composedPath() { return this._path.slice(); }\n"
+    "  initEvent(t, b, c) { this.type = String(t); this.bubbles = !!b; this.cancelable = !!c; }\n"
+    "}\n"
+    "Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;\n"
+    "class CustomEvent extends Event { constructor(t, i = {}) { super(t, i); this.detail = i.detail !== undefined ? i.detail : null; } }\n"
+    "class UIEvent extends Event { constructor(t, i = {}) { super(t, i); this.view = i.view || G; this.detail = i.detail || 0; } }\n"
+    "class MouseEvent extends UIEvent {\n"
+    "  constructor(t, i = {}) {\n"
+    "    super(t, i); this.clientX = i.clientX || 0; this.clientY = i.clientY || 0;\n"
+    "    this.pageX = this.clientX + (G.scrollX || 0); this.pageY = this.clientY + (G.scrollY || 0);\n"
+    "    this.screenX = this.clientX; this.screenY = this.clientY;\n"
+    "    this.button = i.button || 0; this.buttons = i.buttons || 0;\n"
+    "    this.ctrlKey = !!i.ctrlKey; this.shiftKey = !!i.shiftKey; this.altKey = !!i.altKey; this.metaKey = !!i.metaKey;\n"
+    "  }\n"
+    "}\n"
+    "class PointerEvent extends MouseEvent { constructor(t, i = {}) { super(t, i); this.pointerId = i.pointerId || 1; this.pointerType = i.pointerType || 'mouse'; } }\n"
+    "class KeyboardEvent extends UIEvent {\n"
+    "  constructor(t, i = {}) {\n"
+    "    super(t, i); this.key = i.key || ''; this.code = i.code || '';\n"
+    "    this.keyCode = i.keyCode || 0; this.which = i.which || this.keyCode;\n"
+    "    this.ctrlKey = !!i.ctrlKey; this.shiftKey = !!i.shiftKey; this.altKey = !!i.altKey; this.metaKey = !!i.metaKey;\n"
+    "  }\n"
+    "}\n"
+    "class InputEvent extends UIEvent { constructor(t, i = {}) { super(t, i); this.data = i.data !== undefined ? i.data : null; this.inputType = i.inputType || 'insertText'; } }\n"
+    "class FocusEvent extends UIEvent { constructor(t, i = {}) { super(t, i); this.relatedTarget = i.relatedTarget || null; } }\n"
+    "Object.assign(G, { Event, CustomEvent, UIEvent, MouseEvent, PointerEvent, KeyboardEvent, InputEvent, FocusEvent });\n",
+
+    /* Chunk 2: EventTarget & W3C Capture/Target/Bubble Dispatcher */
+    "const getListeners = (obj) => { let m = evStore.get(obj); if (!m) { m = new Map(); evStore.set(obj, m); } return m; };\n"
+    "class EventTarget {\n"
+    "  addEventListener(type, cb, opts) {\n"
+    "    if (!cb || (typeof cb !== 'function' && typeof cb.handleEvent !== 'function')) return;\n"
+    "    const t = String(type);\n"
+    "    const cap = typeof opts === 'boolean' ? opts : !!(opts && opts.capture);\n"
+    "    const once = !!(opts && typeof opts === 'object' && opts.once);\n"
+    "    const sig = (opts && typeof opts === 'object') ? opts.signal : null;\n"
+    "    if (sig && sig.aborted) return;\n"
+    "    const m = getListeners(this); let arr = m.get(t); if (!arr) { arr = []; m.set(t, arr); }\n"
+    "    if (arr.some(e => e.cb === cb && e.cap === cap)) return;\n"
+    "    const entry = { cb, cap, once };\n"
+    "    arr.push(entry);\n"
+    "    if (sig && typeof sig.addEventListener === 'function') {\n"
+    "      sig.addEventListener('abort', () => this.removeEventListener(t, cb, cap), { once: true });\n"
+    "    }\n"
+    "  }\n"
+    "  removeEventListener(type, cb, opts) {\n"
+    "    const cap = typeof opts === 'boolean' ? opts : !!(opts && opts.capture);\n"
+    "    const m = evStore.get(this); if (!m) return;\n"
+    "    const arr = m.get(String(type)); if (!arr) return;\n"
+    "    const idx = arr.findIndex(e => e.cb === cb && e.cap === cap);\n"
+    "    if (idx >= 0) arr.splice(idx, 1);\n"
+    "  }\n"
+    "  dispatchEvent(ev) { return runEventDispatch(this, ev).notCanceled; }\n"
+    "}\n"
+    "G.EventTarget = EventTarget;\n"
+    "G.addEventListener = EventTarget.prototype.addEventListener.bind(G);\n"
+    "G.removeEventListener = EventTarget.prototype.removeEventListener.bind(G);\n"
+    "G.dispatchEvent = EventTarget.prototype.dispatchEvent.bind(G);\n",
+
+    /* Chunk 3: Event propagation engine + inline on* attribute support */
+    "const uidMap = new Map();\n"
+    "let wrapUid = null;\n"
+    "const invokeOnTarget = (node, ev, phase) => {\n"
+    "  let ran = false;\n"
+    "  ev.currentTarget = node; ev.eventPhase = phase;\n"
+    "  const m = evStore.get(node);\n"
+    "  const list = m && m.get(ev.type) ? m.get(ev.type).slice() : [];\n"
+    "  for (const item of list) {\n"
+    "    if (phase === 1 && !item.cap) continue;\n"
+    "    if (phase === 3 && item.cap) continue;\n"
+    "    if (item.once) node.removeEventListener(ev.type, item.cb, item.cap);\n"
+    "    ran = true;\n"
+    "    try {\n"
+    "      if (typeof item.cb === 'function') item.cb.call(node, ev);\n"
+    "      else if (item.cb && typeof item.cb.handleEvent === 'function') item.cb.handleEvent(ev);\n"
+    "    } catch (err) { B.log('[Uncaught Event Error] ' + fmtVal(err)); }\n"
+    "    if (ev._stopImm) return ran;\n"
+    "  }\n"
+    "  if (phase !== 1) {\n"
+    "    const propName = 'on' + ev.type;\n"
+    "    const fnProp = node[propName];\n"
+    "    if (typeof fnProp === 'function') {\n"
+    "      ran = true;\n"
+    "      try { if (fnProp.call(node, ev) === false) ev.preventDefault(); }\n"
+    "      catch (err) { B.log('[Uncaught Handler Error] ' + fmtVal(err)); }\n"
+    "    } else if (node && typeof node.getAttribute === 'function') {\n"
+    "      const code = node.getAttribute(propName);\n"
+    "      if (code) {\n"
+    "        ran = true;\n"
+    "        try { const fn = new Function('event', code); if (fn.call(node, ev) === false) ev.preventDefault(); }\n"
+    "        catch (err) { B.log('[Uncaught Inline Handler] ' + fmtVal(err)); }\n"
+    "      }\n"
+    "    }\n"
+    "  }\n"
+    "  return ran;\n"
+    "};\n"
+    "const runEventDispatch = (target, ev) => {\n"
+    "  if (!ev || typeof ev.type !== 'string') return { handled: false, notCanceled: true };\n"
+    "  ev.target = target; ev.srcElement = target; ev._stop = false; ev._stopImm = false;\n"
+    "  const path = [];\n"
+    "  const tuid = B.nodeUidOf(target);\n"
+    "  if (tuid >= 0) {\n"
+    "    const chain = B.ancestorChain(tuid);\n"
+    "    for (let i = 0; i < chain.length; i++) { const w = wrapUid(chain[i]); if (w) path.push(w); }\n"
+    "    if (path[path.length - 1] !== G.document && G.document) path.push(G.document);\n"
+    "    path.push(G);\n"
+    "  } else { path.push(target); }\n"
+    "  ev._path = path;\n"
+    "  let handled = false;\n"
+    "  for (let i = path.length - 1; i >= 1; i--) {\n"
+    "    if (invokeOnTarget(path[i], ev, 1)) handled = true;\n"
+    "    if (ev._stop) break;\n"
+    "  }\n"
+    "  if (!ev._stop && path.length > 0) {\n"
+    "    if (invokeOnTarget(path[0], ev, 2)) handled = true;\n"
+    "  }\n"
+    "  if (ev.bubbles && !ev._stop) {\n"
+    "    for (let i = 1; i < path.length; i++) {\n"
+    "      if (invokeOnTarget(path[i], ev, 3)) handled = true;\n"
+    "      if (ev._stop) break;\n"
+    "    }\n"
+    "  }\n"
+    "  ev.currentTarget = null; ev.eventPhase = 0;\n"
+    "  return { handled, notCanceled: !ev.defaultPrevented };\n"
+    "};\n",
+
+    /* Chunk 4: NodeList, HTMLCollection, DOMTokenList, CSSStyleDeclaration & dataset Proxies */
+    "class NodeList {\n"
+    "  constructor(items = []) {\n"
+    "    this._items = items;\n"
+    "    return new Proxy(this, {\n"
+    "      get(t, p, r) {\n"
+    "        if (typeof p === 'string') {\n"
+    "          const n = Number(p);\n"
+    "          if (Number.isInteger(n) && n >= 0 && n < t._items.length) return t._items[n];\n"
+    "        }\n"
+    "        return Reflect.get(t, p, r);\n"
+    "      },\n"
+    "      has(t, p) {\n"
+    "        if (typeof p === 'string') { const n = Number(p); if (Number.isInteger(n) && n >= 0 && n < t._items.length) return true; }\n"
+    "        return Reflect.has(t, p);\n"
+    "      }\n"
+    "    });\n"
+    "  }\n"
+    "  get length() { return this._items.length; }\n"
+    "  item(i) { return this._items[i] || null; }\n"
+    "  forEach(cb, thisArg) { this._items.forEach((v, i) => cb.call(thisArg, v, i, this)); }\n"
+    "  entries() { return this._items.entries(); }\n"
+    "  keys() { return this._items.keys(); }\n"
+    "  values() { return this._items.values(); }\n"
+    "  [Symbol.iterator]() { return this._items[Symbol.iterator](); }\n"
+    "}\n"
+    "G.NodeList = NodeList; G.HTMLCollection = NodeList;\n"
+    "const camelToKebab = (s) => s.startsWith('--') ? s : s.replace(/[A-Z]/g, m => '-' + m.toLowerCase());\n"
+    "const kebabToCamel = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());\n"
+    "const parseInlineStyle = (raw) => {\n"
+    "  const map = new Map(); if (!raw) return map;\n"
+    "  for (const decl of String(raw).split(';')) {\n"
+    "    const idx = decl.indexOf(':'); if (idx <= 0) continue;\n"
+    "    const k = decl.slice(0, idx).trim(); const v = decl.slice(idx + 1).trim();\n"
+    "    if (k) map.set(k.startsWith('--') ? k : k.toLowerCase(), v);\n"
+    "  }\n"
+    "  return map;\n"
+    "};\n"
+    "const serializeInlineStyle = (map) => { const out = []; for (const [k, v] of map) { if (v !== '') out.push(k + ': ' + v); } return out.join('; '); };\n"
+    "const makeStyleProxy = (uid) => {\n"
+    "  const api = {\n"
+    "    get cssText() { return B.attrOp(uid, 0, 'style') || ''; },\n"
+    "    set cssText(v) { B.attrOp(uid, 1, 'style', String(v || '')); },\n"
+    "    getPropertyValue(p) { const m = parseInlineStyle(B.attrOp(uid, 0, 'style')); return m.get(camelToKebab(String(p))) || ''; },\n"
+    "    setProperty(p, v, prio) {\n"
+    "      const m = parseInlineStyle(B.attrOp(uid, 0, 'style')); const k = camelToKebab(String(p));\n"
+    "      if (v === null || v === undefined || v === '') m.delete(k);\n"
+    "      else m.set(k, String(v) + (prio === 'important' ? ' !important' : ''));\n"
+    "      B.attrOp(uid, 1, 'style', serializeInlineStyle(m));\n"
+    "    },\n"
+    "    removeProperty(p) {\n"
+    "      const m = parseInlineStyle(B.attrOp(uid, 0, 'style')); const k = camelToKebab(String(p));\n"
+    "      const old = m.get(k) || ''; m.delete(k); B.attrOp(uid, 1, 'style', serializeInlineStyle(m)); return old;\n"
+    "    }\n"
+    "  };\n"
+    "  return new Proxy(api, {\n"
+    "    get(t, p) { if (p in t || typeof p === 'symbol') return t[p]; return t.getPropertyValue(String(p)); },\n"
+    "    set(t, p, v) { if (p === 'cssText') { t.cssText = v; return true; } t.setProperty(String(p), v); return true; }\n"
+    "  });\n"
+    "};\n",
+
+    /* Chunk 5: DOMTokenList & dataset Proxy + Node class */
+    "class DOMTokenList {\n"
+    "  constructor(uid) { this._u = uid; }\n"
+    "  _list() { const c = B.attrOp(this._u, 0, 'class') || ''; return c.trim() ? c.trim().split(/\\s+/) : []; }\n"
+    "  _save(arr) { B.attrOp(this._u, 1, 'class', arr.join(' ')); }\n"
+    "  get length() { return this._list().length; }\n"
+    "  get value() { return B.attrOp(this._u, 0, 'class') || ''; }\n"
+    "  set value(v) { B.attrOp(this._u, 1, 'class', String(v)); }\n"
+    "  item(i) { return this._list()[i] || null; }\n"
+    "  contains(tok) { return this._list().includes(String(tok)); }\n"
+    "  add(...toks) { const s = this._list(); for (const t of toks) { const k = String(t); if (k && !s.includes(k)) s.push(k); } this._save(s); }\n"
+    "  remove(...toks) { const rem = new Set(toks.map(String)); this._save(this._list().filter(x => !rem.has(x))); }\n"
+    "  toggle(tok, force) {\n"
+    "    const k = String(tok); const has = this.contains(k);\n"
+    "    const want = force !== undefined ? !!force : !has;\n"
+    "    if (want) this.add(k); else this.remove(k); return want;\n"
+    "  }\n"
+    "  replace(oldT, newT) { const s = this._list(); const i = s.indexOf(String(oldT)); if (i < 0) return false; s[i] = String(newT); this._save(s); return true; }\n"
+    "  forEach(cb, thisArg) { this._list().forEach((v, i) => cb.call(thisArg, v, i, this)); }\n"
+    "  toString() { return this.value; }\n"
+    "  [Symbol.iterator]() { return this._list()[Symbol.iterator](); }\n"
+    "}\n"
+    "const makeDatasetProxy = (uid) => new Proxy({}, {\n"
+    "  get(_, p) { if (typeof p !== 'string') return undefined; const v = B.attrOp(uid, 0, 'data-' + camelToKebab(p)); return v === null ? undefined : v; },\n"
+    "  set(_, p, v) { if (typeof p === 'string') B.attrOp(uid, 1, 'data-' + camelToKebab(p), String(v)); return true; },\n"
+    "  has(_, p) { return typeof p === 'string' && B.attrOp(uid, 2, 'data-' + camelToKebab(p)); },\n"
+    "  deleteProperty(_, p) { if (typeof p === 'string') B.attrOp(uid, 4, 'data-' + camelToKebab(p)); return true; },\n"
+    "  ownKeys() { return B.attrOp(uid, 3).filter(n => n.startsWith('data-')).map(n => kebabToCamel(n.slice(5))); },\n"
+    "  getOwnPropertyDescriptor(_, p) {\n"
+    "    if (typeof p === 'string' && B.attrOp(uid, 2, 'data-' + camelToKebab(p))) {\n"
+    "      return { configurable: true, enumerable: true, writable: true, value: B.attrOp(uid, 0, 'data-' + camelToKebab(p)) };\n"
+    "    }\n"
+    "    return undefined;\n"
+    "  }\n"
+    "});\n",
+
+    /* Chunk 6: Node & Element classes */
+    "class Node extends EventTarget {\n"
+    "  get _uid() { return B.nodeUidOf(this); }\n"
+    "  get nodeType() { const i = B.nodeInfo(this._uid); return i ? i.nodeType : 1; }\n"
+    "  get nodeName() { const i = B.nodeInfo(this._uid); if (!i) return ''; return i.nodeType === 1 ? i.tag.toUpperCase() : i.tag; }\n"
+    "  get isConnected() { const i = B.nodeInfo(this._uid); return !!(i && i.connected); }\n"
+    "  get ownerDocument() { return this.nodeType === 9 ? null : G.document; }\n"
+    "  get parentNode() { return wrapUid(B.nav(this._uid, 0)); }\n"
+    "  get parentElement() { return wrapUid(B.nav(this._uid, 1)); }\n"
+    "  get firstChild() { return wrapUid(B.nav(this._uid, 2)); }\n"
+    "  get lastChild() { return wrapUid(B.nav(this._uid, 3)); }\n"
+    "  get nextSibling() { return wrapUid(B.nav(this._uid, 6)); }\n"
+    "  get previousSibling() { return wrapUid(B.nav(this._uid, 7)); }\n"
+    "  get childNodes() { return new NodeList(B.childUids(this._uid, false).map(wrapUid).filter(Boolean)); }\n"
+    "  hasChildNodes() { return B.nav(this._uid, 2) !== 0; }\n"
+    "  get textContent() { return B.getText(this._uid); }\n"
+    "  set textContent(v) { B.setText(this._uid, v === null || v === undefined ? '' : String(v)); }\n"
+    "  get nodeValue() { const t = this.nodeType; return (t === 3 || t === 8) ? B.getText(this._uid) : null; }\n"
+    "  set nodeValue(v) { const t = this.nodeType; if (t === 3 || t === 8) B.setText(this._uid, String(v ?? '')); }\n"
+    "  appendChild(ch) { if (ch) B.insertBefore(this._uid, ch._uid, 0); return ch; }\n"
+    "  insertBefore(ch, ref) { if (ch) B.insertBefore(this._uid, ch._uid, ref ? ref._uid : 0); return ch; }\n"
+    "  removeChild(ch) { if (ch) B.removeNode(ch._uid); return ch; }\n"
+    "  replaceChild(nw, old) { if (nw && old) { B.insertBefore(this._uid, nw._uid, old._uid); B.removeNode(old._uid); } return old; }\n"
+    "  cloneNode(deep = false) { return wrapUid(B.cloneNode(this._uid, !!deep)); }\n"
+    "  contains(other) { return !!(other && B.contains(this._uid, other._uid)); }\n"
+    "  getRootNode() { return this.isConnected ? G.document : this; }\n"
+    "}\n"
+    "Node.ELEMENT_NODE = 1; Node.TEXT_NODE = 3; Node.COMMENT_NODE = 8; Node.DOCUMENT_NODE = 9; Node.DOCUMENT_FRAGMENT_NODE = 11;\n"
+    "G.Node = Node;\n",
+
+    /* Chunk 7: Element, HTMLElement, HTMLCanvasElement, HTMLMediaElement */
+    "const coerceNode = (x) => (x instanceof Node) ? x : wrapUid(B.createNode(3, String(x)));\n"
+    "class Element extends Node {\n"
+    "  get tagName() { const i = B.nodeInfo(this._uid); return i ? i.tag.toUpperCase() : 'DIV'; }\n"
+    "  get localName() { const i = B.nodeInfo(this._uid); return i ? i.tag : 'div'; }\n"
+    "  get id() { return B.attrOp(this._uid, 0, 'id') || ''; }\n"
+    "  set id(v) { B.attrOp(this._uid, 1, 'id', String(v)); }\n"
+    "  get className() { return B.attrOp(this._uid, 0, 'class') || ''; }\n"
+    "  set className(v) { B.attrOp(this._uid, 1, 'class', String(v ?? '')); }\n"
+    "  get classList() { if (!this._cl) this._cl = new DOMTokenList(this._uid); return this._cl; }\n"
+    "  get innerHTML() { return B.getHtml(this._uid, false); }\n"
+    "  set innerHTML(v) { B.setInnerHtml(this._uid, String(v ?? '')); notifyMutations(); }\n"
+    "  get outerHTML() { return B.getHtml(this._uid, true); }\n"
+    "  set outerHTML(v) {\n"
+    "    const p = this.parentNode; if (!p) return;\n"
+    "    const f = wrapUid(B.createNode(11, '')); B.setInnerHtml(f._uid, String(v ?? ''));\n"
+    "    p.insertBefore(f, this); B.removeNode(this._uid); notifyMutations();\n"
+    "  }\n"
+    "  insertAdjacentHTML(pos, html) {\n"
+    "    const p = String(pos).toLowerCase(); const f = wrapUid(B.createNode(11, '')); B.setInnerHtml(f._uid, String(html ?? ''));\n"
+    "    if (p === 'beforeend') this.appendChild(f);\n"
+    "    else if (p === 'afterbegin') this.insertBefore(f, this.firstChild);\n"
+    "    else if (p === 'beforebegin' && this.parentNode) this.parentNode.insertBefore(f, this);\n"
+    "    else if (p === 'afterend' && this.parentNode) this.parentNode.insertBefore(f, this.nextSibling);\n"
+    "    notifyMutations();\n"
+    "  }\n"
+    "  insertAdjacentElement(pos, el) {\n"
+    "    const p = String(pos).toLowerCase();\n"
+    "    if (p === 'beforeend') this.appendChild(el);\n"
+    "    else if (p === 'afterbegin') this.insertBefore(el, this.firstChild);\n"
+    "    else if (p === 'beforebegin' && this.parentNode) this.parentNode.insertBefore(el, this);\n"
+    "    else if (p === 'afterend' && this.parentNode) this.parentNode.insertBefore(el, this.nextSibling);\n"
+    "    return el;\n"
+    "  }\n"
+    "  getAttribute(n) { return B.attrOp(this._uid, 0, String(n)); }\n",
+    "  setAttribute(n, v) { B.attrOp(this._uid, 1, String(n), String(v)); notifyMutations(); }\n"
+    "  hasAttribute(n) { return B.attrOp(this._uid, 2, String(n)); }\n"
+    "  removeAttribute(n) { B.attrOp(this._uid, 4, String(n)); notifyMutations(); }\n"
+    "  toggleAttribute(n, force) {\n"
+    "    const has = this.hasAttribute(n); const want = force !== undefined ? !!force : !has;\n"
+    "    if (want) this.setAttribute(n, ''); else this.removeAttribute(n); return want;\n"
+    "  }\n"
+    "  getAttributeNames() { return B.attrOp(this._uid, 3); }\n"
+    "  get attributes() { return B.attrOp(this._uid, 3).map(name => ({ name, value: this.getAttribute(name) })); }\n"
+    "  querySelector(s) { const u = B.querySelector(this._uid, String(s), true); return u.length ? wrapUid(u[0]) : null; }\n"
+    "  querySelectorAll(s) { return new NodeList(B.querySelector(this._uid, String(s), false).map(wrapUid).filter(Boolean)); }\n"
+    "  getElementsByTagName(t) { return new NodeList(B.getByTagOrCls(this._uid, true, String(t)).map(wrapUid).filter(Boolean)); }\n"
+    "  getElementsByClassName(c) { return new NodeList(B.getByTagOrCls(this._uid, false, String(c)).map(wrapUid).filter(Boolean)); }\n"
+    "  matches(s) { return B.matchesOrClosest(this._uid, String(s), false) !== 0; }\n"
+    "  closest(s) { return wrapUid(B.matchesOrClosest(this._uid, String(s), true)); }\n"
+    "  get children() { return new NodeList(B.childUids(this._uid, true).map(wrapUid).filter(Boolean)); }\n"
+    "  get childElementCount() { return B.childUids(this._uid, true).length; }\n"
+    "  get firstElementChild() { return wrapUid(B.nav(this._uid, 4)); }\n"
+    "  get lastElementChild() { return wrapUid(B.nav(this._uid, 5)); }\n"
+    "  get nextElementSibling() { return wrapUid(B.nav(this._uid, 8)); }\n"
+    "  get previousElementSibling() { return wrapUid(B.nav(this._uid, 9)); }\n"
+    "  append(...ns) { for (const n of ns) this.appendChild(coerceNode(n)); notifyMutations(); }\n"
+    "  prepend(...ns) { const f = this.firstChild; for (const n of ns) this.insertBefore(coerceNode(n), f); notifyMutations(); }\n"
+    "  before(...ns) { const p = this.parentNode; if (p) for (const n of ns) p.insertBefore(coerceNode(n), this); }\n"
+    "  after(...ns) { const p = this.parentNode, nx = this.nextSibling; if (p) for (const n of ns) p.insertBefore(coerceNode(n), nx); }\n"
+    "  replaceWith(...ns) { this.before(...ns); this.remove(); }\n"
+    "  remove() { B.removeNode(this._uid); notifyMutations(); }\n"
+    "  getBoundingClientRect() {\n"
+    "    const c = B.computedInfo(this._uid);\n"
+    "    return { x: 0, y: 0, top: 0, left: 0, width: c.width, height: c.height, right: c.width, bottom: c.height, toJSON() { return this; } };\n"
+    "  }\n"
+    "  getClientRects() { return [this.getBoundingClientRect()]; }\n"
+    "  scrollIntoView() {}\n"
+    "  attachShadow() { if (!this._sr) this._sr = this; return this._sr; }\n"
+    "  get shadowRoot() { return this._sr || null; }\n"
+    "}\n",
+
+    /* Chunk 8: HTMLElement, HTMLCanvasElement, CanvasRenderingContext2D, HTMLMediaElement */
+    "class HTMLElement extends Element {\n"
+    "  get style() { if (!this._st) this._st = makeStyleProxy(this._uid); return this._st; }\n"
+    "  set style(v) { this.style.cssText = String(v ?? ''); }\n"
+    "  get dataset() { if (!this._ds) this._ds = makeDatasetProxy(this._uid); return this._ds; }\n"
+    "  get innerText() { return this.textContent; }\n"
+    "  set innerText(v) { this.textContent = v; }\n"
+    "  get value() { return B.formState(this._uid, 0); }\n"
+    "  set value(v) { B.formState(this._uid, 1, String(v ?? '')); }\n"
+    "  get checked() { return B.formState(this._uid, 2); }\n"
+    "  set checked(v) { B.formState(this._uid, 3, !!v); }\n"
+    "  get disabled() { return this.hasAttribute('disabled'); }\n"
+    "  set disabled(v) { if (v) this.setAttribute('disabled', ''); else this.removeAttribute('disabled'); }\n"
+    "  get hidden() { return this.hasAttribute('hidden'); }\n"
+    "  set hidden(v) { if (v) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); }\n"
+    "  get href() { return this.getAttribute('href') || ''; }\n"
+    "  set href(v) { this.setAttribute('href', v); }\n"
+    "  get src() { return this.getAttribute('src') || ''; }\n"
+    "  set src(v) { this.setAttribute('src', v); }\n"
+    "  get type() { return this.getAttribute('type') || ''; }\n"
+    "  set type(v) { this.setAttribute('type', v); }\n"
+    "  get name() { return this.getAttribute('name') || ''; }\n"
+    "  set name(v) { this.setAttribute('name', v); }\n"
+    "  get offsetWidth() { return B.computedInfo(this._uid).width; }\n"
+    "  get offsetHeight() { return B.computedInfo(this._uid).height; }\n"
+    "  get clientWidth() { return this.offsetWidth; }\n"
+    "  get clientHeight() { return this.offsetHeight; }\n"
+    "  get scrollWidth() { return this.offsetWidth; }\n"
+    "  get scrollHeight() { return this.offsetHeight; }\n"
+    "  focus() { B.formState(this._uid, 4, true); this.dispatchEvent(new FocusEvent('focus')); }\n"
+    "  blur() { B.formState(this._uid, 4, false); this.dispatchEvent(new FocusEvent('blur')); }\n"
+    "  click() { this.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); }\n"
+    "}\n"
+    "class CanvasGradient {\n"
+    "  constructor(id) { this._gid = id; }\n"
+    "  addColorStop(off, col) { B.canvasCmd(0, 101, this._gid, Number(off), String(col)); }\n"
+    "}\n"
+    "class ImageData {\n"
+    "  constructor(a, b, c) {\n"
+    "    if (a instanceof Uint8ClampedArray) { this.data = a; this.width = b | 0; this.height = (c || (a.length / (4 * this.width))) | 0; }\n"
+    "    else { this.width = a | 0; this.height = b | 0; this.data = new Uint8ClampedArray(this.width * this.height * 4); }\n"
+    "  }\n"
+    "}\n"
+    "G.CanvasGradient = CanvasGradient; G.ImageData = ImageData;\n",
+
+    /* Chunk 9: CanvasRenderingContext2D, HTMLCanvasElement & HTMLMediaElement */
+    "class CanvasRenderingContext2D {\n"
+    "  constructor(canvas) {\n"
+    "    this.canvas = canvas; this._u = canvas._uid;\n"
+    "    this._fill = '#000000'; this._stroke = '#000000'; this._lw = 1; this._ga = 1;\n"
+    "    this._font = '14px sans-serif'; this.textAlign = 'start'; this.textBaseline = 'alphabetic';\n"
+    "    this.lineCap = 'butt'; this.lineJoin = 'miter'; this.globalCompositeOperation = 'source-over';\n"
+    "  }\n"
+    "  get fillStyle() { return this._fill; }\n"
+    "  set fillStyle(v) { this._fill = v; B.canvasCmd(this._u, 1, false, v instanceof CanvasGradient ? v._gid : String(v)); }\n"
+    "  get strokeStyle() { return this._stroke; }\n"
+    "  set strokeStyle(v) { this._stroke = v; B.canvasCmd(this._u, 1, true, v instanceof CanvasGradient ? v._gid : String(v)); }\n"
+    "  get lineWidth() { return this._lw; }\n"
+    "  set lineWidth(v) { this._lw = Number(v); B.canvasCmd(this._u, 2, this._lw); }\n"
+    "  get globalAlpha() { return this._ga; }\n"
+    "  set globalAlpha(v) { this._ga = Number(v); B.canvasCmd(this._u, 3, this._ga); }\n"
+    "  get font() { return this._font; }\n"
+    "  set font(v) { this._font = String(v); B.canvasCmd(this._u, 4, this._font); }\n"
+    "  save() { B.canvasCmd(this._u, 5); }\n"
+    "  restore() { B.canvasCmd(this._u, 6); }\n"
+    "  translate(x, y) { B.canvasCmd(this._u, 7, +x, +y); }\n"
+    "  scale(x, y) { B.canvasCmd(this._u, 8, +x, +y); }\n"
+    "  rotate(a) { B.canvasCmd(this._u, 9, +a); }\n"
+    "  setTransform(a, b, c, d, e, f) { B.canvasCmd(this._u, 10, +a, +b, +c, +d, +e, +f); }\n"
+    "  resetTransform() { this.setTransform(1, 0, 0, 1, 0, 0); }\n"
+    "  clearRect(x, y, w, h) { B.canvasCmd(this._u, 11, +x, +y, +w, +h); }\n"
+    "  fillRect(x, y, w, h) { B.canvasCmd(this._u, 12, +x, +y, +w, +h); }\n"
+    "  strokeRect(x, y, w, h) { B.canvasCmd(this._u, 13, +x, +y, +w, +h); }\n"
+    "  beginPath() { B.canvasCmd(this._u, 14); }\n"
+    "  moveTo(x, y) { B.canvasCmd(this._u, 15, +x, +y); }\n"
+    "  lineTo(x, y) { B.canvasCmd(this._u, 16, +x, +y); }\n",
+    "  closePath() { B.canvasCmd(this._u, 17); }\n"
+    "  rect(x, y, w, h) { B.canvasCmd(this._u, 18, +x, +y, +w, +h); }\n"
+    "  roundRect(x, y, w, h) { this.rect(x, y, w, h); }\n"
+    "  arc(x, y, r, s, e, ccw = false) { B.canvasCmd(this._u, 19, +x, +y, +r, +s, +e, !!ccw); }\n"
+    "  quadraticCurveTo(cx, cy, x, y) { this.lineTo(cx, cy); this.lineTo(x, y); }\n"
+    "  bezierCurveTo(c1x, c1y, c2x, c2y, x, y) { this.lineTo(c1x, c1y); this.lineTo(c2x, c2y); this.lineTo(x, y); }\n"
+    "  fill() { B.canvasCmd(this._u, 20); }\n"
+    "  stroke() { B.canvasCmd(this._u, 21); }\n"
+    "  clip() {}\n"
+    "  fillText(t, x, y) { B.canvasCmd(this._u, 22, false, String(t), +x, +y); }\n"
+    "  strokeText(t, x, y) { this.fillText(t, x, y); }\n"
+    "  measureText(t) { const w = B.canvasCmd(this._u, 22, true, String(t), 0, 0) || 0; return { width: w, actualBoundingBoxAscent: 12, actualBoundingBoxDescent: 3 }; }\n"
+    "  createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient(B.canvasCmd(0, 100, false, +x0, +y0, 0, +x1, +y1, 0)); }\n"
+    "  createRadialGradient(x0, y0, r0, x1, y1, r1) { return new CanvasGradient(B.canvasCmd(0, 100, true, +x0, +y0, +r0, +x1, +y1, +r1)); }\n"
+    "  createImageData(w, h) { return new ImageData(w, h); }\n"
+    "  getImageData(x, y, w, h) { const ab = B.canvasCmd(this._u, 23, +x, +y, +w, +h); return new ImageData(new Uint8ClampedArray(ab || (w * h * 4)), w, h); }\n"
+    "  putImageData(id, dx, dy) { if (id && id.data) B.canvasCmd(this._u, 24, id.data, +dx, +dy, id.width, id.height); }\n"
+    "  drawImage(img, dx, dy, dw, dh) { if (img && img._uid) B.canvasCmd(this._u, 25, img._uid, +dx, +dy, dw || 0, dh || 0); }\n"
+    "}\n"
+    "class HTMLCanvasElement extends HTMLElement {\n"
+    "  get width() { return Number(this.getAttribute('width')) || 300; }\n"
+    "  set width(v) { const n = Math.max(1, v | 0); this.setAttribute('width', String(n)); B.canvasCmd(this._uid, 0, n, this.height); }\n"
+    "  get height() { return Number(this.getAttribute('height')) || 150; }\n"
+    "  set height(v) { const n = Math.max(1, v | 0); this.setAttribute('height', String(n)); B.canvasCmd(this._uid, 0, this.width, n); }\n"
+    "  getContext(type) {\n"
+    "    if (String(type).toLowerCase() !== '2d') return null;\n"
+    "    if (!this._ctx2d) { B.canvasCmd(this._uid, 0, this.width, this.height); this._ctx2d = new CanvasRenderingContext2D(this); }\n"
+    "    return this._ctx2d;\n"
+    "  }\n"
+    "  toDataURL() { return B.canvasCmd(this._uid, 26); }\n"
+    "}\n"
+    "class HTMLMediaElement extends HTMLElement {\n"
+    "  constructor() { super(); }\n"
+    "  get paused() { return this._paused !== undefined ? this._paused : false; }\n"
+    "  get currentTime() { return this._ct || 0; }\n"
+    "  set currentTime(v) { this._ct = Math.max(0, Number(v) || 0); this.setAttribute('data-arcr-seek', String(this._ct)); B.markDirty(); }\n"
+    "  get duration() { return 180; }\n"
+    "  get volume() { return this._vol !== undefined ? this._vol : 1; }\n"
+    "  set volume(v) { this._vol = Math.min(1, Math.max(0, Number(v) || 0)); }\n"
+    "  get muted() { return !!this._muted; }\n"
+    "  set muted(v) { this._muted = !!v; }\n"
+    "  get readyState() { return 4; }\n"
+    "  play() { this._paused = false; this.setAttribute('data-arcr-paused', '0'); B.markDirty(); this.dispatchEvent(new Event('play')); return Promise.resolve(); }\n"
+    "  pause() { this._paused = true; this.setAttribute('data-arcr-paused', '1'); B.markDirty(); this.dispatchEvent(new Event('pause')); }\n"
+    "  load() { B.markDirty(); }\n"
+    "  canPlayType(t) { const s = String(t || '').toLowerCase(); return (s.includes('mp4') || s.includes('webm') || s.includes('ogg') || s.includes('mpeg')) ? 'probably' : 'maybe'; }\n"
+    "}\n"
+    "Object.assign(G, { Element, HTMLElement, HTMLCanvasElement, CanvasRenderingContext2D, HTMLMediaElement });\n"
+};
+
+static const char *const kWebBootstrapChunks2[] = {
+    /* Chunk 10: DocumentFragment, Document, wrapUid & CustomElementRegistry */
+    "class DocumentFragment extends Element {}\n"
+    "const ceMap = new Map();\n"
+    "const ceWait = new Map();\n"
+    "G.customElements = {\n"
+    "  define(name, ctor) {\n"
+    "    const k = String(name).toLowerCase(); ceMap.set(k, ctor);\n"
+    "    const w = ceWait.get(k); if (w) { ceWait.delete(k); w.forEach(r => r(ctor)); }\n"
+    "  },\n"
+    "  get(name) { return ceMap.get(String(name).toLowerCase()); },\n"
+    "  whenDefined(name) {\n"
+    "    const k = String(name).toLowerCase();\n"
+    "    if (ceMap.has(k)) return Promise.resolve(ceMap.get(k));\n"
+    "    return new Promise(res => { let a = ceWait.get(k); if (!a) { a = []; ceWait.set(k, a); } a.push(res); });\n"
+    "  },\n"
+    "  upgrade() {}\n"
+    "};\n"
+    "let docReadyState = 'interactive';\n"
+    "let docCookie = '';\n"
+    "class Document extends Element {\n"
+    "  get documentElement() { const s = B.docSpecialUids(); return s ? wrapUid(s.html) : null; }\n"
+    "  get head() { const s = B.docSpecialUids(); return s ? wrapUid(s.head) : null; }\n"
+    "  get body() { const s = B.docSpecialUids(); return s ? wrapUid(s.body) : null; }\n"
+    "  get scrollingElement() { return this.documentElement || this.body; }\n"
+    "  get activeElement() { const s = B.docSpecialUids(); return s ? wrapUid(s.active) : this.body; }\n"
+    "  get title() { return B.getTitle(); }\n"
+    "  set title(v) { B.setTitle(String(v ?? '')); }\n"
+    "  get readyState() { return docReadyState; }\n"
+    "  get visibilityState() { return 'visible'; }\n"
+    "  get hidden() { return false; }\n"
+    "  get cookie() { return docCookie; }\n"
+    "  set cookie(v) { const kv = String(v || '').split(';')[0].trim(); if (kv) docCookie = docCookie ? (docCookie + '; ' + kv) : kv; }\n"
+    "  get defaultView() { return G; }\n"
+    "  get location() { return G.location; }\n"
+    "  get URL() { return G.location.href; }\n"
+    "  get documentURI() { return G.location.href; }\n"
+    "  get characterSet() { return 'UTF-8'; }\n"
+    "  get compatMode() { return 'CSS1Compat'; }\n"
+    "  get currentScript() { return null; }\n"
+    "  get implementation() { return { createHTMLDocument: (t = '') => { const f = wrapUid(B.createNode(11, '')); f.title = t; return f; }, hasFeature: () => true }; }\n"
+    "  getElementById(id) { return wrapUid(B.getById(String(id))); }\n"
+    "  getElementsByName(n) { return this.querySelectorAll('[name=\"' + String(n).replace(/\"/g, '') + '\"]'); }\n"
+    "  createElement(tag) { return wrapUid(B.createNode(1, String(tag))); }\n"
+    "  createElementNS(_ns, tag) { const t = String(tag); const c = t.indexOf(':'); return wrapUid(B.createNode(1, c >= 0 ? t.slice(c + 1) : t)); }\n"
+    "  createTextNode(s) { return wrapUid(B.createNode(3, String(s ?? ''))); }\n"
+    "  createComment(s) { return wrapUid(B.createNode(8, String(s ?? ''))); }\n"
+    "  createDocumentFragment() { return wrapUid(B.createNode(11, '')); }\n"
+    "  createEvent() { return new Event(''); }\n"
+    "  importNode(n, deep = false) { return n ? n.cloneNode(deep) : null; }\n"
+    "  adoptNode(n) { return n; }\n"
+    "}\n"
+    "wrapUid = (uid) => {\n"
+    "  if (!uid) return null;\n"
+    "  const ex = uidMap.get(uid); if (ex) return ex;\n"
+    "  const info = B.nodeInfo(uid); if (!info) return null;\n"
+    "  let proto = Node.prototype;\n"
+    "  if (info.nodeType === 9) proto = Document.prototype;\n"
+    "  else if (info.nodeType === 11) proto = DocumentFragment.prototype;\n"
+    "  else if (info.nodeType === 1) {\n"
+    "    if (info.tag === 'canvas') proto = HTMLCanvasElement.prototype;\n"
+    "    else if (info.tag === 'video' || info.tag === 'audio') proto = HTMLMediaElement.prototype;\n"
+    "    else if (ceMap.has(info.tag)) proto = ceMap.get(info.tag).prototype || HTMLElement.prototype;\n"
+    "    else proto = HTMLElement.prototype;\n"
+    "  }\n"
+    "  const obj = B.allocNodeObj(uid, proto);\n"
+    "  uidMap.set(uid, obj);\n"
+    "  return obj;\n"
+    "};\n"
+    "Object.assign(G, { Document, DocumentFragment, HTMLImageElement: HTMLElement, Image: function(w, h) { const i = G.document.createElement('img'); if (w) i.setAttribute('width', w); if (h) i.setAttribute('height', h); return i; } });\n",
+
+    /* Chunk 11: Observers, Timers, rAF & Microtasks */
+    "const mutObservers = new Set();\n"
+    "let mutPending = false;\n"
+    "const notifyMutations = () => {\n"
+    "  if (mutObservers.size === 0 || mutPending) return;\n"
+    "  mutPending = true;\n"
+    "  Promise.resolve().then(() => {\n"
+    "    mutPending = false;\n"
+    "    for (const mo of mutObservers) {\n"
+    "      if (mo._target) { try { mo._cb([{ type: 'childList', target: mo._target, addedNodes: [], removedNodes: [] }], mo); } catch (_) {} }\n"
+    "    }\n"
+    "  });\n"
+    "};\n"
+    "class MutationObserver {\n"
+    "  constructor(cb) { this._cb = cb; this._target = null; }\n"
+    "  observe(target) { this._target = target; mutObservers.add(this); }\n"
+    "  disconnect() { this._target = null; mutObservers.delete(this); }\n"
+    "  takeRecords() { return []; }\n"
+    "}\n"
+    "class ResizeObserver {\n"
+    "  constructor(cb) { this._cb = cb; }\n"
+    "  observe(el) { if (el) Promise.resolve().then(() => { try { const r = el.getBoundingClientRect(); this._cb([{ target: el, contentRect: r }], this); } catch (_) {} }); }\n"
+    "  unobserve() {} disconnect() {}\n"
+    "}\n"
+    "class IntersectionObserver {\n"
+    "  constructor(cb, opts = {}) { this._cb = cb; this.root = opts.root || null; this.rootMargin = opts.rootMargin || '0px'; this.thresholds = [0]; }\n"
+    "  observe(el) {\n"
+    "    if (el) Promise.resolve().then(() => {\n"
+    "      try { const r = el.getBoundingClientRect(); this._cb([{ target: el, isIntersecting: true, intersectionRatio: 1, boundingClientRect: r, intersectionRect: r, rootBounds: null, time: B.envInfo().nowMs }], this); } catch (_) {}\n"
+    "    });\n"
+    "  }\n"
+    "  unobserve() {} disconnect() {} takeRecords() { return []; }\n"
+    "}\n"
+    "Object.assign(G, { MutationObserver, ResizeObserver, IntersectionObserver });\n"
+    "let nextTimerId = 1;\n"
+    "const timerMap = new Map();\n"
+    "const rafMap = new Map();\n"
+    "G.queueMicrotask = (cb) => { Promise.resolve().then(() => { if (typeof cb === 'function') cb(); }); };\n"
+    "G.setTimeout = (fn, delay = 0, ...args) => {\n"
+    "  const id = nextTimerId++;\n"
+    "  const due = B.envInfo().nowMs + Math.max(0, Number(delay) || 0);\n"
+    "  timerMap.set(id, { id, fn, args, due, interval: -1 });\n"
+    "  return id;\n"
+    "};\n"
+    "G.setInterval = (fn, delay = 0, ...args) => {\n"
+    "  const id = nextTimerId++; const ms = Math.max(4, Number(delay) || 4);\n"
+    "  timerMap.set(id, { id, fn, args, due: B.envInfo().nowMs + ms, interval: ms });\n"
+    "  return id;\n"
+    "};\n"
+    "G.clearTimeout = (id) => { timerMap.delete(Number(id)); };\n"
+    "G.clearInterval = G.clearTimeout;\n"
+    "G.requestAnimationFrame = (cb) => { const id = nextTimerId++; rafMap.set(id, cb); return id; };\n"
+    "G.cancelAnimationFrame = (id) => { rafMap.delete(Number(id)); };\n"
+    "G.requestIdleCallback = (cb) => G.setTimeout(() => cb({ didTimeout: false, timeRemaining: () => 12 }), 1);\n"
+    "G.cancelIdleCallback = G.clearTimeout;\n",
+
+    /* Chunk 12: URL, URLSearchParams, TextEncoder, TextDecoder, Blob, FormData */
+    "class URLSearchParams {\n"
+    "  constructor(init = '') {\n"
+    "    this._p = [];\n"
+    "    if (typeof init === 'string') {\n"
+    "      const s = init.startsWith('?') ? init.slice(1) : init;\n"
+    "      if (s) for (const part of s.split('&')) {\n"
+    "        const eq = part.indexOf('=');\n"
+    "        const k = eq >= 0 ? part.slice(0, eq) : part; const v = eq >= 0 ? part.slice(eq + 1) : '';\n"
+    "        this._p.push([decodeURIComponent(k.replace(/\\+/g, ' ')), decodeURIComponent(v.replace(/\\+/g, ' '))]);\n"
+    "      }\n"
+    "    } else if (init && typeof init === 'object') {\n"
+    "      const it = Symbol.iterator in init ? init : Object.entries(init);\n"
+    "      for (const [k, v] of it) this._p.push([String(k), String(v)]);\n"
+    "    }\n"
+    "  }\n"
+    "  append(k, v) { this._p.push([String(k), String(v)]); }\n"
+    "  set(k, v) { const s = String(k); let done = false; this._p = this._p.filter(e => { if (e[0] === s) { if (!done) { e[1] = String(v); done = true; return true; } return false; } return true; }); if (!done) this._p.push([s, String(v)]); }\n"
+    "  get(k) { const f = this._p.find(e => e[0] === String(k)); return f ? f[1] : null; }\n"
+    "  getAll(k) { return this._p.filter(e => e[0] === String(k)).map(e => e[1]); }\n"
+    "  has(k) { return this._p.some(e => e[0] === String(k)); }\n"
+    "  delete(k) { this._p = this._p.filter(e => e[0] !== String(k)); }\n"
+    "  forEach(cb, thisArg) { this._p.forEach(([k, v]) => cb.call(thisArg, v, k, this)); }\n"
+    "  entries() { return this._p[Symbol.iterator](); }\n"
+    "  keys() { return this._p.map(e => e[0])[Symbol.iterator](); }\n"
+    "  values() { return this._p.map(e => e[1])[Symbol.iterator](); }\n"
+    "  [Symbol.iterator]() { return this.entries(); }\n"
+    "  toString() { return this._p.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&'); }\n"
+    "}\n"
+    "const parseUrlParts = (raw, base) => {\n"
+    "  let s = String(raw || '').trim();\n"
+    "  if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(s) && base) {\n"
+    "    const b = parseUrlParts(base, null);\n"
+    "    if (s.startsWith('//')) s = b.protocol + s;\n"
+    "    else if (s.startsWith('/')) s = b.origin + s;\n"
+    "    else if (s.startsWith('?')) s = b.origin + b.pathname + s;\n"
+    "    else if (s.startsWith('#')) s = b.origin + b.pathname + b.search + s;\n"
+    "    else { const dir = b.pathname.slice(0, b.pathname.lastIndexOf('/') + 1) || '/'; s = b.origin + dir + s; }\n"
+    "  }\n"
+    "  const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*:)(?:\\/\\/([^/?#]*))?([^?#]*)(\\?[^#]*)?(#.*)?$/);\n"
+    "  if (!m) return { protocol: 'https:', host: 'localhost', hostname: 'localhost', port: '', pathname: '/', search: '', hash: '', origin: 'https://localhost', href: s };\n"
+    "  const protocol = m[1].toLowerCase(); const host = m[2] || '';\n"
+    "  const ci = host.indexOf(':'); const hostname = ci >= 0 ? host.slice(0, ci) : host; const port = ci >= 0 ? host.slice(ci + 1) : '';\n"
+    "  const pathname = m[3] || (host ? '/' : ''); const search = m[4] || ''; const hash = m[5] || '';\n"
+    "  const origin = host ? (protocol + '//' + host) : 'null';\n"
+    "  const href = (host ? (protocol + '//' + host) : protocol) + pathname + search + hash;\n"
+    "  return { protocol, host, hostname, port, pathname, search, hash, origin, href };\n"
+    "};\n"
+    "class URL {\n"
+    "  constructor(url, base) {\n"
+    "    Object.assign(this, parseUrlParts(url, base));\n"
+    "    this.searchParams = new URLSearchParams(this.search);\n"
+    "  }\n"
+    "  toString() { const q = this.searchParams.toString(); return (this.origin !== 'null' ? this.origin : this.protocol) + this.pathname + (q ? '?' + q : this.search) + this.hash; }\n"
+    "  toJSON() { return this.toString(); }\n"
+    "  static createObjectURL() { return 'blob:waterscape/' + Math.random().toString(36).slice(2); }\n"
+    "  static revokeObjectURL() {}\n"
+    "}\n"
+    "G.URL = URL; G.URLSearchParams = URLSearchParams;\n",
+
+    /* Chunk 13: TextEncoder, TextDecoder, Blob, FormData, Crypto, AbortController */
+    "class TextEncoder {\n"
+    "  get encoding() { return 'utf-8'; }\n"
+    "  encode(str = '') {\n"
+    "    const s = unescape(encodeURIComponent(String(str)));\n"
+    "    const u = new Uint8Array(s.length);\n"
+    "    for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i);\n"
+    "    return u;\n"
+    "  }\n"
+    "}\n"
+    "class TextDecoder {\n"
+    "  constructor(label = 'utf-8') { this.encoding = String(label).toLowerCase(); }\n"
+    "  decode(input) {\n"
+    "    if (!input) return '';\n"
+    "    const u = input instanceof ArrayBuffer ? new Uint8Array(input) : new Uint8Array(input.buffer || input, input.byteOffset || 0, input.byteLength ?? input.length ?? 0);\n"
+    "    let bin = ''; for (let i = 0; i < u.length; i++) bin += String.fromCharCode(u[i]);\n"
+    "    try { return decodeURIComponent(escape(bin)); } catch (_) { return bin; }\n"
+    "  }\n"
+    "}\n"
+    "class Blob {\n"
+    "  constructor(parts = [], opts = {}) {\n"
+    "    this.type = String(opts.type || ''); const enc = new TextEncoder(); const chunks = []; let total = 0;\n"
+    "    for (const p of parts) {\n"
+    "      const b = (p instanceof Uint8Array) ? p : (p instanceof ArrayBuffer) ? new Uint8Array(p) : (p instanceof Blob) ? p._bytes : enc.encode(String(p));\n"
+    "      chunks.push(b); total += b.length;\n"
+    "    }\n"
+    "    this._bytes = new Uint8Array(total); let off = 0;\n"
+    "    for (const c of chunks) { this._bytes.set(c, off); off += c.length; }\n"
+    "    this.size = total;\n"
+    "  }\n"
+    "  arrayBuffer() { return Promise.resolve(this._bytes.buffer.slice(0)); }\n"
+    "  text() { return Promise.resolve(new TextDecoder().decode(this._bytes)); }\n"
+    "  slice(s = 0, e = this.size, type = '') { return new Blob([this._bytes.slice(s, e)], { type }); }\n"
+    "}\n"
+    "class File extends Blob { constructor(p, name, opts = {}) { super(p, opts); this.name = String(name); this.lastModified = opts.lastModified || Date.now(); } }\n"
+    "class FormData extends URLSearchParams {}\n"
+    "class AbortSignal extends EventTarget {\n"
+    "  constructor() { super(); this.aborted = false; this.reason = undefined; this.onabort = null; }\n"
+    "  throwIfAborted() { if (this.aborted) throw this.reason || new DOMException('Aborted', 'AbortError'); }\n"
+    "}\n"
+    "class AbortController {\n"
+    "  constructor() { this.signal = new AbortSignal(); }\n"
+    "  abort(reason) {\n"
+    "    if (this.signal.aborted) return;\n"
+    "    this.signal.aborted = true; this.signal.reason = reason || new Error('AbortError');\n"
+    "    this.signal.dispatchEvent(new Event('abort'));\n"
+    "  }\n"
+    "}\n"
+    "G.crypto = {\n"
+    "  getRandomValues: (arr) => B.randomBytes(arr),\n"
+    "  randomUUID: () => {\n"
+    "    const b = B.randomBytes(new Uint8Array(16)); b[6] = (b[6] & 0x0f) | 0x40; b[8] = (b[8] & 0x3f) | 0x80;\n"
+    "    const h = Array.from(b, x => x.toString(16).padStart(2, '0')).join('');\n"
+    "    return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);\n"
+    "  },\n"
+    "  subtle: {}\n"
+    "};\n"
+    "G.structuredClone = (v) => { if (v === undefined || typeof v !== 'object' || v === null) return v; return JSON.parse(JSON.stringify(v)); };\n"
+    "Object.assign(G, { TextEncoder, TextDecoder, Blob, File, FormData, AbortSignal, AbortController });\n",
+
+    /* Chunk 14: Headers, Request, Response, fetch() & XMLHttpRequest */
+    "class Headers {\n"
+    "  constructor(init) {\n"
+    "    this._m = new Map();\n"
+    "    if (init instanceof Headers) init.forEach((v, k) => this.set(k, v));\n"
+    "    else if (Array.isArray(init)) for (const [k, v] of init) this.append(k, v);\n"
+    "    else if (init && typeof init === 'object') for (const [k, v] of Object.entries(init)) this.set(k, v);\n"
+    "  }\n"
+    "  set(k, v) { this._m.set(String(k).toLowerCase(), String(v)); }\n"
+    "  append(k, v) { const kl = String(k).toLowerCase(); const ex = this._m.get(kl); this._m.set(kl, ex ? ex + ', ' + v : String(v)); }\n"
+    "  get(k) { const v = this._m.get(String(k).toLowerCase()); return v !== undefined ? v : null; }\n"
+    "  has(k) { return this._m.has(String(k).toLowerCase()); }\n"
+    "  delete(k) { this._m.delete(String(k).toLowerCase()); }\n"
+    "  forEach(cb, thisArg) { this._m.forEach((v, k) => cb.call(thisArg, v, k, this)); }\n"
+    "  entries() { return this._m.entries(); } keys() { return this._m.keys(); } values() { return this._m.values(); }\n"
+    "  [Symbol.iterator]() { return this._m.entries(); }\n"
+    "}\n"
+    "class Request {\n"
+    "  constructor(input, init = {}) {\n"
+    "    const isReq = input instanceof Request;\n"
+    "    this.url = new URL(isReq ? input.url : String(input), G.location.href).toString();\n"
+    "    this.method = String(init.method || (isReq ? input.method : 'GET')).toUpperCase();\n"
+    "    this.headers = new Headers(init.headers || (isReq ? input.headers : undefined));\n"
+    "    this.body = init.body !== undefined ? init.body : (isReq ? input.body : null);\n"
+    "    this.signal = init.signal || null;\n"
+    "  }\n"
+    "  clone() { return new Request(this); }\n"
+    "}\n",
+    "class Response {\n"
+    "  constructor(body = null, init = {}) {\n"
+    "    this.status = init.status !== undefined ? Number(init.status) : 200;\n"
+    "    this.ok = this.status >= 200 && this.status < 300;\n"
+    "    this.statusText = init.statusText || (this.ok ? 'OK' : 'Error');\n"
+    "    this.url = init.url || '';\n"
+    "    this.headers = new Headers(init.headers);\n"
+    "    this._ab = body instanceof ArrayBuffer ? body : (typeof body === 'string' ? new TextEncoder().encode(body).buffer : new ArrayBuffer(0));\n"
+    "    this.bodyUsed = false;\n"
+    "  }\n"
+    "  arrayBuffer() { this.bodyUsed = true; return Promise.resolve(this._ab.slice(0)); }\n"
+    "  text() { this.bodyUsed = true; return Promise.resolve(new TextDecoder().decode(this._ab)); }\n"
+    "  json() { return this.text().then(t => JSON.parse(t)); }\n"
+    "  blob() { return Promise.resolve(new Blob([this._ab], { type: this.headers.get('content-type') || '' })); }\n"
+    "  clone() { return new Response(this._ab.slice(0), { status: this.status, statusText: this.statusText, headers: this.headers, url: this.url }); }\n"
+    "  static json(data, init = {}) { const h = new Headers(init.headers); h.set('content-type', 'application/json'); return new Response(JSON.stringify(data), { ...init, headers: h }); }\n"
+    "}\n"
+    "G.fetch = (input, init = {}) => new Promise((resolve, reject) => {\n"
+    "  try {\n"
+    "    const req = new Request(input, init);\n"
+    "    if (req.signal && req.signal.aborted) return reject(req.signal.reason || new Error('AbortError'));\n"
+    "    const bodyStr = req.body === null || req.body === undefined ? null : (req.body instanceof URLSearchParams ? req.body.toString() : String(req.body));\n"
+    "    const r = B.httpFetch(req.url, req.method, bodyStr, req.headers.get('content-type'));\n"
+    "    if (!r.netOk && r.status === 0) return reject(new TypeError('NetworkError when attempting to fetch resource.'));\n"
+    "    const h = new Headers(); if (r.contentType) h.set('content-type', r.contentType);\n"
+    "    resolve(new Response(r.buffer, { status: r.status || 200, headers: h, url: req.url }));\n"
+    "  } catch (e) { reject(e); }\n"
+    "});\n"
+    "class XMLHttpRequest extends EventTarget {\n"
+    "  constructor() { super(); this.readyState = 0; this.status = 0; this.statusText = ''; this.responseText = ''; this.response = ''; this.responseType = ''; this._hdrs = {}; }\n"
+    "  open(m, u) { this._m = String(m || 'GET').toUpperCase(); this._u = new URL(String(u), G.location.href).toString(); this.readyState = 1; }\n"
+    "  setRequestHeader(k, v) { this._hdrs[String(k).toLowerCase()] = String(v); }\n"
+    "  getResponseHeader(k) { return String(k).toLowerCase() === 'content-type' ? (this._ct || null) : null; }\n"
+    "  getAllResponseHeaders() { return this._ct ? ('content-type: ' + this._ct + '\\r\\n') : ''; }\n"
+    "  abort() { this.readyState = 0; }\n"
+    "  send(body = null) {\n"
+    "    const r = B.httpFetch(this._u, this._m, body === null ? null : String(body), this._hdrs['content-type'] || null);\n"
+    "    this.status = r.status || (r.netOk ? 200 : 0); this._ct = r.contentType || '';\n"
+    "    this.responseText = new TextDecoder().decode(r.buffer);\n"
+    "    this.response = this.responseType === 'json' ? (() => { try { return JSON.parse(this.responseText); } catch (_) { return null; } })() : (this.responseType === 'arraybuffer' ? r.buffer : this.responseText);\n"
+    "    this.readyState = 4;\n"
+    "    this.dispatchEvent(new Event('readystatechange'));\n"
+    "    this.dispatchEvent(new Event(r.netOk ? 'load' : 'error'));\n"
+    "  }\n"
+    "}\n"
+    "Object.assign(G, { Headers, Request, Response, XMLHttpRequest });\n",
+
+    /* Chunk 15: Storage, Location, History, Navigator, Screen, CSS/Media, DOMParser, Intl & Hooks */
+    "const makeStorage = (persist) => {\n"
+    "  const mem = new Map();\n"
+    "  const api = {\n"
+    "    get length() { return mem.size; },\n"
+    "    key(i) { return Array.from(mem.keys())[i] ?? null; },\n"
+    "    getItem(k) { const s = String(k); if (mem.has(s)) return mem.get(s); if (persist) { const v = B.storageOp(0, s); if (v !== null) { mem.set(s, v); return v; } } return null; },\n"
+    "    setItem(k, v) { const s = String(k), sv = String(v); mem.set(s, sv); if (persist) B.storageOp(1, s, sv); },\n"
+    "    removeItem(k) { const s = String(k); mem.delete(s); if (persist) B.storageOp(1, s, null); },\n"
+    "    clear() { if (persist) for (const k of mem.keys()) B.storageOp(1, k, null); mem.clear(); }\n"
+    "  };\n"
+    "  return new Proxy(api, {\n"
+    "    get(t, p) { if (p in t || typeof p === 'symbol') return t[p]; const v = t.getItem(String(p)); return v === null ? undefined : v; },\n"
+    "    set(t, p, v) { t.setItem(String(p), v); return true; },\n"
+    "    deleteProperty(t, p) { t.removeItem(String(p)); return true; }\n"
+    "  });\n"
+    "};\n"
+    "G.localStorage = makeStorage(true); G.sessionStorage = makeStorage(false);\n"
+    "let curLocUrl = B.envInfo().url || 'about:blank';\n"
+    "const getLocParts = () => parseUrlParts(curLocUrl, null);\n"
+    "G.location = {\n"
+    "  get href() { return getLocParts().href; },\n"
+    "  set href(v) { const r = new URL(String(v), curLocUrl).toString(); curLocUrl = r; B.navigate(r); },\n"
+    "  get origin() { return getLocParts().origin; },\n"
+    "  get protocol() { return getLocParts().protocol; },\n"
+    "  get host() { return getLocParts().host; },\n"
+    "  get hostname() { return getLocParts().hostname; },\n"
+    "  get port() { return getLocParts().port; },\n"
+    "  get pathname() { return getLocParts().pathname; },\n"
+    "  get search() { return getLocParts().search; },\n"
+    "  get hash() { return getLocParts().hash; },\n"
+    "  set hash(v) { const h = String(v).startsWith('#') ? String(v) : '#' + v; const p = getLocParts(); curLocUrl = p.origin + p.pathname + p.search + h; G.dispatchEvent(new Event('hashchange')); },\n"
+    "  assign(u) { this.href = u; }, replace(u) { this.href = u; }, reload() { B.navigate(curLocUrl); },\n"
+    "  toString() { return this.href; }\n"
+    "};\n"
+    "let histState = null, histLen = 1;\n"
+    "G.history = {\n"
+    "  get state() { return histState; }, get length() { return histLen; }, scrollRestoration: 'auto',\n"
+    "  pushState(st, _t, url) { histState = st; histLen++; if (url) curLocUrl = new URL(String(url), curLocUrl).toString(); },\n"
+    "  replaceState(st, _t, url) { histState = st; if (url) curLocUrl = new URL(String(url), curLocUrl).toString(); },\n"
+    "  back() {}, forward() {}, go() {}\n"
+    "};\n"
+    "G.navigator = {\n"
+    "  userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Waterscape/2.0 Arcradient/2.0 Chrome/134.0.0.0 Safari/537.36',\n"
+    "  appName: 'Netscape', platform: 'Linux x86_64', vendor: 'Waterscape',\n"
+    "  language: 'ko-KR', languages: ['ko-KR', 'ko', 'en-US', 'en'],\n"
+    "  onLine: true, cookieEnabled: true, hardwareConcurrency: 8, maxTouchPoints: 0, webdriver: false,\n"
+    "  clipboard: { writeText: (t) => Promise.resolve(B.clipboardOp(true, String(t ?? ''))), readText: () => Promise.resolve(B.clipboardOp(false)) },\n"
+    "  mediaCapabilities: { decodingInfo: () => Promise.resolve({ supported: true, smooth: true, powerEfficient: true }) },\n"
+    "  serviceWorker: { register: () => Promise.resolve({ scope: '/' }), ready: new Promise(() => {}) },\n"
+    "  sendBeacon: () => true\n"
+    "};\n",
+
+    /* Chunk 16: Viewport, getComputedStyle, matchMedia, DOMParser, Intl, document init & C hooks */
+    "Object.defineProperties(G, {\n"
+    "  innerWidth:  { get: () => B.envInfo().width, configurable: true },\n"
+    "  innerHeight: { get: () => B.envInfo().height, configurable: true },\n"
+    "  outerWidth:  { get: () => B.envInfo().width, configurable: true },\n"
+    "  outerHeight: { get: () => B.envInfo().height, configurable: true },\n"
+    "  devicePixelRatio: { value: 1, configurable: true }\n"
+    "});\n"
+    "G.scrollX = 0; G.scrollY = 0; G.pageXOffset = 0; G.pageYOffset = 0;\n"
+    "G.scrollTo = (x, y) => { if (typeof x === 'object' && x) { G.scrollX = x.left || 0; G.scrollY = x.top || 0; } else { G.scrollX = x || 0; G.scrollY = y || 0; } };\n"
+    "G.scroll = G.scrollTo; G.scrollBy = (dx, dy) => G.scrollTo(G.scrollX + (dx || 0), G.scrollY + (dy || 0));\n"
+    "G.screen = { get width() { return G.innerWidth; }, get height() { return G.innerHeight; }, get availWidth() { return G.innerWidth; }, get availHeight() { return G.innerHeight; }, colorDepth: 24, pixelDepth: 24 };\n"
+    "G.visualViewport = new Proxy(new EventTarget(), { get(t, p) { if (p === 'width') return G.innerWidth; if (p === 'height') return G.innerHeight; if (p === 'scale') return 1; return t[p]; } });\n"
+    "G.getComputedStyle = (el) => {\n"
+    "  const uid = el ? el._uid : 0; const c = B.computedInfo(uid); const inl = uid > 0 ? makeStyleProxy(uid) : null;\n"
+    "  const base = { display: c.display, position: c.position, color: c.color, backgroundColor: c.backgroundColor, fontSize: c.fontSize + 'px', width: c.width + 'px', height: c.height + 'px', opacity: String(c.opacity),\n"
+    "    getPropertyValue(p) { const k = kebabToCamel(String(p)); if (inl) { const iv = inl.getPropertyValue(p); if (iv) return iv; } return this[k] || ''; } };\n"
+    "  return new Proxy(base, { get(t, p) { if (p in t || typeof p === 'symbol') return t[p]; return t.getPropertyValue(camelToKebab(String(p))); } });\n"
+    "};\n"
+    "G.matchMedia = (q) => {\n"
+    "  const s = String(q || ''); const env = B.envInfo(); let matches = true;\n"
+    "  if (/prefers-color-scheme\\s*:\\s*dark/i.test(s)) matches = !!env.prefersDark;\n"
+    "  else if (/prefers-color-scheme\\s*:\\s*light/i.test(s)) matches = !env.prefersDark;\n"
+    "  else { const mx = s.match(/max-width\\s*:\\s*(\\d+)/i); if (mx) matches = env.width <= Number(mx[1]); const mn = s.match(/min-width\\s*:\\s*(\\d+)/i); if (mn) matches = matches && env.width >= Number(mn[1]); }\n"
+    "  const mql = Object.assign(new EventTarget(), { media: s, matches, onchange: null, addListener(fn) { this.addEventListener('change', fn); }, removeListener(fn) { this.removeEventListener('change', fn); } });\n"
+    "  return mql;\n"
+    "};\n",
+    "G.CSS = { supports: () => true, escape: (s) => String(s).replace(/[^a-zA-Z0-9_-]/g, '\\\\$&') };\n"
+    "G.DOMParser = class { parseFromString(str) { const d = wrapUid(B.createNode(11, '')); B.setInnerHtml(d._uid, String(str ?? '')); d.getElementById = (id) => d.querySelector('#' + id); d.body = d.querySelector('body') || d; d.head = d.querySelector('head') || d; d.documentElement = d.querySelector('html') || d; return d; } };\n"
+    "G.Range = class { setStart() {} setEnd() {} selectNodeContents() {} collapse() {} getBoundingClientRect() { return { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 }; } createContextualFragment(h) { const f = G.document.createDocumentFragment(); B.setInnerHtml(f._uid, String(h ?? '')); return f; } };\n"
+    "G.document = wrapUid(B.docSpecialUids().doc);\n"
+    "G.document.createRange = () => new G.Range();\n"
+    "G.getSelection = () => ({ toString: () => '', rangeCount: 0, removeAllRanges() {}, addRange() {} });\n"
+    "if (!G.Intl) G.Intl = {};\n"
+    "if (!G.Intl.NumberFormat) G.Intl.NumberFormat = class { format(n) { return Number(n).toLocaleString(); } resolvedOptions() { return { locale: 'ko-KR' }; } };\n"
+    "if (!G.Intl.DateTimeFormat) G.Intl.DateTimeFormat = class { format(d = new Date()) { return new Date(d).toISOString().slice(0, 10); } resolvedOptions() { return { locale: 'ko-KR', timeZone: 'Asia/Seoul' }; } };\n"
+    "if (!G.Intl.RelativeTimeFormat) G.Intl.RelativeTimeFormat = class { format(v, u) { return v + ' ' + u; } };\n"
+    "if (!G.Intl.PluralRules) G.Intl.PluralRules = class { select(n) { return n === 1 ? 'one' : 'other'; } };\n"
+    "if (!G.Intl.Collator) G.Intl.Collator = class { compare(a, b) { return String(a).localeCompare(String(b)); } };\n"
+    "return {\n"
+    "  wrapUid,\n"
+    "  dispatchNative(uid, type, cx, cy, keyCode) {\n"
+    "    if (type === 'load') docReadyState = 'complete';\n"
+    "    let target = uid === 0 ? G.document : wrapUid(uid);\n"
+    "    if (!target) target = G.document || G;\n"
+    "    const bubbles = !(type === 'load' || type === 'focus' || type === 'blur' || type === 'mouseenter' || type === 'mouseleave');\n"
+    "    let ev;\n"
+    "    if (type === 'click' || type === 'mousedown' || type === 'mouseup' || type === 'mousemove' || type === 'contextmenu') ev = new MouseEvent(type, { bubbles, cancelable: true, clientX: cx, clientY: cy });\n"
+    "    else if (type === 'keydown' || type === 'keyup' || type === 'keypress') ev = new KeyboardEvent(type, { bubbles, cancelable: true, keyCode });\n"
+    "    else if (type === 'input') ev = new InputEvent(type, { bubbles: true, cancelable: false });\n"
+    "    else ev = new Event(type, { bubbles, cancelable: true });\n"
+    "    ev.isTrusted = true;\n"
+    "    if (type === 'load') { const r = runEventDispatch(G, ev); return { handled: r.handled, defaultPrevented: !r.notCanceled }; }\n"
+    "    const res = runEventDispatch(target, ev);\n"
+    "    return { handled: res.handled, defaultPrevented: !res.notCanceled };\n"
+    "  },\n"
+    "  tickTimers(nowMs) {\n"
+    "    let ran = false;\n"
+    "    if (rafMap.size > 0) {\n"
+    "      const batch = Array.from(rafMap.entries()); rafMap.clear();\n"
+    "      for (const [, cb] of batch) { ran = true; try { if (typeof cb === 'function') cb(nowMs); } catch (e) { B.log('[rAF Error] ' + fmtVal(e)); } }\n"
+    "    }\n"
+    "    const due = [];\n"
+    "    for (const t of timerMap.values()) { if (t.due <= nowMs) due.push(t); }\n"
+    "    due.sort((a, b) => a.due - b.due);\n"
+    "    for (const t of due) {\n"
+    "      if (!timerMap.has(t.id)) continue;\n"
+    "      if (t.interval > 0) t.due = nowMs + t.interval; else timerMap.delete(t.id);\n"
+    "      ran = true;\n"
+    "      try { if (typeof t.fn === 'function') t.fn(...t.args); else (0, eval)(String(t.fn)); } catch (e) { B.log('[Timer Error] ' + fmtVal(e)); }\n"
+    "    }\n"
+    "    return ran;\n"
+    "  },\n"
+    "  hasTimers() { return timerMap.size > 0 || rafMap.size > 0; }\n"
+    "};\n"
+    "})"
+};
+
+/* -------------------------------------------------------------------------
+ * 7. QuickJS-NG Lifecycle, Safety Interrupts & ArcrJsVTable Implementation
+ * ------------------------------------------------------------------------- */
+static int qjs_interrupt_handler(JSContext *ctx, void *opaque) {
+    (void)ctx;
+    ArcrJsVm *vm = (ArcrJsVm *)opaque;
+    if (!vm || !vm->interrupt_armed) return 0;
+    return (arcr_platform_monotonic_usec() >= vm->deadline_usec) ? 1 : 0;
+}
+
+static void qjs_log_exception(ArcrJsVm *vm, JSContext *ctx) {
+    if (!vm || !ctx) return;
+    JSValue exc = JS_GetException(ctx);
+    if (JS_IsNull(exc) || JS_IsUndefined(exc)) {
+        JS_FreeValue(ctx, exc);
+        return;
     }
-    return false;
+    const char *msg = JS_ToCString(ctx, exc);
+    JSValue stack_v = JS_IsObject(exc) ? JS_GetPropertyStr(ctx, exc, "stack") : JS_UNDEFINED;
+    const char *stack_s = JS_IsString(stack_v) ? JS_ToCString(ctx, stack_v) : NULL;
+
+    if (vm->host.console_log) {
+        char buf[1024];
+        if (stack_s && stack_s[0] != '\0') {
+            snprintf(buf, sizeof(buf), "[Uncaught JS Exception] %s\n%s",
+                     msg ? msg : "Error", stack_s);
+        } else {
+            snprintf(buf, sizeof(buf), "[Uncaught JS Exception] %s",
+                     msg ? msg : "Error");
+        }
+        vm->host.console_log(vm->host.userdata, buf);
+    }
+
+    if (stack_s) JS_FreeCString(ctx, stack_s);
+    JS_FreeValue(ctx, stack_v);
+    if (msg) JS_FreeCString(ctx, msg);
+    JS_FreeValue(ctx, exc);
 }
 
-static void bind_builtin_obj(ArcrJsVm *vm, const char *name, JsBuiltinId id) {
-    JsVal v; memset(&v, 0, sizeof(v));
-    v.kind   = JS_VAL_BUILTIN_OBJ;
-    v.as.u32 = (uint32_t)id;
-    js_obj_set(vm, vm->globals, name, v);
+static void qjs_promise_rejection_tracker(JSContext *ctx, JSValueConst promise,
+                                          JSValueConst reason, bool is_handled,
+                                          void *opaque) {
+    (void)promise;
+    if (is_handled) return;
+    ArcrJsVm *vm = (ArcrJsVm *)opaque;
+    if (!vm || !vm->host.console_log) return;
+    const char *msg = JS_ToCString(ctx, reason);
+    if (msg) {
+        char buf[512];
+        snprintf(buf, sizeof(buf), "[Unhandled Promise Rejection] %s", msg);
+        vm->host.console_log(vm->host.userdata, buf);
+        JS_FreeCString(ctx, msg);
+    }
 }
 
-static void bind_native_fn(ArcrJsVm *vm, const char *name, JsNativeFnId id) {
-    JsVal v; memset(&v, 0, sizeof(v));
-    v.kind   = JS_VAL_NATIVE_FN;
-    v.as.u32 = (uint32_t)id;
-    js_obj_set(vm, vm->globals, name, v);
+static void qjs_drain_microtasks(ArcrJsVm *vm) {
+    if (!vm || !vm->rt) return;
+    JSContext *pctx = NULL;
+    int guard = 0;
+    vm->deadline_usec   = arcr_platform_monotonic_usec() + ARCR_JS_TURN_DEADLINE_USEC;
+    vm->interrupt_armed = true;
+    while (guard++ < 4096 && JS_IsJobPending(vm->rt)) {
+        int r = JS_ExecutePendingJob(vm->rt, &pctx);
+        if (r < 0) {
+            if (pctx) qjs_log_exception(vm, pctx);
+            break;
+        }
+    }
+    vm->interrupt_armed = false;
 }
 
-static ArcrJsVm *portable_create_vm(size_t heap_limit_bytes,
-                                    const ArcrJsHostCallbacks *host_cb) {
+static const JSClassDef kDomNodeClassDef = {
+    .class_name = "DOMNode",
+    .finalizer  = NULL,
+    .gc_mark    = NULL,
+    .call       = NULL,
+    .exotic     = NULL
+};
+
+static ArcrJsVm *qjs_create_vm(size_t heap_limit_bytes, const ArcrJsHostCallbacks *host_cb) {
     ArcrJsVm *vm = (ArcrJsVm *)calloc(1u, sizeof(ArcrJsVm));
     if (!vm) return NULL;
-    arcr_arena_init(&vm->vm_arena, 32768u);
-    arcr_arena_init(&vm->temp_arena, 8192u);
-    vm->heap_limit = (heap_limit_bytes > 0u) ? heap_limit_bytes : (8u * 1024u * 1024u);
-    if (host_cb) vm->host_cb = *host_cb;
-    vm->start_monotonic_usec = arcr_platform_monotonic_usec();
-    arcr_str_copy(vm->location_href, sizeof(vm->location_href), "about:blank");
 
-    if (vm->host_cb.doc && vm->host_cb.doc->title) {
-        arcr_str_copy(vm->doc_title, sizeof(vm->doc_title), vm->host_cb.doc->title);
-    }
+    if (host_cb) vm->host = *host_cb;
+    vm->heap_limit        = (heap_limit_bytes >= (2u * 1024u * 1024u))
+                                ? heap_limit_bytes
+                                : (16u * 1024u * 1024u);
+    vm->boot_usec         = arcr_platform_monotonic_usec();
+    vm->fn_dispatch_event = JS_UNDEFINED;
+    vm->fn_tick_timers    = JS_UNDEFINED;
+    vm->fn_has_timers     = JS_UNDEFINED;
+    vm->fn_wrap_uid       = JS_UNDEFINED;
 
-    vm->globals = js_alloc_object(vm, 32u);
-    if (!vm->globals) {
-        arcr_arena_destroy(&vm->temp_arena);
-        arcr_arena_destroy(&vm->vm_arena);
+    vm->rt = JS_NewRuntime();
+    if (!vm->rt) {
         free(vm);
         return NULL;
     }
 
-    bind_builtin_obj(vm, "console",      JS_BUILTIN_CONSOLE);
-    bind_builtin_obj(vm, "Math",         JS_BUILTIN_MATH);
-    bind_builtin_obj(vm, "JSON",         JS_BUILTIN_JSON);
-    bind_builtin_obj(vm, "performance",  JS_BUILTIN_PERFORMANCE);
-    bind_builtin_obj(vm, "Date",         JS_BUILTIN_DATE);
-    bind_builtin_obj(vm, "localStorage", JS_BUILTIN_LOCALSTORAGE);
-    bind_builtin_obj(vm, "document",     JS_BUILTIN_DOCUMENT);
-    bind_builtin_obj(vm, "window",       JS_BUILTIN_WINDOW);
-    bind_builtin_obj(vm, "globalThis",   JS_BUILTIN_WINDOW);
-    bind_builtin_obj(vm, "location",     JS_BUILTIN_LOCATION);
-    bind_builtin_obj(vm, "Array",        JS_BUILTIN_ARRAY_CTOR);
-    bind_builtin_obj(vm, "Object",       JS_BUILTIN_OBJECT_CTOR);
+    JS_SetMemoryLimit(vm->rt, vm->heap_limit);
+    JS_SetMaxStackSize(vm->rt, 512u * 1024u); /* Safe inside 1 MB Win32 stacks! */
+    JS_SetRuntimeOpaque(vm->rt, vm);
+    JS_SetInterruptHandler(vm->rt, qjs_interrupt_handler, vm);
+    JS_SetHostPromiseRejectionTracker(vm->rt, qjs_promise_rejection_tracker, vm);
 
-    bind_native_fn(vm, "parseInt",   JS_NAT_PARSE_INT);
-    bind_native_fn(vm, "parseFloat", JS_NAT_PARSE_FLOAT);
-    bind_native_fn(vm, "isNaN",      JS_NAT_IS_NAN);
-    bind_native_fn(vm, "isFinite",   JS_NAT_IS_FINITE);
-    bind_native_fn(vm, "Number",     JS_NAT_NUMBER);
-    bind_native_fn(vm, "String",     JS_NAT_STRING);
-    bind_native_fn(vm, "Boolean",    JS_NAT_BOOLEAN);
+    JS_NewClassID(vm->rt, &vm->dom_node_class_id);
+    if (JS_NewClass(vm->rt, vm->dom_node_class_id, &kDomNodeClassDef) < 0) {
+        JS_FreeRuntime(vm->rt);
+        free(vm);
+        return NULL;
+    }
 
-    js_obj_set(vm, vm->globals, "NaN",      js_num(js_make_nan()));
-    js_obj_set(vm, vm->globals, "Infinity", js_num(1e308 * 10.0));
+    vm->ctx = JS_NewContext(vm->rt);
+    if (!vm->ctx) {
+        JS_FreeRuntime(vm->rt);
+        free(vm);
+        return NULL;
+    }
+    JS_SetContextOpaque(vm->ctx, vm);
+    (void)JS_AddIntrinsicBigInt(vm->ctx);
+    (void)JS_AddIntrinsicDOMException(vm->ctx);
+
+    js_uid_sync_document(vm);
+
+    /* Assemble and run modular ES2026 Web API bootstrap */
+    JsByteBuf boot = {0};
+    for (size_t i = 0u; i < ARCR_ARRAY_LEN(kWebBootstrapChunks); ++i) {
+        (void)jbuf_cstr(&boot, kWebBootstrapChunks[i]);
+    }
+    for (size_t i = 0u; i < ARCR_ARRAY_LEN(kWebBootstrapChunks2); ++i) {
+        (void)jbuf_cstr(&boot, kWebBootstrapChunks2[i]);
+    }
+
+    JSValue factory = JS_Eval(vm->ctx, boot.data ? boot.data : "", boot.len,
+                              "<waterscape-web-apis>", JS_EVAL_TYPE_GLOBAL);
+    free(boot.data);
+
+    if (JS_IsException(factory)) {
+        qjs_log_exception(vm, vm->ctx);
+        JS_FreeContext(vm->ctx);
+        JS_FreeRuntime(vm->rt);
+        free(vm->uid_table);
+        free(vm);
+        return NULL;
+    }
+
+    JSValue bridge = JS_NewObject(vm->ctx);
+    JS_SetPropertyFunctionList(vm->ctx, bridge, kBridgeFuncs, (int)ARCR_ARRAY_LEN(kBridgeFuncs));
+
+    JSValue hooks = JS_Call(vm->ctx, factory, JS_UNDEFINED, 1, &bridge);
+    JS_FreeValue(vm->ctx, bridge);
+    JS_FreeValue(vm->ctx, factory);
+
+    if (JS_IsException(hooks)) {
+        qjs_log_exception(vm, vm->ctx);
+        JS_FreeContext(vm->ctx);
+        JS_FreeRuntime(vm->rt);
+        free(vm->uid_table);
+        free(vm);
+        return NULL;
+    }
+
+    vm->fn_dispatch_event = JS_GetPropertyStr(vm->ctx, hooks, "dispatchNative");
+    vm->fn_tick_timers    = JS_GetPropertyStr(vm->ctx, hooks, "tickTimers");
+    vm->fn_has_timers     = JS_GetPropertyStr(vm->ctx, hooks, "hasTimers");
+    vm->fn_wrap_uid       = JS_GetPropertyStr(vm->ctx, hooks, "wrapUid");
+    JS_FreeValue(vm->ctx, hooks);
+    qjs_drain_microtasks(vm);
     return vm;
 }
 
-static void portable_destroy_vm(ArcrJsVm *vm) {
+static bool surf_in_doc_tree_rec(const ArcrDomNode *n, const ArcrDomSurface *s) {
+    if (!n) return false;
+    if (n->surface == s) return true;
+    for (const ArcrDomNode *c = n->first_child; c != NULL; c = c->next_sibling) {
+        if (surf_in_doc_tree_rec(c, s)) return true;
+    }
+    return false;
+}
+
+static void qjs_destroy_vm(ArcrJsVm *vm) {
     if (!vm) return;
-    arcr_arena_destroy(&vm->temp_arena);
-    arcr_arena_destroy(&vm->vm_arena);
+
+    if (vm->ctx) {
+        JS_FreeValue(vm->ctx, vm->fn_dispatch_event);
+        JS_FreeValue(vm->ctx, vm->fn_tick_timers);
+        JS_FreeValue(vm->ctx, vm->fn_has_timers);
+        JS_FreeValue(vm->ctx, vm->fn_wrap_uid);
+        JS_FreeContext(vm->ctx);
+        vm->ctx = NULL;
+    }
+    if (vm->rt) {
+        JS_RunGC(vm->rt);
+        JS_FreeRuntime(vm->rt);
+        vm->rt = NULL;
+    }
+
+    while (vm->canvas_head) {
+        Canvas2DCtx *nx = vm->canvas_head->next;
+        free(vm->canvas_head);
+        vm->canvas_head = nx;
+    }
+    free(vm->grads);
+
+    /* Free any JS-allocated canvas surfaces on detached nodes not reachable from doc->root */
+    while (vm->surf_track_head) {
+        DetachedSurfTrack *nx = vm->surf_track_head->next;
+        ArcrDomSurface *s = vm->surf_track_head->surf;
+        if (s && s->heap_owned && s->argb_pixels) {
+            bool attached = vm->host.doc && vm->host.doc->root &&
+                            surf_in_doc_tree_rec(vm->host.doc->root, s);
+            if (!attached) {
+                free(s->argb_pixels);
+                s->argb_pixels = NULL;
+                s->heap_owned  = false;
+            }
+        }
+        free(vm->surf_track_head);
+        vm->surf_track_head = nx;
+    }
+
+    if (vm->canvas_fonts) {
+        arcr_font_system_destroy(vm->canvas_fonts);
+    }
+    free(vm->uid_table);
     free(vm);
 }
 
-static bool portable_eval_script(ArcrJsVm *vm, const char *utf8_code, size_t code_len) {
-    if (!vm || !utf8_code) return false;
-    if (vm->vm_arena.total_used + code_len > vm->heap_limit) return false;
+static bool qjs_eval_script(ArcrJsVm *vm, const char *utf8_code, size_t code_len) {
+    if (!vm || !vm->ctx || !utf8_code) return false;
+    if (code_len == 0u) return true;
 
-    vm->has_exception = false;
-    vm->sp            = 0u;
-    vm->try_depth     = 0u;
-    vm->fuel          = JS_FUEL_BUDGET_PER_CALL;
+    js_uid_sync_document(vm);
+    JS_UpdateStackTop(vm->rt);
 
-    JsChunk *chunk = compile_script_to_chunk(vm, utf8_code, code_len);
-    if (!chunk) return false;
+    char *buf = (char *)malloc(code_len + 1u);
+    if (!buf) return false;
+    memcpy(buf, utf8_code, code_len);
+    buf[code_len] = '\0';
 
-    vm->bytecode_cache_bytes += ARCR_MAX(64u, code_len / 2u);
-    vm->executed_scripts++;
+    vm->deadline_usec   = arcr_platform_monotonic_usec() + ARCR_JS_TURN_DEADLINE_USEC;
+    vm->interrupt_armed = true;
 
-    JsEnv *top_env = alloc_env(vm, NULL, ARCR_MAX(1u, (size_t)chunk->local_count));
-    if (!top_env) return false;
+    JSValue res = JS_Eval(vm->ctx, buf, code_len, "<script>", JS_EVAL_TYPE_GLOBAL);
+    free(buf);
+    vm->interrupt_armed = false;
 
-    JsVal win_this = { JS_VAL_BUILTIN_OBJ, { .u32 = JS_BUILTIN_WINDOW } };
-    JsVal ret      = js_undef();
-    return vm_run_frames(vm, chunk, top_env, win_this, &ret);
+    bool ok = true;
+    if (JS_IsException(res)) {
+        qjs_log_exception(vm, vm->ctx);
+        ok = false;
+    } else {
+        JS_FreeValue(vm->ctx, res);
+    }
+
+    qjs_drain_microtasks(vm);
+    return ok;
 }
 
-static bool portable_dispatch_dom_event(ArcrJsVm *vm, uint32_t target_node_uid,
-                                        const char *event_type) {
-    if (!vm || !event_type || target_node_uid == 0u) return false;
-    ArcrDocument *doc = vm->host_cb.doc;
-    ArcrDomNode *target = doc ? js_dom_find_uid(vm, doc, target_node_uid) : NULL;
-
-    bool prevented = false;
-    bool stopped   = false;
-    vm->active_ev_prevented = &prevented;
-    vm->active_ev_stopped   = &stopped;
-    vm->has_exception       = false;
-    vm->fuel                = JS_FUEL_BUDGET_PER_CALL;
-
-    JsObject *ev_obj = js_alloc_object(vm, 8u);
-    if (!ev_obj) {
-        vm->active_ev_prevented = NULL;
-        vm->active_ev_stopped   = NULL;
+static bool qjs_dispatch_dom_event_ex(ArcrJsVm *vm, uint32_t target_node_uid,
+                                      const char *event_type,
+                                      int32_t client_x, int32_t client_y, int key_code,
+                                      bool *out_default_prevented) {
+    if (out_default_prevented) *out_default_prevented = false;
+    if (!vm || !vm->ctx || !event_type || !JS_IsFunction(vm->ctx, vm->fn_dispatch_event)) {
         return false;
     }
-    js_obj_set(vm, ev_obj, "type",   js_mk_str(vm, event_type));
-    js_obj_set(vm, ev_obj, "target", js_dom_node(target_node_uid));
-    JsVal pd_fn = { JS_VAL_NATIVE_FN, { .u32 = JS_NAT_EVENT_PREVENT_DEFAULT } };
-    JsVal sp_fn = { JS_VAL_NATIVE_FN, { .u32 = JS_NAT_EVENT_STOP_PROP } };
-    js_obj_set(vm, ev_obj, "preventDefault",  pd_fn);
-    js_obj_set(vm, ev_obj, "stopPropagation", sp_fn);
 
-    JsVal ev_val; memset(&ev_val, 0, sizeof(ev_val));
-    ev_val.kind   = JS_VAL_OBJECT;
-    ev_val.as.obj = ev_obj;
-    js_obj_set(vm, vm->globals, "event", ev_val);
+    js_uid_sync_document(vm);
+    JS_UpdateStackTop(vm->rt);
 
-    char attr_name[40];
-    snprintf(attr_name, sizeof(attr_name), "on%s", event_type);
+    JSValue args[5];
+    args[0] = JS_NewUint32(vm->ctx, target_node_uid);
+    args[1] = JS_NewString(vm->ctx, event_type);
+    args[2] = JS_NewInt32(vm->ctx, client_x);
+    args[3] = JS_NewInt32(vm->ctx, client_y);
+    args[4] = JS_NewInt32(vm->ctx, key_code);
 
-    bool handled = false;
-    if (target) {
-        for (ArcrDomNode *cur = target; cur != NULL && !stopped; cur = cur->parent) {
-            if (cur->kind != ARCR_NODE_ELEMENT) continue;
-            js_obj_set(vm, ev_obj, "currentTarget", js_dom_node(cur->node_uid));
+    vm->deadline_usec   = arcr_platform_monotonic_usec() + ARCR_JS_TURN_DEADLINE_USEC;
+    vm->interrupt_armed = true;
+    JSValue ret = JS_Call(vm->ctx, vm->fn_dispatch_event, JS_UNDEFINED, 5, args);
+    vm->interrupt_armed = false;
 
-            /* 1. Inline attribute handler (e.g., onclick="...") */
-            const char *inline_js = js_dom_get_attr(doc, cur, attr_name);
-            if (inline_js && inline_js[0] != '\0') {
-                JsChunk *ich = compile_script_to_chunk(vm, inline_js, strlen(inline_js));
-                if (ich) {
-                    JsEnv *ienv = alloc_env(vm, NULL, ARCR_MAX(1u, (size_t)ich->local_count));
-                    if (ienv) {
-                        JsVal dummy = js_undef();
-                        if (vm_run_frames(vm, ich, ienv, js_dom_node(cur->node_uid), &dummy)) {
-                            handled = true;
-                        }
-                    }
-                }
-            }
+    for (int i = 0; i < 5; ++i) JS_FreeValue(vm->ctx, args[i]);
 
-            /* 2. Registered addEventListener callbacks on `cur->node_uid` */
-            for (size_t i = 0u; i < JS_MAX_EVENT_LISTENERS; ++i) {
-                if (vm->listeners[i].active &&
-                    vm->listeners[i].node_uid == cur->node_uid &&
-                    arcr_str_eq_nocase(vm->listeners[i].event_type, event_type)) {
-                    JsVal ret = js_undef();
-                    if (vm_invoke_callable(vm, vm->listeners[i].callback,
-                                           js_dom_node(cur->node_uid), &ev_val, 1u, &ret)) {
-                        handled = true;
-                    }
-                }
-            }
-            js_obj_set(vm, ev_obj, "defaultPrevented", js_bool(prevented));
-        }
+    bool handled   = false;
+    bool prevented = false;
+    if (JS_IsException(ret)) {
+        qjs_log_exception(vm, vm->ctx);
     } else {
-        /* Fallback when VM has no bound ArcrDocument */
-        for (size_t i = 0u; i < JS_MAX_EVENT_LISTENERS; ++i) {
-            if (vm->listeners[i].active &&
-                vm->listeners[i].node_uid == target_node_uid &&
-                arcr_str_eq_nocase(vm->listeners[i].event_type, event_type)) {
-                JsVal ret = js_undef();
-                if (vm_invoke_callable(vm, vm->listeners[i].callback,
-                                       js_dom_node(target_node_uid), &ev_val, 1u, &ret)) {
-                    handled = true;
-                }
-            }
+        if (JS_IsObject(ret)) {
+            JSValue vh = JS_GetPropertyStr(vm->ctx, ret, "handled");
+            JSValue vp = JS_GetPropertyStr(vm->ctx, ret, "defaultPrevented");
+            handled   = JS_ToBool(vm->ctx, vh) > 0;
+            prevented = JS_ToBool(vm->ctx, vp) > 0;
+            JS_FreeValue(vm->ctx, vh);
+            JS_FreeValue(vm->ctx, vp);
         }
+        JS_FreeValue(vm->ctx, ret);
     }
 
-    vm->active_ev_prevented = NULL;
-    vm->active_ev_stopped   = NULL;
+    qjs_drain_microtasks(vm);
+    if (out_default_prevented) *out_default_prevented = prevented;
     return handled || prevented;
 }
 
-static size_t portable_get_used_heap_bytes(const ArcrJsVm *vm) {
-    if (!vm) return 0u;
-    return sizeof(ArcrJsVm) + vm->vm_arena.total_used +
-           vm->temp_arena.total_used + vm->bytecode_cache_bytes;
+static bool qjs_dispatch_dom_event(ArcrJsVm *vm, uint32_t target_node_uid,
+                                   const char *event_type) {
+    return qjs_dispatch_dom_event_ex(vm, target_node_uid, event_type, 0, 0, 0, NULL);
 }
 
-static void portable_release_caches_on_pressure(ArcrJsVm *vm, int pressure_level) {
-    if (!vm) return;
+static bool qjs_tick_timers_and_raf(ArcrJsVm *vm, uint64_t now_ms, bool *out_dom_mutated) {
+    if (out_dom_mutated) *out_dom_mutated = false;
+    if (!vm || !vm->ctx || !JS_IsFunction(vm->ctx, vm->fn_tick_timers)) return false;
+
+    bool had_dirty = vm->host.doc ? vm->host.doc->dom_dirty : false;
+    if (vm->host.doc) vm->host.doc->dom_dirty = false;
+
+    JS_UpdateStackTop(vm->rt);
+    uint64_t now_us = arcr_platform_monotonic_usec();
+    double rel_ms = (now_us >= vm->boot_usec) ? ((double)(now_us - vm->boot_usec) * 0.001) : (double)now_ms;
+    JSValue arg = JS_NewFloat64(vm->ctx, rel_ms);
+
+    vm->deadline_usec   = now_us + ARCR_JS_TURN_DEADLINE_USEC;
+    vm->interrupt_armed = true;
+    JSValue ret = JS_Call(vm->ctx, vm->fn_tick_timers, JS_UNDEFINED, 1, &arg);
+    vm->interrupt_armed = false;
+    JS_FreeValue(vm->ctx, arg);
+
+    bool ran = false;
+    if (JS_IsException(ret)) {
+        qjs_log_exception(vm, vm->ctx);
+    } else {
+        ran = JS_ToBool(vm->ctx, ret) > 0;
+        JS_FreeValue(vm->ctx, ret);
+    }
+
+    if (JS_IsJobPending(vm->rt)) {
+        ran = true;
+        qjs_drain_microtasks(vm);
+    }
+
+    bool mutated = vm->host.doc ? vm->host.doc->dom_dirty : false;
+    if (vm->host.doc && had_dirty) vm->host.doc->dom_dirty = true;
+    if (out_dom_mutated) *out_dom_mutated = mutated;
+    return ran || mutated;
+}
+
+static bool qjs_has_pending_timers(const ArcrJsVm *vm) {
+    if (!vm || !vm->ctx || !vm->rt) return false;
+    if (JS_IsJobPending(vm->rt)) return true;
+    if (!JS_IsFunction(vm->ctx, vm->fn_has_timers)) return false;
+    JSValue ret = JS_Call(vm->ctx, vm->fn_has_timers, JS_UNDEFINED, 0, NULL);
+    if (JS_IsException(ret)) {
+        JS_FreeValue(vm->ctx, JS_GetException(vm->ctx));
+        return false;
+    }
+    bool has = JS_ToBool(vm->ctx, ret) > 0;
+    JS_FreeValue(vm->ctx, ret);
+    return has;
+}
+
+static size_t qjs_get_used_heap_bytes(const ArcrJsVm *vm) {
+    if (!vm || !vm->rt) return 0u;
+    JSMemoryUsage mu;
+    memset(&mu, 0, sizeof(mu));
+    JS_ComputeMemoryUsage(vm->rt, &mu);
+    return (mu.memory_used_size > 0) ? (size_t)mu.memory_used_size : sizeof(ArcrJsVm);
+}
+
+static void qjs_release_caches_on_pressure(ArcrJsVm *vm, int pressure_level) {
+    if (!vm || !vm->rt) return;
     if (pressure_level >= 1) {
-        vm->bytecode_cache_bytes = 0u;
-        arcr_arena_reset(&vm->temp_arena);
+        JS_RunGC(vm->rt);
+        if (vm->canvas_fonts) {
+            arcr_font_system_purge_cache(vm->canvas_fonts);
+        }
     }
 }
 
 static const ArcrJsVTable kPortableJsVTable = {
     .struct_size                = sizeof(ArcrJsVTable),
-    .engine_backend_name        = "ArcradientJS-Portable (Pure C11 Bytecode VM)",
-    .create_vm                  = portable_create_vm,
-    .destroy_vm                 = portable_destroy_vm,
-    .eval_script                = portable_eval_script,
-    .dispatch_dom_event         = portable_dispatch_dom_event,
-    .get_used_heap_bytes        = portable_get_used_heap_bytes,
-    .release_caches_on_pressure = portable_release_caches_on_pressure
+    .engine_backend_name        = "ArcradientJS/QuickJS-NG-ES2026",
+    .create_vm                  = qjs_create_vm,
+    .destroy_vm                 = qjs_destroy_vm,
+    .eval_script                = qjs_eval_script,
+    .dispatch_dom_event         = qjs_dispatch_dom_event,
+    .dispatch_dom_event_ex      = qjs_dispatch_dom_event_ex,
+    .tick_timers_and_raf        = qjs_tick_timers_and_raf,
+    .has_pending_timers         = qjs_has_pending_timers,
+    .get_used_heap_bytes        = qjs_get_used_heap_bytes,
+    .release_caches_on_pressure = qjs_release_caches_on_pressure
 };
 
 static ArcrModuleDescriptor g_js_desc = {
@@ -4929,7 +4262,7 @@ static ArcrModuleDescriptor g_js_desc = {
     .engine_build_id    = ARCR_ENGINE_BUILD_ID,
     .arch_id            = 0,
     .min_os_major_minor = ARCR_OS_POSIX_ANY,
-    .required_cpu_flags = ARCR_CPU_SCALAR, /* Runs on Win2000 x86 SSE1 or Scalar! */
+    .required_cpu_flags = ARCR_CPU_SCALAR,
     .module_name        = "arcr-js-portable",
     .vtable             = &kPortableJsVTable
 };
