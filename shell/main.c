@@ -1,377 +1,444 @@
 /*
- * Arcradient Browser (MSHTML-Next)
- * shell/main.c - Vertical-Slice Executable, Win32 GDI Window & Snapshot Generator
+ * Waterscape Browser 1.0 / Arcradient Engine (MSHTML-Next)
+ * shell/main.c - Unified `waterscape` CLI, Snapshot Showcase & Benchmark Entrypoint
  */
-#if defined(_WIN32)
-#  ifndef WINVER
-#    define WINVER 0x0500
-#  endif
-#  ifndef _WIN32_WINNT
-#    define _WIN32_WINNT 0x0500
-#  endif
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <windows.h>
-#  include <imm.h>
-#endif
-
 #include "arcr_shell.h"
+#include "waterscape_presenter.h"
+#include "../accel/arcr_accel.h"
 #include "../base/arcr_base.h"
 #include "../platform/arcr_platform.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static const char *const kKoreanShowcaseLightHtml =
+static const char *const kWaterscapeShowcaseLightHtml =
     "<!DOCTYPE html>"
     "<html lang=\"ko\">"
     "<head>"
-    "  <title>Arcradient 한국어 설계 개요</title>"
+    "  <meta charset=\"utf-8\">"
+    "  <title>Waterscape Browser 1.0 — 설계 개요</title>"
     "  <style>"
     "    :root {"
-    "      --accent: #2563eb;"
+    "      --accent: #0284c7;"
     "      --card-bg: #f8fafc;"
     "      --card-border: #cbd5e1;"
-    "      --badge-bg: #dbeafe;"
+    "      --badge-bg: #e0f2fe;"
     "    }"
-    "    body { background: #ffffff; color: #0f172a; padding: 22px; }"
-    "    h1 { color: #0f172a; font-size: 23px; margin-bottom: 6px; }"
-    "    .subtitle { color: #475569; font-size: 14px; margin-bottom: 16px; }"
+    "    body { background: #ffffff; color: #0f172a; padding: 20px 26px; }"
+    "    h1 { color: #0f172a; font-size: 22px; margin-top: 0px; margin-bottom: 4px; }"
+    "    .subtitle { color: #475569; font-size: 13px; margin-bottom: 14px; }"
     "    .card {"
     "      background: var(--card-bg);"
     "      border: 1px solid var(--card-border);"
     "      border-left: 4px solid var(--accent);"
-    "      padding: 14px;"
-    "      margin-bottom: 12px;"
+    "      padding: 12px 16px;"
+    "      margin-bottom: 10px;"
     "    }"
-    "    h2 { color: var(--accent); font-size: 17px; margin-top: 0px; margin-bottom: 6px; }"
-    "    p { font-size: 14px; margin-bottom: 6px; word-break: keep-all; }"
-    "    li { font-size: 14px; margin-bottom: 4px; }"
-    "    code { background: var(--badge-bg); color: #1e3a8a; padding: 2px 6px; }"
+    "    h2 { color: var(--accent); font-size: 16px; margin-top: 0px; margin-bottom: 5px; }"
+    "    p { font-size: 14px; margin-bottom: 4px; word-break: keep-all; }"
+    "    li { font-size: 13px; margin-bottom: 3px; }"
+    "    code { background: var(--badge-bg); color: #0369a1; padding: 1px 6px; }"
     "  </style>"
     "</head>"
     "<body>"
-    "  <h1>Arcradient (MSHTML-Next) 수직 시제품</h1>"
-    "  <p class=\"subtitle\">순수 C11 무의존성 코어 · CPU 소프트웨어 기본 렌더링 · 선택적 GPU 가속</p>"
+    "  <h1>Waterscape Web Browser 1.0 (Arcradient Pure C11)</h1>"
+    "  <p class=\"subtitle\">초경량 순수 C11 네이티브 코어 · 멀티코어 64x64 타일 + AVX2/SSE2/SSE1 · 하드웨어 GPU 프레젠테이션</p>"
     "  <div class=\"card\">"
-    "    <h2>1. 구형 PC부터 현대 64비트까지 단일 엔진 계열</h2>"
-    "    <p>Windows 2000 SP4(32비트 <code>SSE1</code>)부터 최신 x64 환경까지 동일한 순수 C 아키텍처로 구동됩니다. 정적 문서에서는 <code>ArcradientJS</code> 모듈을 메모리에 올리지 않아 자원 낭비를 원천 차단합니다.</p>"
+    "    <h2>1. 구형 Windows 2000 SP4부터 최신 64비트까지 단일 아키텍처</h2>"
+    "    <p>무거운 외부 프레임워크 없이 순수 C11로 작성되어 즉시 기동되며, 정적 문서에서는 <code>arcr_js_portable</code> 및 <code>arcr_media</code> 모듈을 적재하지 않아 <code>0 Byte</code> 오버헤드를 보장합니다.</p>"
     "  </div>"
     "  <div class=\"card\">"
-    "    <h2>2. 한국어 조판 및 행두·행말 금칙처리 내장</h2>"
-    "    <p>초기 단계부터 한글 어절 줄바꿈(<code>word-break: keep-all</code>), 영문·숫자 혼용 배치, 문장 부호 금칙처리(마침표·쉼표·괄호 고립 방지), 그리고 <code>Imm32</code> 한글 조합기를 기본 지원합니다.</p>"
+    "    <h2>2. Firefox급 확장성(.wsx)과 내장 광고·추적 차단(Waterscape Shield)</h2>"
+    "    <p>O(1) 도메인 해시 기반 <code>Waterscape Shield</code>, 다크 모드 변환기, 리더 모드, 네이티브 C11 성능 HUD 플러그인을 기본 내장하며 툴바에서 실시간 전환합니다.</p>"
     "  </div>"
     "  <div class=\"card\">"
-    "    <h2>3. 비용 추정 기반 가속과 무중단 CPU 복귀</h2>"
+    "    <h2>3. 완벽한 한국어 조판 및 다세대 GPU 무중단 폴백</h2>"
     "    <ul>"
-    "      <li>작은 도형과 정적 문서 스크롤은 <code>CPU Scalar / SIMD</code> 타일 경로로 즉시 처리</li>"
-    "      <li>GPU 드라이버 오류나 장치 손실 발생 시 프로세스 종료 없이 CPU 경로로 자동 복귀</li>"
-    "      <li>내장 루트 인증서 저장소와 CMOS 시계 오차 감지로 안전한 <code>TLS 1.3</code> 연결 수행</li>"
+    "      <li>한글 어절 유지(<code>word-break: keep-all</code>), 행두·행말 금칙처리 및 <code>Imm32</code> 조합 입력 내장</li>"
+    "      <li>Windows <code>D3D11 Flip -&gt; D3D9 -&gt; OpenGL ICD -&gt; GDI</code> 및 Linux <code>X11 MIT-SHM</code> 무복사 출력</li>"
     "    </ul>"
     "  </div>"
     "</body>"
     "</html>";
 
-static const char *const kKoreanShowcaseDarkHtml =
-    "<!DOCTYPE html>"
-    "<html lang=\"ko\">"
-    "<head>"
-    "  <title>Arcradient 어두운 테마 검증</title>"
-    "  <style>"
-    "    :root { --accent: #38bdf8; --card-bg: #1e293b; --border: #334155; }"
-    "    body { background: #0f172a; color: #f1f5f9; padding: 22px; }"
-    "    h1 { color: #f8fafc; font-size: 23px; margin-bottom: 8px; }"
-    "    .card {"
-    "      background: var(--card-bg);"
-    "      border: 1px solid var(--border);"
-    "      border-left: 4px solid var(--accent);"
-    "      padding: 14px;"
-    "      margin-bottom: 12px;"
-    "    }"
-    "    h2 { color: var(--accent); font-size: 17px; margin-top: 0px; margin-bottom: 6px; }"
-    "    p { color: #cbd5e1; font-size: 14px; word-break: keep-all; }"
-    "    code { background: #0b1120; color: #7dd3fc; padding: 2px 6px; }"
-    "  </style>"
-    "</head>"
-    "<body>"
-    "  <h1>Chrome의 간결함과 Firefox의 사용자 지정 결합</h1>"
-    "  <div class=\"card\">"
-    "    <h2>선택형 북마크 바와 압축형 도구 모음 활성화 예시</h2>"
-    "    <p>상단 도구 모음은 세로 공간을 아끼는 압축형 높이를 기본으로 하며, 북마크 바는 필요할 때만 <code>Ctrl+B</code> 또는 설정에서 꺼내 쓸 수 있습니다.</p>"
-    "  </div>"
-    "  <div class=\"card\">"
-    "    <h2>지연 로드 상태 실시간 확인</h2>"
-    "    <p>현재 문서는 스크립트와 영상 태그를 포함하지 않으므로 <code>arcr-js</code> 및 <code>arcr-media</code> 동적 라이브러리가 메모리에 적재되지 않은 상태(<code>0 Byte</code>)로 동작합니다.</p>"
-    "  </div>"
-    "</body>"
-    "</html>";
-
-static void populate_demo_shell(ArcrBrowserShell *sh, bool add_bookmarks, const char *primary_html) {
-    if (add_bookmarks) {
-        arcr_shell_add_bookmark(sh, "★ Arcradient 문서", "https://arcradient.org/docs");
-        arcr_shell_add_bookmark(sh, "★ 호환성 표 (WPT)", "https://arcradient.org/wpt");
-        arcr_shell_add_bookmark(sh, "★ 고급 설정 (arcr://config)", "arcr://config");
-    }
-
-    arcr_shell_open_tab_html(sh, "https://arcradient.org/ko/mshtml-next",
-                             primary_html, strlen(primary_html), true);
-    arcr_shell_open_tab_html(sh, "arcr://settings",
-                             kKoreanShowcaseDarkHtml, strlen(kKoreanShowcaseDarkHtml), false);
-    const char *compat_html =
-        "<!DOCTYPE html><html lang=\"ko\"><head><title>지원 범위 표</title>"
-        "<style>body{background:#ffffff;color:#0f172a;padding:22px;}h1{font-size:21px;margin-bottom:10px;}"
-        "p{font-size:14px;word-break:keep-all;margin-bottom:8px;}code{background:#e2e8f0;padding:2px 6px;}</style>"
-        "</head><body><h1>플랫폼 지원 범위 (Legacy x86 ~ Modern x64)</h1>"
-        "<p><code>Legacy x86</code>: Windows 2000 SP4 이상 · 32비트 <code>SSE1</code> + 스칼라 기본 렌더링</p>"
-        "<p><code>Classic / Modern x64</code>: <code>SSE3</code> 최소 기준선 유지 (<code>AVX</code> 비필수, 런타임 감지 시 가속)</p>"
-        "<p>단축키 안내: <code>F2</code> 테마 전환 · <code>Ctrl+B</code> 북마크 바 표시/숨김 · 탭 클릭 전환</p>"
-        "</body></html>";
-    arcr_shell_open_tab_html(sh, "https://arcradient.org/ko/compat",
-                             compat_html, strlen(compat_html), false);
+static void seed_default_bookmarks(ArcrBrowserShell *sh) {
+    if (!sh || arcr_shell_bookmark_count(sh) > 0u) return;
+    arcr_shell_add_bookmark(sh, "★ 새 탭 홈", "waterscape://newtab");
+    arcr_shell_add_bookmark(sh, "⚡ 하드웨어 가속", "waterscape://hardware");
+    arcr_shell_add_bookmark(sh, "🧩 확장·플러그인", "waterscape://addons");
+    arcr_shell_add_bookmark(sh, "⚙ 환경설정", "waterscape://settings");
 }
 
-static bool render_theme_snapshot(const char *module_dir, const char *out_png,
-                                  ArcrProfileMode profile, ArcrShellTheme theme,
-                                  bool show_bookmarks, const char *html) {
-    ArcrEngineConfig ecfg;
-    arcr_engine_default_config(&ecfg, profile);
-    ecfg.module_search_dir = module_dir;
-
-    ArcrEngine *eng = arcr_engine_create(&ecfg);
-    if (!eng) return false;
-
-    ArcrShellConfig scfg;
-    arcr_shell_default_config(&scfg, theme);
-    scfg.show_bookmarks_bar = show_bookmarks;
-
-    ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
-    if (!sh) {
-        arcr_engine_destroy(eng);
-        return false;
-    }
-
-    populate_demo_shell(sh, show_bookmarks, html);
-    arcr_shell_activate_tab(sh, 0u);
-    arcr_shell_set_status_overlay(sh, "링크 미리보기: https://arcradient.org/ko/accel-pipeline");
-
-    int32_t w = scfg.window_width;
-    int32_t h = scfg.window_height;
-    uint32_t *fb = (uint32_t *)calloc((size_t)(w * h), sizeof(uint32_t));
-    if (!fb) {
-        arcr_shell_destroy(sh);
-        arcr_engine_destroy(eng);
-        return false;
-    }
+static bool save_shell_png(ArcrEngine *eng, ArcrBrowserShell *sh,
+                           int32_t w, int32_t h, const char *out_png) {
+    uint32_t *fb = (uint32_t *)calloc((size_t)w * (size_t)h, sizeof(uint32_t));
+    if (!fb) return false;
 
     bool ok = arcr_shell_render_frame(sh, fb, w, h, w) &&
               arcr_platform_write_png(out_png, fb, w, h, w);
 
     ArcrEngineStats st;
+    memset(&st, 0, sizeof(st));
     arcr_engine_get_stats(eng, &st);
-    printf("  -> Saved %-32s (%dx%d) | DOM=%u boxes=%u cmds=%u shared=%lu arena=%luB js_loaded=%s\n",
+    printf("  -> Saved %-42s (%dx%d) | tiles=%u layout=%luus paint=%luus arena=%luKiB\n",
            out_png, (int)w, (int)h,
-           st.dom_node_count, st.layout_box_count, st.display_cmd_count,
-           (unsigned long)st.style_shared_hits, (unsigned long)st.arena_used_bytes,
-           st.js_module_loaded ? "YES" : "NO");
+           (unsigned)st.tiles_rendered_last_frame,
+           (unsigned long)st.last_layout_usec,
+           (unsigned long)st.last_paint_usec,
+           (unsigned long)(st.arena_used_bytes / 1024u));
 
     free(fb);
-    arcr_shell_destroy(sh);
-    arcr_engine_destroy(eng);
     return ok;
 }
 
-#if defined(_WIN32)
-#ifndef WM_MOUSEWHEEL
-#  define WM_MOUSEWHEEL 0x020A
-#endif
-#ifndef GWLP_USERDATA
-#  define GWLP_USERDATA (-21)
-#endif
+static bool run_snapshot_suite(const char *mod_dir, const char *snap_dir) {
+    arcr_platform_mkdir_p(snap_dir);
+    bool all_ok = true;
+    char path[640];
+    char legacy_path[640];
 
-typedef struct Win32HostWindow {
-    ArcrBrowserShell *shell;
-    HDC               mem_dc;
-    HBITMAP           dib;
-    HGDIOBJ           old_bmp;
-    uint32_t         *dib_pixels;
-    int32_t           dib_w;
-    int32_t           dib_h;
-    int32_t           scroll_y;
-} Win32HostWindow;
+    /* 1. waterscape_newtab_dark.png (+ shell_modern_dark.png) */
+    {
+        ArcrEngineConfig ecfg;
+        arcr_engine_default_config(&ecfg, ARCR_PROFILE_MODERN);
+        ecfg.module_search_dir = mod_dir;
+        ecfg.private_browsing  = true;
+        ArcrEngine *eng = arcr_engine_create(&ecfg);
+        if (!eng) return false;
 
-static void win32_resize_dib(Win32HostWindow *host, int32_t w, int32_t h) {
-    if (!host || w <= 0 || h <= 0) return;
-    if (w == host->dib_w && h == host->dib_h && host->dib) return;
+        ArcrShellConfig scfg;
+        arcr_shell_default_config(&scfg, ARCR_SHELL_THEME_MODERN_DARK);
+        scfg.window_width       = 1120;
+        scfg.window_height      = 720;
+        scfg.show_bookmarks_bar = true;
+        scfg.private_browsing   = true;
+        scfg.module_search_dir  = mod_dir;
 
-    if (!host->mem_dc) {
-        host->mem_dc = CreateCompatibleDC(NULL);
+        ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
+        seed_default_bookmarks(sh);
+        arcr_shell_open_tab_url(sh, "waterscape://newtab", true);
+        arcr_shell_open_tab_url(sh, "waterscape://hardware", false);
+        arcr_shell_open_tab_url(sh, "waterscape://addons", false);
+        arcr_shell_activate_tab(sh, 0u);
+
+        snprintf(path, sizeof(path), "%s/waterscape_newtab_dark.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, path) && all_ok;
+        snprintf(legacy_path, sizeof(legacy_path), "%s/shell_modern_dark.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, legacy_path) && all_ok;
+
+        arcr_shell_destroy(sh);
+        arcr_engine_destroy(eng);
     }
-    if (host->dib) {
-        SelectObject(host->mem_dc, host->old_bmp);
-        DeleteObject(host->dib);
-        host->dib        = NULL;
-        host->dib_pixels = NULL;
+
+    /* 2. waterscape_showcase_light.png (+ shell_modern_light.png) */
+    {
+        ArcrEngineConfig ecfg;
+        arcr_engine_default_config(&ecfg, ARCR_PROFILE_MODERN);
+        ecfg.module_search_dir = mod_dir;
+        ecfg.private_browsing  = true;
+        ArcrEngine *eng = arcr_engine_create(&ecfg);
+        if (!eng) return false;
+
+        ArcrShellConfig scfg;
+        arcr_shell_default_config(&scfg, ARCR_SHELL_THEME_MODERN_LIGHT);
+        scfg.window_width       = 1120;
+        scfg.window_height      = 720;
+        scfg.show_bookmarks_bar = true;
+        scfg.private_browsing   = false; /* Normal browsing UI without private badge */
+        scfg.profile_dir_override = "";
+        scfg.module_search_dir  = mod_dir;
+
+        ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
+        seed_default_bookmarks(sh);
+        arcr_shell_open_tab_html(sh, "https://waterscape.browser.org/ko/overview",
+                                 kWaterscapeShowcaseLightHtml,
+                                 strlen(kWaterscapeShowcaseLightHtml), true);
+        arcr_shell_open_tab_url(sh, "waterscape://newtab", false);
+        arcr_shell_open_tab_url(sh, "waterscape://settings", false);
+        arcr_shell_activate_tab(sh, 0u);
+        arcr_shell_set_status_overlay(sh, "링크 이동: https://waterscape.browser.org/ko/hardware-pipeline");
+
+        snprintf(path, sizeof(path), "%s/waterscape_showcase_light.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, path) && all_ok;
+        snprintf(legacy_path, sizeof(legacy_path), "%s/shell_modern_light.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, legacy_path) && all_ok;
+
+        arcr_shell_destroy(sh);
+        arcr_engine_destroy(eng);
     }
 
-    BITMAPINFO bmi;
-    ZeroMemory(&bmi, sizeof(bmi));
-    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-    bmi.bmiHeader.biWidth       = w;
-    bmi.bmiHeader.biHeight      = -h; /* Top-down ARGB8888 framebuffer */
-    bmi.bmiHeader.biPlanes      = 1;
-    bmi.bmiHeader.biBitCount    = 32;
-    bmi.bmiHeader.biCompression = BI_RGB;
+    /* 3. waterscape_addons_hardware.png (Add-ons Manager + F12 Hardware Telemetry Dock) */
+    {
+        ArcrEngineConfig ecfg;
+        arcr_engine_default_config(&ecfg, ARCR_PROFILE_MODERN);
+        ecfg.module_search_dir = mod_dir;
+        ecfg.private_browsing  = true;
+        ArcrEngine *eng = arcr_engine_create(&ecfg);
+        if (!eng) return false;
 
-    void *bits = NULL;
-    HBITMAP hbm = CreateDIBSection(host->mem_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
-    if (hbm && bits) {
-        host->old_bmp    = SelectObject(host->mem_dc, hbm);
-        host->dib        = hbm;
-        host->dib_pixels = (uint32_t *)bits;
-        host->dib_w      = w;
-        host->dib_h      = h;
+        ArcrShellConfig scfg;
+        arcr_shell_default_config(&scfg, ARCR_SHELL_THEME_MODERN_DARK);
+        scfg.window_width       = 1120;
+        scfg.window_height      = 760;
+        scfg.show_bookmarks_bar = false;
+        scfg.show_devtools_dock = true;
+        scfg.private_browsing   = true;
+        scfg.module_search_dir  = mod_dir;
+
+        ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
+        /* Trigger one blocked tracker probe so Shield telemetry counter is non-zero */
+        if (arcr_shell_get_addons(sh)) {
+            (void)ws_addons_should_block_url(arcr_shell_get_addons(sh),
+                                             "https://doubleclick.net/pixel.js",
+                                             "example.com");
+        }
+        arcr_shell_open_tab_url(sh, "waterscape://addons", true);
+        arcr_shell_open_tab_url(sh, "waterscape://hardware", false);
+        arcr_shell_activate_tab(sh, 0u);
+
+        snprintf(path, sizeof(path), "%s/waterscape_addons_hardware.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, path) && all_ok;
+
+        arcr_shell_destroy(sh);
+        arcr_engine_destroy(eng);
     }
+
+    /* 4. waterscape_win2000_classic.png (+ shell_win2000_classic.png) */
+    {
+        ArcrEngineConfig ecfg;
+        arcr_engine_default_config(&ecfg, ARCR_PROFILE_MINIMUM);
+        ecfg.module_search_dir = mod_dir;
+        ecfg.private_browsing  = true;
+        ArcrEngine *eng = arcr_engine_create(&ecfg);
+        if (!eng) return false;
+
+        ArcrShellConfig scfg;
+        arcr_shell_default_config(&scfg, ARCR_SHELL_THEME_WIN2000_CLASSIC);
+        scfg.window_width         = 860;
+        scfg.window_height        = 640;
+        scfg.draw_os_window_frame = true;
+        scfg.private_browsing     = true;
+        scfg.module_search_dir    = mod_dir;
+
+        ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
+        arcr_shell_open_tab_url(sh, "waterscape://hardware", true);
+        arcr_shell_open_tab_html(sh, "https://waterscape.browser.org/win2000",
+                                 kWaterscapeShowcaseLightHtml,
+                                 strlen(kWaterscapeShowcaseLightHtml), false);
+        arcr_shell_activate_tab(sh, 0u);
+
+        snprintf(path, sizeof(path), "%s/waterscape_win2000_classic.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, path) && all_ok;
+        snprintf(legacy_path, sizeof(legacy_path), "%s/shell_win2000_classic.png", snap_dir);
+        all_ok = save_shell_png(eng, sh, scfg.window_width, scfg.window_height, legacy_path) && all_ok;
+
+        arcr_shell_destroy(sh);
+        arcr_engine_destroy(eng);
+    }
+
+    return all_ok;
 }
 
-static LRESULT CALLBACK arcr_win32_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    Win32HostWindow *host = (Win32HostWindow *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-
-    switch (msg) {
-    case WM_CREATE: {
-        CREATESTRUCTW *cs = (CREATESTRUCTW *)lParam;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
-        return 0;
-    }
-    case WM_ERASEBKGND:
-        return 1; /* Prevent flicker on non-composited Windows 2000/XP desktops */
-    case WM_SIZE:
-        if (host) {
-            int32_t w = (int32_t)(LOWORD(lParam));
-            int32_t h = (int32_t)(HIWORD(lParam));
-            if (w > 0 && h > 0) {
-                win32_resize_dib(host, w, h);
-                InvalidateRect(hwnd, NULL, FALSE);
-            }
-        }
-        return 0;
-    case WM_LBUTTONDOWN:
-        if (host && host->shell) {
-            int32_t x = (int32_t)(int16_t)LOWORD(lParam);
-            int32_t y = (int32_t)(int16_t)HIWORD(lParam);
-            int tab_idx = arcr_shell_hit_test_tab(host->shell, x, y);
-            if (tab_idx >= 0) {
-                arcr_shell_activate_tab(host->shell, (size_t)tab_idx);
-                host->scroll_y = 0;
-                ArcrWebView *v = arcr_shell_active_webview(host->shell);
-                if (v) arcr_webview_set_scroll(v, 0);
-                InvalidateRect(hwnd, NULL, FALSE);
-            }
-        }
-        return 0;
-    case WM_MOUSEWHEEL:
-        if (host && host->shell) {
-            int16_t delta = (int16_t)HIWORD(wParam);
-            host->scroll_y -= (delta / 120) * 48;
-            if (host->scroll_y < 0) host->scroll_y = 0;
-            ArcrWebView *v = arcr_shell_active_webview(host->shell);
-            if (v) arcr_webview_set_scroll(v, host->scroll_y);
-            InvalidateRect(hwnd, NULL, FALSE);
-        }
-        return 0;
-    case WM_KEYDOWN:
-        if (host && host->shell) {
-            if (wParam == VK_F2) {
-                ArcrShellTheme next = (ArcrShellTheme)(((int)arcr_shell_get_theme(host->shell) + 1) % 3);
-                arcr_shell_set_theme(host->shell, next, false);
-                InvalidateRect(hwnd, NULL, FALSE);
-                return 0;
-            }
-            if (wParam == 'B' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
-                bool vis = !arcr_shell_is_bookmarks_bar_visible(host->shell);
-                arcr_shell_set_bookmarks_bar_visible(host->shell, vis);
-                InvalidateRect(hwnd, NULL, FALSE);
-                return 0;
-            }
-            if (wParam == VK_DOWN || wParam == VK_UP || wParam == VK_NEXT || wParam == VK_PRIOR) {
-                int32_t step = (wParam == VK_NEXT || wParam == VK_PRIOR) ? 180 : 36;
-                if (wParam == VK_UP || wParam == VK_PRIOR) step = -step;
-                host->scroll_y += step;
-                if (host->scroll_y < 0) host->scroll_y = 0;
-                ArcrWebView *v = arcr_shell_active_webview(host->shell);
-                if (v) arcr_webview_set_scroll(v, host->scroll_y);
-                InvalidateRect(hwnd, NULL, FALSE);
-                return 0;
-            }
-        }
-        break;
-    case WM_IME_COMPOSITION:
-        if (host && host->shell) {
-            HIMC himc = ImmGetContext(hwnd);
-            if (himc) {
-                DWORD flag = (lParam & GCS_RESULTSTR) ? GCS_RESULTSTR : GCS_COMPSTR;
-                LONG bytes = ImmGetCompositionStringW(himc, flag, NULL, 0);
-                if (bytes > 0 && bytes < 512) {
-                    WCHAR wbuf[256];
-                    ZeroMemory(wbuf, sizeof(wbuf));
-                    ImmGetCompositionStringW(himc, flag, wbuf, (DWORD)bytes);
-                    char utf8[768];
-                    int n = WideCharToMultiByte(CP_UTF8, 0, wbuf, bytes / (LONG)sizeof(WCHAR),
-                                                utf8, (int)sizeof(utf8) - 1, NULL, NULL);
-                    if (n > 0) {
-                        utf8[n] = '\0';
-                        ArcrWebView *v = arcr_shell_active_webview(host->shell);
-                        if (v) {
-                            arcr_webview_ime_composition(v, utf8, n, (lParam & GCS_RESULTSTR) != 0);
-                        }
-                        char status[832];
-                        snprintf(status, sizeof(status), "IME 조합 입력: %s", utf8);
-                        arcr_shell_set_status_overlay(host->shell, status);
-                        InvalidateRect(hwnd, NULL, FALSE);
-                    }
-                }
-                ImmReleaseContext(hwnd, himc);
-            }
-        }
-        break;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hwnd, &ps);
-        if (host && host->shell && host->dib_pixels && host->dib_w > 0 && host->dib_h > 0) {
-            arcr_shell_render_frame(host->shell, host->dib_pixels,
-                                    host->dib_w, host->dib_h, host->dib_w);
-            BitBlt(hdc, 0, 0, host->dib_w, host->dib_h, host->mem_dc, 0, 0, SRCCOPY);
-        }
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    default:
-        break;
-    }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
-}
-
-static int run_win32_interactive_window(const char *mod_dir) {
-    ArcrSystemUiMetrics ui_m;
-    arcr_platform_query_ui_metrics(&ui_m);
-
-    ArcrProfileMode prof = ui_m.prefer_classic_opaque ? ARCR_PROFILE_MINIMUM : ARCR_PROFILE_MODERN;
-    ArcrShellTheme theme = ui_m.prefer_classic_opaque ? ARCR_SHELL_THEME_WIN2000_CLASSIC
-                                                      : ARCR_SHELL_THEME_MODERN_LIGHT;
+static int run_raster_benchmark(const char *mod_dir, ArcrProfileMode profile, ArcrShellTheme theme) {
+    enum { BENCH_W = 1280, BENCH_H = 800, BENCH_FRAMES = 100 };
 
     ArcrEngineConfig ecfg;
-    arcr_engine_default_config(&ecfg, prof);
+    arcr_engine_default_config(&ecfg, profile);
     ecfg.module_search_dir = mod_dir;
+    ecfg.private_browsing  = true;
 
     ArcrEngine *eng = arcr_engine_create(&ecfg);
     if (!eng) return 1;
 
     ArcrShellConfig scfg;
     arcr_shell_default_config(&scfg, theme);
-    scfg.draw_os_window_frame = false; /* Native Win32 provides outer window frame */
+    scfg.window_width       = BENCH_W;
+    scfg.window_height      = BENCH_H;
+    scfg.show_bookmarks_bar = true;
+    scfg.show_devtools_dock = true;
+    scfg.private_browsing   = true;
+    scfg.module_search_dir  = mod_dir;
+
+    ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
+    if (!sh) {
+        arcr_engine_destroy(eng);
+        return 1;
+    }
+    seed_default_bookmarks(sh);
+    arcr_shell_open_tab_html(sh, "https://waterscape.browser.org/bench",
+                             kWaterscapeShowcaseLightHtml,
+                             strlen(kWaterscapeShowcaseLightHtml), true);
+    arcr_shell_open_tab_url(sh, "waterscape://hardware", false);
+    arcr_shell_activate_tab(sh, 0u);
+
+    uint32_t *fb = (uint32_t *)calloc((size_t)BENCH_W * (size_t)BENCH_H, sizeof(uint32_t));
+    if (!fb) {
+        arcr_shell_destroy(sh);
+        arcr_engine_destroy(eng);
+        return 1;
+    }
+
+    /* Warmup frame */
+    arcr_shell_render_frame(sh, fb, BENCH_W, BENCH_H, BENCH_W);
+
+    uint64_t t0 = arcr_platform_monotonic_usec();
+    for (int i = 0; i < BENCH_FRAMES; ++i) {
+        ArcrWebView *av = arcr_shell_active_webview(sh);
+        if (av) arcr_webview_set_scroll(av, (i % 8) * 12);
+        arcr_shell_render_frame(sh, fb, BENCH_W, BENCH_H, BENCH_W);
+    }
+    uint64_t elapsed_us = arcr_platform_monotonic_usec() - t0;
+    if (elapsed_us == 0ULL) elapsed_us = 1ULL;
+
+    double total_ms   = (double)elapsed_us / 1000.0;
+    double avg_ms     = total_ms / (double)BENCH_FRAMES;
+    double fps        = 1000000.0 * (double)BENCH_FRAMES / (double)elapsed_us;
+    double total_mpix = ((double)BENCH_W * (double)BENCH_H * (double)BENCH_FRAMES) / 1000000.0;
+    double mpix_sec   = total_mpix / ((double)elapsed_us / 1000000.0);
+
+    ArcrEngineStats st;
+    memset(&st, 0, sizeof(st));
+    arcr_engine_get_stats(eng, &st);
+
+    printf("\n=== Waterscape 1.0 Multi-Core Tile + SIMD Rasterization Benchmark ===\n");
+    printf("  Resolution   : %dx%d (%d frames)\n", BENCH_W, BENCH_H, BENCH_FRAMES);
+    printf("  Workers/SIMD : %u threads | %s\n",
+           (unsigned)st.worker_thread_count, arcr_cpu_simd_tier_name(st.detected_cpu_flags));
+    printf("  Elapsed Time : %.2f ms (%.3f ms / frame)\n", total_ms, avg_ms);
+    printf("  Throughput   : %.1f FPS | %.1f MPix/sec\n", fps, mpix_sec);
+
+    free(fb);
+    arcr_shell_destroy(sh);
+    arcr_engine_destroy(eng);
+    return 0;
+}
+
+static void print_usage(const char *prog) {
+    printf("Usage: %s [options] [url]\n\n", prog);
+    printf("Options:\n");
+    printf("  --url <url>               Initial URL or search query (default: waterscape://newtab)\n");
+    printf("  --private                 Ephemeral private browsing (no disk history/prefs)\n");
+    printf("  --theme <light|dark|classic>  UI theme override\n");
+    printf("  --profile <minimum|balanced|modern>  Engine hardware resource profile\n");
+    printf("  --module-dir <dir>        Directory containing Tier-4 modules & .wsx add-ons\n");
+    printf("  --headless                Render 1 full frame offscreen, print telemetry & exit 0\n");
+    printf("  --snapshot-dir <dir>      Render flagship Waterscape showcase PNGs into <dir>\n");
+    printf("  --benchmark               Run 100-frame multi-core tile + SIMD benchmark\n");
+    printf("  --auto-close-ms <ms>      Auto-close desktop window after <ms> milliseconds\n");
+    printf("  --version                 Print browser & engine version\n");
+    printf("  --help                    Show this help message\n");
+}
+
+int main(int argc, char **argv) {
+    const char     *mod_dir       = ".";
+    const char     *snap_dir      = NULL;
+    const char     *initial_url   = NULL;
+    bool            private_mode  = false;
+    bool            headless      = false;
+    bool            benchmark     = false;
+    bool            theme_set     = false;
+    bool            profile_set   = false;
+    uint32_t        auto_close_ms = 0u;
+    ArcrShellTheme  theme         = ARCR_SHELL_THEME_MODERN_DARK;
+    ArcrProfileMode profile       = ARCR_PROFILE_MODERN;
+
+    for (int i = 1; i < argc; ++i) {
+        const char *arg = argv[i];
+        if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
+            printf("Waterscape Web Browser %s (Arcradient Pure C11 Engine %s)\n",
+                   WATERSCAPE_VERSION_STR, ARCRADIENT_VERSION_STR);
+            return 0;
+        }
+        if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
+            print_usage(argv[0]);
+            return 0;
+        }
+        if (strcmp(arg, "--private") == 0) {
+            private_mode = true;
+        } else if (strcmp(arg, "--headless") == 0) {
+            headless = true;
+        } else if (strcmp(arg, "--benchmark") == 0) {
+            benchmark = true;
+        } else if (strcmp(arg, "--url") == 0 && i + 1 < argc) {
+            initial_url = argv[++i];
+        } else if (strcmp(arg, "--module-dir") == 0 && i + 1 < argc) {
+            mod_dir = argv[++i];
+        } else if (strcmp(arg, "--snapshot-dir") == 0 && i + 1 < argc) {
+            snap_dir = argv[++i];
+        } else if (strcmp(arg, "--auto-close-ms") == 0 && i + 1 < argc) {
+            int32_t ms = 0;
+            const char *ms_s = argv[++i];
+            if (arcr_parse_i32(ms_s, strlen(ms_s), &ms) && ms > 0) {
+                auto_close_ms = (uint32_t)ms;
+            }
+        } else if (strcmp(arg, "--theme") == 0 && i + 1 < argc) {
+            const char *t = argv[++i];
+            theme_set = true;
+            if (arcr_str_eq_nocase(t, "dark"))         theme = ARCR_SHELL_THEME_MODERN_DARK;
+            else if (arcr_str_eq_nocase(t, "classic")) theme = ARCR_SHELL_THEME_WIN2000_CLASSIC;
+            else                                       theme = ARCR_SHELL_THEME_MODERN_LIGHT;
+        } else if (strcmp(arg, "--profile") == 0 && i + 1 < argc) {
+            const char *p = argv[++i];
+            profile_set = true;
+            if (arcr_str_eq_nocase(p, "minimum"))       profile = ARCR_PROFILE_MINIMUM;
+            else if (arcr_str_eq_nocase(p, "balanced")) profile = ARCR_PROFILE_BALANCED;
+            else                                        profile = ARCR_PROFILE_MODERN;
+        } else if (arg[0] != '-' && !initial_url) {
+            initial_url = arg;
+        }
+    }
+
+    ArcrSystemUiMetrics ui_m;
+    arcr_platform_query_ui_metrics(&ui_m);
+    if (!profile_set) {
+        profile = ui_m.prefer_classic_opaque ? ARCR_PROFILE_MINIMUM : ARCR_PROFILE_MODERN;
+    }
+    if (!theme_set) {
+        theme = ui_m.prefer_classic_opaque ? ARCR_SHELL_THEME_WIN2000_CLASSIC
+                                           : ARCR_SHELL_THEME_MODERN_LIGHT;
+    }
+
+    uint32_t cpu_flags = arcr_detect_cpu_flags();
+    ArcrGpuProbeResult gpu_probe;
+    memset(&gpu_probe, 0, sizeof(gpu_probe));
+    arcr_gpu_probe_system(&gpu_probe);
+
+    printf("Waterscape Web Browser %s — Powered by Arcradient Pure C11 Engine\n",
+           WATERSCAPE_VERSION_STR);
+    printf("  OS Platform  : %s (ver 0x%04X)\n",
+           arcr_platform_os_name(), (unsigned)arcr_platform_os_version());
+    printf("  Host SIMD    : %s (flags=0x%X)\n",
+           arcr_cpu_simd_tier_name(cpu_flags), (unsigned)cpu_flags);
+    printf("  GPU Probe    : %s (%s)\n",
+           arcr_accel_backend_name(gpu_probe.best_gpu_backend),
+           gpu_probe.adapter_description[0] ? gpu_probe.adapter_description : "Auto");
+
+    if (snap_dir) {
+        return run_snapshot_suite(mod_dir, snap_dir) ? 0 : 1;
+    }
+
+    if (benchmark) {
+        return run_raster_benchmark(mod_dir, profile, theme);
+    }
+
+    ArcrEngineConfig ecfg;
+    arcr_engine_default_config(&ecfg, profile);
+    ecfg.module_search_dir = mod_dir;
+    ecfg.private_browsing  = private_mode;
+
+    ArcrEngine *eng = arcr_engine_create(&ecfg);
+    if (!eng) {
+        fprintf(stderr, "waterscape: failed to initialize Arcradient Engine.\n");
+        return 1;
+    }
+
+    ArcrShellConfig scfg;
+    arcr_shell_default_config(&scfg, theme);
+    scfg.draw_os_window_frame = false; /* OS provides window border in desktop mode */
+    scfg.private_browsing     = private_mode;
+    scfg.load_saved_prefs     = (!private_mode && !theme_set);
+    scfg.module_search_dir    = mod_dir;
 
     ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
     if (!sh) {
@@ -379,102 +446,58 @@ static int run_win32_interactive_window(const char *mod_dir) {
         return 1;
     }
 
-    populate_demo_shell(sh, true, kKoreanShowcaseLightHtml);
-    arcr_shell_set_status_overlay(sh, "F2: 테마 전환 | Ctrl+B: 북마크 바 | 탭 클릭 지원");
+    seed_default_bookmarks(sh);
+    if (initial_url && initial_url[0] != '\0') {
+        arcr_shell_open_tab_url(sh, initial_url, true);
+    } else {
+        arcr_shell_open_tab_url(sh, "waterscape://newtab", true);
+        arcr_shell_open_tab_url(sh, "waterscape://hardware", false);
+        arcr_shell_activate_tab(sh, 0u);
+    }
 
-    Win32HostWindow host;
-    ZeroMemory(&host, sizeof(host));
-    host.shell = sh;
+    if (headless) {
+        int32_t w = scfg.window_width;
+        int32_t h = scfg.window_height;
+        uint32_t *fb = (uint32_t *)calloc((size_t)w * (size_t)h, sizeof(uint32_t));
+        bool ok = fb && arcr_shell_render_frame(sh, fb, w, h, w);
+        ArcrEngineStats st;
+        memset(&st, 0, sizeof(st));
+        arcr_engine_get_stats(eng, &st);
 
-    HINSTANCE hInst = GetModuleHandleW(NULL);
-    WNDCLASSEXW wc;
-    ZeroMemory(&wc, sizeof(wc));
-    wc.cbSize        = sizeof(wc);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc   = arcr_win32_wndproc;
-    wc.hInstance     = hInst;
-    wc.hCursor       = LoadCursorW(NULL, MAKEINTRESOURCEW(32512));
-    wc.lpszClassName = L"ArcradientBrowserWnd";
-    RegisterClassExW(&wc);
+        printf("  Headless Run : %s (%dx%d) | URL=%s\n",
+               ok ? "OK" : "FAIL", (int)w, (int)h,
+               arcr_shell_active_webview(sh)
+                   ? arcr_webview_get_url(arcr_shell_active_webview(sh))
+                   : "none");
+        printf("  Telemetry    : workers=%u tiles=%u layout=%luus paint=%luus addons=%lu arena=%luB\n",
+               (unsigned)st.worker_thread_count,
+               (unsigned)st.tiles_rendered_last_frame,
+               (unsigned long)st.last_layout_usec,
+               (unsigned long)st.last_paint_usec,
+               (unsigned long)(arcr_shell_get_addons(sh)
+                                   ? ws_addons_count(arcr_shell_get_addons(sh))
+                                   : 0u),
+               (unsigned long)st.arena_used_bytes);
 
-    HWND hwnd = CreateWindowExW(
-        0, wc.lpszClassName,
-        L"Arcradient Browser (MSHTML-Next \x00B7 Pure C11)",
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, scfg.window_width, scfg.window_height,
-        NULL, NULL, hInst, &host);
-    if (!hwnd) {
+        free(fb);
         arcr_shell_destroy(sh);
         arcr_engine_destroy(eng);
-        return 1;
+        return ok ? 0 : 1;
     }
 
-    ShowWindow(hwnd, SW_SHOWDEFAULT);
-    UpdateWindow(hwnd);
+    WaterscapeWindowOptions wopts;
+    memset(&wopts, 0, sizeof(wopts));
+    wopts.window_title        = private_mode
+                                    ? "Waterscape Browser (사생활 보호)"
+                                    : "Waterscape Browser";
+    wopts.initial_width       = scfg.window_width;
+    wopts.initial_height      = scfg.window_height;
+    wopts.force_cpu_presenter = ecfg.force_cpu_rendering;
+    wopts.auto_close_ms       = auto_close_ms;
 
-    MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
-    if (host.dib) {
-        SelectObject(host.mem_dc, host.old_bmp);
-        DeleteObject(host.dib);
-    }
-    if (host.mem_dc) DeleteDC(host.mem_dc);
+    int rc = waterscape_run_desktop_window(eng, sh, &wopts);
+    arcr_shell_save_profile(sh);
     arcr_shell_destroy(sh);
     arcr_engine_destroy(eng);
-    return (int)msg.wParam;
-}
-#endif /* _WIN32 */
-
-int main(int argc, char **argv) {
-    uint32_t cpu_flags = arcr_detect_cpu_flags();
-    printf("Arcradient Browser / Engine (MSHTML-Next · Pure C11)\n");
-    printf("  OS Platform  : %s (ver 0x%04X)\n",
-           arcr_platform_os_name(), (unsigned)arcr_platform_os_version());
-    printf("  Host SIMD    : %s (flags=0x%X)\n",
-           arcr_cpu_simd_tier_name(cpu_flags), cpu_flags);
-
-    const char *mod_dir = ".";
-    const char *snap_dir = NULL;
-    bool headless = false;
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--module-dir") == 0 && i + 1 < argc) {
-            mod_dir = argv[++i];
-        } else if (strcmp(argv[i], "--snapshot-dir") == 0 && i + 1 < argc) {
-            snap_dir = argv[++i];
-        } else if (strcmp(argv[i], "--headless") == 0) {
-            headless = true;
-        }
-    }
-
-    if (snap_dir) {
-        char p1[512], p2[512], p3[512];
-        snprintf(p1, sizeof(p1), "%s/shell_modern_light.png", snap_dir);
-        snprintf(p2, sizeof(p2), "%s/shell_modern_dark.png", snap_dir);
-        snprintf(p3, sizeof(p3), "%s/shell_win2000_classic.png", snap_dir);
-
-        bool ok1 = render_theme_snapshot(mod_dir, p1, ARCR_PROFILE_MODERN,
-                                         ARCR_SHELL_THEME_MODERN_LIGHT, false,
-                                         kKoreanShowcaseLightHtml);
-        bool ok2 = render_theme_snapshot(mod_dir, p2, ARCR_PROFILE_MODERN,
-                                         ARCR_SHELL_THEME_MODERN_DARK, true,
-                                         kKoreanShowcaseDarkHtml);
-        bool ok3 = render_theme_snapshot(mod_dir, p3, ARCR_PROFILE_MINIMUM,
-                                         ARCR_SHELL_THEME_WIN2000_CLASSIC, false,
-                                         kKoreanShowcaseLightHtml);
-        return (ok1 && ok2 && ok3) ? 0 : 1;
-    }
-
-#if defined(_WIN32)
-    if (!headless) {
-        return run_win32_interactive_window(mod_dir);
-    }
-#else
-    (void)headless;
-#endif
-
-    return 0;
+    return rc;
 }

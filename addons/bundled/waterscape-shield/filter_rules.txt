@@ -1,0 +1,92 @@
+! Title: Waterscape Shield Built-in Protection List
+! Version: 1.0.0
+! Description: High-speed O(1) domain & URL substring rules blocking ads, trackers, telemetry, and malvertising
+# Syntax: EasyList / Adblock Plus subset (||domain^, /path_substring, @@||exception^)
+
+! --- Major Ad Networks & Exchanges ---
+||doubleclick.net^
+||googlesyndication.com^
+||googleadservices.com^
+||adservice.google.com^
+||2mdn.net^
+||adnxs.com^
+||adsrvr.org^
+||criteo.com^
+||criteo.net^
+||rubiconproject.com^
+||pubmatic.com^
+||openx.net^
+||casalemedia.com^
+||indexww.com^
+||smartadserver.com^
+||adform.net^
+||advertising.com^
+||amazon-adsystem.com^
+||media.net^
+||yieldmo.com^
+||triplelift.com^
+||sharethrough.com^
+||sovrn.com^
+||teads.tv^
+||zedo.com^
+||popads.net^
+||popcash.net^
+||propellerads.com^
+
+! --- Native Ad Widgets & Recommendation Trackers ---
+||taboola.com^
+||outbrain.com^
+||revcontent.com^
+||mgid.com^
+
+! --- Cross-Site Analytics, Session Replay & Behavioral Telemetry ---
+||google-analytics.com^
+||googletagmanager.com^
+||googletagservices.com^
+||connect.facebook.net^
+||pixel.facebook.com^
+||an.facebook.com^
+||scorecardresearch.com^
+||quantserve.com^
+||hotjar.com^
+||mouseflow.com^
+||fullstory.com^
+||luckyorange.com^
+||crazyegg.com^
+||clarity.ms^
+||bat.bing.com^
+||ads-twitter.com^
+||analytics.tiktok.com^
+||snap.licdn.com^
+||mc.yandex.ru^
+||moatads.com^
+||doubleverify.com^
+||iasds01.com^
+||chartbeat.com^
+||mixpanel.com^
+||amplitude.com^
+||segment.io^
+||newrelic.com^
+||nr-data.net^
+||bugsnag.com^
+
+! --- Test & Verification Domains ---
+||ads.example.com^
+||tracker.example.com^
+||telemetry.example.org^
+||malvertising.invalid^
+
+! --- High-Confidence URL Substring & Path Filters ---
+/ads/
+/pagead/
+/adserver/
+/banner_ad
+/tracker.js
+adbanner
+/adframe.
+/popunder.
+/sponsored_pixel
+/collect?v=1&_v=
+
+! --- First-Party Verification Allowlist Exceptions ---
+@@||safe-allowlist.waterscape.local^

@@ -1,0 +1,10 @@
+{
+  "manifest_version": 2,
+  "id": "waterscape-shield",
+  "name": "Waterscape Shield",
+  "version": "1.0.0",
+  "description": "실시간 광고·추적기·원격분석 차단 엔진 (O(1) FNV-1a Ad, Tracker & Telemetry Blocker)",
+  "enabled_by_default": true,
+  "filter_rules": "filter_rules.txt",
+  "css": "inject.css"
+}

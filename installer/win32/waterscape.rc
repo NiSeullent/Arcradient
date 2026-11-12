@@ -1,0 +1,53 @@
+/*
+ * Waterscape Browser 1.0 / Arcradient Engine (MSHTML-Next)
+ * installer/win32/waterscape.rc - Win32 Application Icon & Version Resource Script
+ *
+ * Compatible with MinGW-w64 `windres` and Microsoft `rc.exe`.
+ * Pass `-DWATERSCAPE_HAVE_ICON_RC` (and optional `-DWATERSCAPE_ICON_PATH=\"...\"`)
+ * once `gen_brand_assets` has produced `waterscape.ico`.
+ */
+#include <winver.h>
+
+#define IDI_WATERSCAPE_MAIN 101
+
+#ifdef WATERSCAPE_HAVE_ICON_RC
+#  ifndef WATERSCAPE_ICON_PATH
+#    define WATERSCAPE_ICON_PATH "waterscape.ico"
+#  endif
+IDI_WATERSCAPE_MAIN ICON WATERSCAPE_ICON_PATH
+#endif
+
+1 24 "waterscape.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     1,0,0,0
+PRODUCTVERSION  1,0,0,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+#ifdef _DEBUG
+FILEFLAGS       VS_FF_DEBUG
+#else
+FILEFLAGS       0x0L
+#endif
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "Arcradient Project\0"
+            VALUE "FileDescription",  "Waterscape Web Browser (Arcradient Pure C11 Engine)\0"
+            VALUE "FileVersion",      "1.0.0.0\0"
+            VALUE "InternalName",     "waterscape\0"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 Arcradient Project (MIT License)\0"
+            VALUE "OriginalFilename", "waterscape.exe\0"
+            VALUE "ProductName",      "Waterscape Browser\0"
+            VALUE "ProductVersion",   "1.0.0\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

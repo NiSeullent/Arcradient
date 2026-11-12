@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcradient VERSION 0.1.0 LANGUAGES C)
+project(waterscape VERSION 1.0.0 LANGUAGES C)
 
 # Strict Pure C11 standard without GNU VLA bloat
 set(CMAKE_C_STANDARD 11)
@@ -7,21 +7,40 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 
 option(ARCR_LEGACY_X86_WIN2000 "Target Windows 2000 SP4 32-bit x86 + SSE1 baseline" OFF)
-option(ARCR_BASELINE_X64_SSE3  "Target x86-64 SSE3 baseline (no SSE4.x/AVX required)" ON)
-option(ARCR_ENABLE_FREETYPE    "Enable optional FreeType2 CJK glyph backend on POSIX" ON)
-option(ARCR_ENABLE_LIBPNG      "Enable optional libpng PNG snapshot export on POSIX" ON)
+option(ARCR_BASELINE_X64_SSE3  "Target x86-64 SSE3 baseline (no SSE4.x/AVX required; AVX2 runtime-dispatched)" ON)
+option(ARCR_ENABLE_FREETYPE    "Enable optional FreeType2 CJK/Mono glyph backend on POSIX" ON)
+option(ARCR_ENABLE_LIBPNG      "Enable optional libpng PNG export on POSIX (falls back to Pure C PNG codec)" ON)
+option(ARCR_ENABLE_OPENSSL     "Enable OpenSSL TLS 1.2/1.3 HTTPS client on POSIX" ON)
+option(WATERSCAPE_ENABLE_X11   "Enable native X11 + MIT-SHM desktop window presenter on POSIX" ON)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options(-Wall -Wextra -Wpedantic -Wvla)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:C>:-Wall>
+        $<$<COMPILE_LANGUAGE:C>:-Wextra>
+        $<$<COMPILE_LANGUAGE:C>:-Wpedantic>
+        $<$<COMPILE_LANGUAGE:C>:-Wvla>
+    )
     if(ARCR_LEGACY_X86_WIN2000)
-        add_compile_options(-m32 -march=pentium3 -msse -mno-sse2)
+        add_compile_options(
+            $<$<COMPILE_LANGUAGE:C>:-m32>
+            $<$<COMPILE_LANGUAGE:C>:-march=pentium3>
+            $<$<COMPILE_LANGUAGE:C>:-msse>
+            $<$<COMPILE_LANGUAGE:C>:-mno-sse2>
+        )
     elseif(ARCR_BASELINE_X64_SSE3 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-        # Baseline x64 guarantees SSE2+SSE3 without requiring SSE4.x or AVX!
-        add_compile_options(-msse3 -mno-ssse3 -mno-sse4.1 -mno-sse4.2 -mno-avx)
+        # Baseline x64 guarantees SSE2+SSE3 without requiring SSE4.x or AVX on older x64 CPUs!
+        add_compile_options(
+            $<$<COMPILE_LANGUAGE:C>:-msse3>
+            $<$<COMPILE_LANGUAGE:C>:-mno-ssse3>
+            $<$<COMPILE_LANGUAGE:C>:-mno-sse4.1>
+            $<$<COMPILE_LANGUAGE:C>:-mno-sse4.2>
+            $<$<COMPILE_LANGUAGE:C>:-mno-avx>
+        )
     endif()
 endif()
 
 if(WIN32)
+    enable_language(RC)
     add_compile_definitions(
         WIN32_LEAN_AND_MEAN
         UNICODE
@@ -42,9 +61,13 @@ if(WIN32)
             )
         endif()
     endif()
+else()
+    add_compile_definitions(_POSIX_C_SOURCE=200809L)
 endif()
 
-# Platform & header interface shared across Engine Core and On-Demand Dynamic Modules
+# =============================================================================
+# Tier 0 & Tier 1: Zero-Dependency Base + Strict OS Platform Abstraction
+# =============================================================================
 add_library(arcr_platform_deps INTERFACE)
 target_include_directories(arcr_platform_deps INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
@@ -52,13 +75,14 @@ target_include_directories(arcr_platform_deps INTERFACE
     "${CMAKE_CURRENT_SOURCE_DIR}/platform"
 )
 
-# Base + Platform object library (compiled once with PIC; zero duplicate import-lib collisions)
 set(ARCR_BASE_SOURCES
     base/arcr_arena.c
     base/arcr_atom.c
     base/arcr_str.c
     base/arcr_utf8.c
     base/arcr_cpuid.c
+    base/arcr_codec.c
+    base/arcr_threadpool.c
 )
 
 if(WIN32)
@@ -72,9 +96,14 @@ set_target_properties(arcr_base PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(arcr_base PUBLIC arcr_platform_deps)
 
 if(WIN32)
-    target_link_libraries(arcr_platform_deps INTERFACE gdi32 user32 advapi32 imm32 ws2_32)
+    # Native Win32 system DLLs present since Windows 2000 SP4 (zero winpthread/vcruntime!)
+    target_link_libraries(arcr_platform_deps INTERFACE
+        gdi32 user32 advapi32 shell32 ole32 comctl32 imm32 ws2_32
+    )
 else()
-    target_link_libraries(arcr_platform_deps INTERFACE ${CMAKE_DL_LIBS})
+    find_package(Threads REQUIRED)
+    target_link_libraries(arcr_platform_deps INTERFACE ${CMAKE_DL_LIBS} Threads::Threads m)
+
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND AND ARCR_ENABLE_FREETYPE)
         pkg_check_modules(FREETYPE QUIET freetype2)
@@ -94,9 +123,24 @@ else()
     endif()
 endif()
 
-# Unified Lightweight Engine Core (base + core + css + layout + paint + accel router)
+# =============================================================================
+# Tier 2: Runtime-Dispatched AVX2 SIMD Kernel Object (Guarded by CPUID at Runtime)
+# =============================================================================
+add_library(arcr_accel_avx2_obj OBJECT accel/arcr_accel_avx2.c)
+set_target_properties(arcr_accel_avx2_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_link_libraries(arcr_accel_avx2_obj PUBLIC arcr_platform_deps)
+if((CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+   AND (NOT ARCR_LEGACY_X86_WIN2000)
+   AND (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64"))
+    target_compile_options(arcr_accel_avx2_obj PRIVATE -mavx2)
+endif()
+
+# =============================================================================
+# Tier 3: Unified Clean-Room Web Engine Core (DOM + O(1) CSS3 + Layout + 64x64 Tile Paint)
+# =============================================================================
 add_library(arcr_engine SHARED
     $<TARGET_OBJECTS:arcr_base>
+    $<TARGET_OBJECTS:arcr_accel_avx2_obj>
     accel/arcr_accel.c
     core/arcr_dom.c
     core/arcr_html_parser.c
@@ -111,9 +155,19 @@ if(MINGW)
     target_link_options(arcr_engine PRIVATE "LINKER:--export-all-symbols")
 endif()
 
-# On-Demand Dynamically Loaded Feature Modules (Loaded ONLY when page requests them!)
+# =============================================================================
+# Tier 4: On-Demand Dynamically Loaded Engine Modules (.dll / .so)
+# =============================================================================
 add_library(arcr_net SHARED net/arcr_net.c $<TARGET_OBJECTS:arcr_base>)
 target_link_libraries(arcr_net PRIVATE arcr_platform_deps)
+if((NOT WIN32) AND PkgConfig_FOUND AND ARCR_ENABLE_OPENSSL)
+    pkg_check_modules(OPENSSL QUIET openssl)
+    if(OPENSSL_FOUND)
+        target_compile_definitions(arcr_net PRIVATE ARCR_HAVE_OPENSSL=1)
+        target_include_directories(arcr_net PRIVATE ${OPENSSL_INCLUDE_DIRS})
+        target_link_libraries(arcr_net PRIVATE ${OPENSSL_LIBRARIES})
+    endif()
+endif()
 
 add_library(arcr_js_portable SHARED js/arcr_js_portable.c $<TARGET_OBJECTS:arcr_base>)
 target_link_libraries(arcr_js_portable PRIVATE arcr_platform_deps)
@@ -124,23 +178,195 @@ target_link_libraries(arcr_media PRIVATE arcr_platform_deps)
 add_library(arcr_devtools SHARED devtools/arcr_devtools.c $<TARGET_OBJECTS:arcr_base>)
 target_link_libraries(arcr_devtools PRIVATE arcr_platform_deps)
 
-# Arcradient Browser Shell (Decoupled from internal Engine structs via arcradient_embed.h)
-add_library(arcr_shell STATIC shell/arcr_shell.c)
+# =============================================================================
+# Tier 5: Official Native C11 Telemetry Plugin & WebExtensions (.wsx) Host
+# =============================================================================
+add_library(ws_plugin_perf_hud SHARED plugins/perf_hud/ws_plugin_perf_hud.c $<TARGET_OBJECTS:arcr_base>)
+target_link_libraries(ws_plugin_perf_hud PRIVATE arcr_platform_deps)
+
+# =============================================================================
+# Tier 7 (Part A): Host Build Tools -> Procedural Brand Assets & .wsx Add-ons
+# =============================================================================
+set(WS_BRAND_DIR  "${CMAKE_BINARY_DIR}/brand")
+set(WS_ADDONS_DIR "${CMAKE_BINARY_DIR}/addons")
+
+if(CMAKE_CROSSCOMPILING)
+    find_program(WS_HOST_CC NAMES cc gcc clang REQUIRED)
+    set(WS_HOST_BIN_DIR "${CMAKE_BINARY_DIR}/host_tools")
+    file(MAKE_DIRECTORY "${WS_HOST_BIN_DIR}")
+
+    set(GEN_BRAND_TOOL      "${WS_HOST_BIN_DIR}/gen_brand_assets")
+    set(PACK_WSX_TOOL       "${WS_HOST_BIN_DIR}/pack_wsx")
+    set(PACK_INSTALLER_TOOL "${WS_HOST_BIN_DIR}/pack_installer")
+
+    add_custom_command(
+        OUTPUT "${GEN_BRAND_TOOL}"
+        COMMAND "${WS_HOST_CC}" -std=c11 -O2 -D_POSIX_C_SOURCE=200809L
+                -I"${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_brand_assets.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/base/arcr_codec.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/base/arcr_str.c"
+                -lm -o "${GEN_BRAND_TOOL}"
+        DEPENDS tools/gen_brand_assets.c base/arcr_codec.c base/arcr_str.c
+        COMMENT "Building host tool gen_brand_assets"
+    )
+    add_custom_command(
+        OUTPUT "${PACK_WSX_TOOL}"
+        COMMAND "${WS_HOST_CC}" -std=c11 -O2 -D_POSIX_C_SOURCE=200809L
+                -I"${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/pack_wsx.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/base/arcr_codec.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/base/arcr_str.c"
+                -o "${PACK_WSX_TOOL}"
+        DEPENDS tools/pack_wsx.c base/arcr_codec.c base/arcr_str.c
+        COMMENT "Building host tool pack_wsx"
+    )
+    add_custom_command(
+        OUTPUT "${PACK_INSTALLER_TOOL}"
+        COMMAND "${WS_HOST_CC}" -std=c11 -O2 -D_POSIX_C_SOURCE=200809L
+                -I"${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/pack_installer.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/base/arcr_codec.c"
+                "${CMAKE_CURRENT_SOURCE_DIR}/base/arcr_str.c"
+                -o "${PACK_INSTALLER_TOOL}"
+        DEPENDS tools/pack_installer.c base/arcr_codec.c base/arcr_str.c
+        COMMENT "Building host tool pack_installer"
+    )
+else()
+    add_executable(gen_brand_assets tools/gen_brand_assets.c base/arcr_codec.c base/arcr_str.c)
+    target_include_directories(gen_brand_assets PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+    if(NOT WIN32)
+        target_link_libraries(gen_brand_assets PRIVATE m)
+    endif()
+
+    add_executable(pack_wsx tools/pack_wsx.c base/arcr_codec.c base/arcr_str.c)
+    target_include_directories(pack_wsx PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+    add_executable(pack_installer tools/pack_installer.c base/arcr_codec.c base/arcr_str.c)
+    target_include_directories(pack_installer PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+
+    set(GEN_BRAND_TOOL      "$<TARGET_FILE:gen_brand_assets>")
+    set(PACK_WSX_TOOL       "$<TARGET_FILE:pack_wsx>")
+    set(PACK_INSTALLER_TOOL "$<TARGET_FILE:pack_installer>")
+endif()
+
+add_custom_command(
+    OUTPUT
+        "${WS_BRAND_DIR}/waterscape.ico"
+        "${WS_BRAND_DIR}/waterscape_256.png"
+        "${WS_BRAND_DIR}/waterscape_48.png"
+        "${WS_BRAND_DIR}/waterscape.svg"
+        "${WS_BRAND_DIR}/wizard_banner.bmp"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${WS_BRAND_DIR}"
+    COMMAND "${GEN_BRAND_TOOL}" "${WS_BRAND_DIR}"
+    DEPENDS "${GEN_BRAND_TOOL}"
+    COMMENT "Generating Waterscape procedural brand icons & banners"
+)
+add_custom_target(waterscape_brand_assets ALL
+    DEPENDS
+        "${WS_BRAND_DIR}/waterscape.ico"
+        "${WS_BRAND_DIR}/waterscape_256.png"
+        "${WS_BRAND_DIR}/waterscape_48.png"
+        "${WS_BRAND_DIR}/waterscape.svg"
+        "${WS_BRAND_DIR}/wizard_banner.bmp"
+)
+
+set(WS_BUNDLED_ADDON_OUTPUTS "")
+foreach(ADDON_ID IN ITEMS waterscape-shield waterscape-dark waterscape-reader)
+    set(ADDON_OUT "${WS_ADDONS_DIR}/${ADDON_ID}.wsx")
+    file(GLOB ADDON_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/addons/bundled/${ADDON_ID}/*")
+    add_custom_command(
+        OUTPUT "${ADDON_OUT}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${WS_ADDONS_DIR}"
+        COMMAND "${PACK_WSX_TOOL}" "${CMAKE_CURRENT_SOURCE_DIR}/addons/bundled/${ADDON_ID}" "${ADDON_OUT}"
+        DEPENDS "${PACK_WSX_TOOL}" ${ADDON_SRCS}
+        COMMENT "Packaging bundled extension ${ADDON_ID}.wsx"
+    )
+    list(APPEND WS_BUNDLED_ADDON_OUTPUTS "${ADDON_OUT}")
+endforeach()
+add_custom_target(waterscape_bundled_addons ALL DEPENDS ${WS_BUNDLED_ADDON_OUTPUTS})
+
+# =============================================================================
+# Tier 6: Waterscape Browser Shell & Hardware-Accelerated Desktop Presenters
+# =============================================================================
+add_library(arcr_shell STATIC
+    addons/ws_addons.c
+    shell/arcr_shell.c
+    shell/waterscape_win32.c
+    shell/waterscape_x11.c
+)
 target_link_libraries(arcr_shell PUBLIC arcr_engine arcr_platform_deps)
 
-add_executable(arcradient shell/main.c)
-target_link_libraries(arcradient PRIVATE arcr_shell)
+if((NOT WIN32) AND PkgConfig_FOUND AND WATERSCAPE_ENABLE_X11)
+    pkg_check_modules(X11_SHM QUIET x11 xext)
+    if(X11_SHM_FOUND)
+        target_compile_definitions(arcr_shell PUBLIC WATERSCAPE_HAVE_X11=1)
+        target_include_directories(arcr_shell PUBLIC ${X11_SHM_INCLUDE_DIRS})
+        target_link_libraries(arcr_shell PUBLIC ${X11_SHM_LIBRARIES})
+    endif()
+endif()
 
-# Verification & Regression Suite
-enable_testing()
-add_executable(arcr_tests tests/test_suite.c)
-target_link_libraries(arcr_tests PRIVATE arcr_shell arcr_engine arcr_platform_deps)
-add_test(NAME ArcradientCoreSuite COMMAND arcr_tests "$<TARGET_FILE_DIR:arcr_net>")
+set(WS_WIN32_RC_SRCS "")
+if(WIN32)
+    set(WS_WIN32_RC_SRCS "${CMAKE_CURRENT_SOURCE_DIR}/installer/win32/waterscape.rc")
+    set_source_files_properties("${WS_WIN32_RC_SRCS}" PROPERTIES
+        COMPILE_DEFINITIONS "WATERSCAPE_HAVE_ICON_RC"
+        INCLUDE_DIRECTORIES "${WS_BRAND_DIR};${CMAKE_CURRENT_SOURCE_DIR}/installer/win32"
+        OBJECT_DEPENDS "${WS_BRAND_DIR}/waterscape.ico;${CMAKE_CURRENT_SOURCE_DIR}/installer/win32/waterscape.manifest"
+    )
+endif()
+
+# Primary Waterscape Browser Executable + `arcradient` Compatibility Binary
+add_executable(waterscape shell/main.c ${WS_WIN32_RC_SRCS})
+target_link_libraries(waterscape PRIVATE arcr_shell)
+add_dependencies(waterscape waterscape_brand_assets waterscape_bundled_addons ws_plugin_perf_hud)
+if(WIN32)
+    target_include_directories(waterscape PRIVATE "${WS_BRAND_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/installer/win32")
+endif()
+
+add_executable(arcradient shell/main.c ${WS_WIN32_RC_SRCS})
+target_link_libraries(arcradient PRIVATE arcr_shell)
+add_dependencies(arcradient waterscape_brand_assets waterscape_bundled_addons ws_plugin_perf_hud)
+if(WIN32)
+    target_include_directories(arcradient PRIVATE "${WS_BRAND_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/installer/win32")
+endif()
+
+# =============================================================================
+# Tier 7 (Part B): Native Self-Extracting Setup Wizard & Uninstaller
+# =============================================================================
+add_executable(waterscape_uninstall
+    installer/win32/waterscape_uninstall.c
+    base/arcr_str.c
+    ${WS_WIN32_RC_SRCS}
+)
+target_include_directories(waterscape_uninstall PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+set_target_properties(waterscape_uninstall PROPERTIES OUTPUT_NAME "uninstall")
+add_dependencies(waterscape_uninstall waterscape_brand_assets)
+if(WIN32)
+    target_include_directories(waterscape_uninstall PRIVATE "${WS_BRAND_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/installer/win32")
+    target_link_libraries(waterscape_uninstall PRIVATE user32 advapi32 shell32 ole32)
+endif()
+
+add_executable(waterscape_setup_stub
+    installer/win32/waterscape_setup.c
+    base/arcr_codec.c
+    base/arcr_str.c
+    base/arcr_cpuid.c
+    ${WS_WIN32_RC_SRCS}
+)
+target_include_directories(waterscape_setup_stub PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+add_dependencies(waterscape_setup_stub waterscape_brand_assets)
+if(WIN32)
+    target_include_directories(waterscape_setup_stub PRIVATE "${WS_BRAND_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/installer/win32")
+    target_link_libraries(waterscape_setup_stub PRIVATE
+        user32 gdi32 advapi32 shell32 ole32 comctl32
+    )
+endif()
 
 if(WIN32)
     # Match arcr_platform_format_module_path ("%s\\%s.dll") without MinGW "lib" prefix
     set_target_properties(
-        arcr_engine arcr_net arcr_js_portable arcr_media arcr_devtools
+        arcr_engine arcr_net arcr_js_portable arcr_media arcr_devtools ws_plugin_perf_hud
         PROPERTIES
             PREFIX ""
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
@@ -148,8 +374,55 @@ if(WIN32)
             ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     )
     set_target_properties(
-        arcradient arcr_tests
+        waterscape arcradient waterscape_uninstall waterscape_setup_stub
         PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     )
+
+    set(WS_STAGE_DIR "${CMAKE_BINARY_DIR}/installer_stage")
+    set(WS_SETUP_EXE "${CMAKE_BINARY_DIR}/WaterscapeSetup.exe")
+
+    add_custom_command(
+        OUTPUT "${WS_SETUP_EXE}"
+        COMMAND "${CMAKE_COMMAND}" -E rm -rf "${WS_STAGE_DIR}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${WS_STAGE_DIR}/addons"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:waterscape>"          "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcradient>"          "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:waterscape_uninstall>" "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_engine>"         "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_net>"            "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_js_portable>"    "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_media>"          "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_devtools>"       "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:ws_plugin_perf_hud>"  "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "${WS_BRAND_DIR}/waterscape.ico"     "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy ${WS_BUNDLED_ADDON_OUTPUTS}          "${WS_STAGE_DIR}/addons/"
+        COMMAND "${PACK_INSTALLER_TOOL}" "$<TARGET_FILE:waterscape_setup_stub>" "${WS_STAGE_DIR}" "${WS_SETUP_EXE}"
+        DEPENDS
+            waterscape arcradient waterscape_uninstall waterscape_setup_stub
+            arcr_engine arcr_net arcr_js_portable arcr_media arcr_devtools ws_plugin_perf_hud
+            waterscape_brand_assets waterscape_bundled_addons "${PACK_INSTALLER_TOOL}"
+        COMMENT "Packing single-file self-extracting Windows installer WaterscapeSetup.exe"
+    )
+    add_custom_target(waterscape_win32_installer ALL DEPENDS "${WS_SETUP_EXE}")
 endif()
+
+# =============================================================================
+# Verification & Benchmark Suite
+# =============================================================================
+enable_testing()
+add_executable(arcr_tests tests/test_suite.c)
+target_link_libraries(arcr_tests PRIVATE arcr_shell arcr_engine arcr_platform_deps)
+add_dependencies(arcr_tests
+    arcr_net arcr_js_portable arcr_media arcr_devtools ws_plugin_perf_hud
+    waterscape_bundled_addons waterscape_brand_assets
+    waterscape_setup_stub waterscape_uninstall
+)
+if(NOT CMAKE_CROSSCOMPILING)
+    add_dependencies(arcr_tests pack_installer)
+endif()
+if(WIN32)
+    add_dependencies(arcr_tests waterscape_win32_installer)
+    set_target_properties(arcr_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+endif()
+add_test(NAME WaterscapeFullSuite COMMAND arcr_tests "$<TARGET_FILE_DIR:arcr_net>")

@@ -1,0 +1,54 @@
+/* NightScape Dark Mode - High-Contrast Slate Palette */
+html,
+body {
+    background-color: #0F172A !important;
+    color: #E2E8F0 !important;
+}
+
+main,
+article,
+section,
+header,
+footer,
+div.content,
+div.container {
+    background-color: #0F172A;
+    color: #E2E8F0;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+    color: #F8FAFC !important;
+}
+
+a {
+    color: #60A5FA !important;
+}
+
+pre,
+code {
+    background-color: #1E293B !important;
+    color: #F1F5F9 !important;
+    border-color: #334155 !important;
+}
+
+blockquote,
+table,
+th,
+td,
+input,
+textarea,
+select,
+button {
+    background-color: #1E293B !important;
+    color: #E2E8F0 !important;
+    border-color: #334155 !important;
+}
+
+hr {
+    border-color: #334155 !important;
+}

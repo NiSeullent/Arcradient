@@ -1,0 +1,40 @@
+/* Waterscape Reader View - Clutter Stripping & Centered Editorial Typography */
+nav,
+aside,
+footer,
+.sidebar,
+.cookie-banner,
+.cookie-notice,
+.newsletter-signup,
+.share-bar,
+.social-share,
+.related-posts,
+.ad-banner,
+.advertisement {
+    display: none !important;
+}
+
+body {
+    max-width: 720px !important;
+    margin: 0 auto !important;
+    font-size: 18px !important;
+    line-height: 28px !important;
+    padding: 28px !important;
+    background-color: #FAF8F5;
+    color: #1E293B;
+}
+
+article,
+main,
+.article-body,
+.post-content {
+    max-width: 720px;
+    margin: 0 auto;
+    font-size: 18px;
+    line-height: 28px;
+}
+
+img {
+    max-width: 100%;
+    height: auto;
+}

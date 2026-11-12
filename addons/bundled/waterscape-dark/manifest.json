@@ -1,0 +1,10 @@
+{
+  "manifest_version": 2,
+  "id": "waterscape-dark",
+  "name": "NightScape Dark Mode",
+  "version": "1.0.0",
+  "description": "웹 페이지에 눈이 편안한 슬레이트 다크 팔레트를 적용합니다 (Adaptive Slate Dark Mode for Web Documents)",
+  "enabled_by_default": false,
+  "css": "inject.css",
+  "js": "content.js"
+}

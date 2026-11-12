@@ -1,0 +1,17 @@
+/* Waterscape Shield - Cosmetic Ad & Tracking Container Hiding */
+.ad-banner,
+.adsbox,
+.advertisement,
+.sponsored-ad,
+.ad-container,
+.ad-slot,
+.ad-wrapper,
+.dfp-ad,
+.google-ad,
+.taboola-widget,
+.outbrain-widget,
+#google_ads,
+#google_ads_frame1,
+[id^="google_ads"] {
+    display: none !important;
+}

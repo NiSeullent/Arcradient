@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Waterscape Web Browser
+GenericName=Web Browser
+Comment=Ultra-fast lightweight Pure C11 web browser
+Exec=waterscape %U
+Icon=waterscape
+Terminal=false
+StartupNotify=true
+StartupWMClass=waterscape
+Categories=Network;WebBrowser;
+MimeType=text/html;x-scheme-handler/http;x-scheme-handler/https;

@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="wsBg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#081330"/>
+      <stop offset="55%" stop-color="#0E2C60"/>
+      <stop offset="100%" stop-color="#125294"/>
+    </linearGradient>
+    <radialGradient id="wsGlow" cx="50%" cy="42%" r="38%">
+      <stop offset="0%" stop-color="#38BDF8" stop-opacity="0.35"/>
+      <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="wsWaveMid" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#22D3EE"/>
+      <stop offset="100%" stop-color="#0369A1"/>
+    </linearGradient>
+    <linearGradient id="wsWaveFront" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#67E8F9"/>
+      <stop offset="100%" stop-color="#0E7490"/>
+    </linearGradient>
+    <clipPath id="wsSquircle">
+      <rect x="12" y="12" width="232" height="232" rx="56" ry="56"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#wsSquircle)">
+    <rect x="12" y="12" width="232" height="232" fill="url(#wsBg)"/>
+    <circle cx="128" cy="108" r="94" fill="url(#wsGlow)"/>
+    <circle cx="128" cy="108" r="65" fill="none" stroke="#BAE6FD" stroke-opacity="0.26" stroke-width="2.5"/>
+    <path d="M0,152 C56,134 98,166 154,148 C196,135 228,150 256,144 L256,256 L0,256 Z" fill="#0284C7" fill-opacity="0.85"/>
+    <polygon points="128,45 75,160 126,155" fill="#FFFFFF"/>
+    <polygon points="132,60 130,156 175,162" fill="#7DD3FC"/>
+    <polygon points="128,25 133,31 128,37 123,31" fill="#FFFFFF"/>
+    <path d="M0,168 C64,146 116,184 176,162 C212,149 236,160 256,165 L256,256 L0,256 Z" fill="url(#wsWaveMid)"/>
+    <path d="M0,168 C64,146 116,184 176,162 C212,149 236,160 256,165" fill="none" stroke="#E0F2FE" stroke-width="2.5" stroke-opacity="0.78"/>
+    <path d="M0,194 C54,210 112,174 174,192 C210,202 236,192 256,186 L256,256 L0,256 Z" fill="url(#wsWaveFront)"/>
+    <path d="M0,194 C54,210 112,174 174,192 C210,202 236,192 256,186" fill="none" stroke="#FFFFFF" stroke-width="3" stroke-opacity="0.9"/>
+  </g>
+  <rect x="13.5" y="13.5" width="229" height="229" rx="54.5" ry="54.5" fill="none" stroke="#BAE6FD" stroke-opacity="0.32" stroke-width="3"/>
+</svg>

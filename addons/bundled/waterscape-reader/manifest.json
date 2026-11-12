@@ -1,0 +1,10 @@
+{
+  "manifest_version": 2,
+  "id": "waterscape-reader",
+  "name": "Waterscape Reader View",
+  "version": "1.0.0",
+  "description": "방해 요소를 제거하고 본문 타이포그래피를 정돈하는 집중 읽기 모드 (Distraction-Free Article Reader)",
+  "enabled_by_default": false,
+  "css": "inject.css",
+  "js": "content.js"
+}

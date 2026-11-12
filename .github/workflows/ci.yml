@@ -1,4 +1,4 @@
-name: Arcradient CI & Cross-Platform Builds
+name: Waterscape 1.0 CI, Cross-Platform Installers & Runtime Verification
 
 on:
   push:
@@ -12,40 +12,61 @@ permissions:
 
 jobs:
   linux-c11:
-    name: Linux x64 (Pure C11 + CTest + Snapshots)
+    name: Linux x64 (Pure C11 · AVX2 · X11 SHM · .deb & .run Installers)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install build & CJK font dependencies
+      - name: Install build, X11 SHM, OpenSSL, CJK font & packaging dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ninja-build pkg-config libfreetype-dev libpng-dev fonts-noto-cjk
+            ninja-build pkg-config libfreetype-dev libpng-dev libssl-dev \
+            libx11-dev libxext-dev xvfb fonts-noto-cjk dpkg-dev
 
-      - name: Configure & Build (Strict C11)
+      - name: Configure & Build Waterscape 1.0 (Strict Pure C11)
         run: |
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
-      - name: Run Verification Suite (CTest)
+      - name: Run 22-Test Full Verification Suite (CTest)
         run: ctest --test-dir build --output-on-failure -V
 
-      - name: Render Browser Shell Theme Snapshots
+      - name: Run Multi-Core + AVX2 Browser Rendering Benchmark & Live X11 SHM Window Test
         run: |
+          ./build/waterscape --module-dir ./build --benchmark
+          xvfb-run -a ./build/waterscape --module-dir ./build --auto-close-ms 300
           mkdir -p snapshots
-          ./build/arcradient --module-dir ./build --snapshot-dir ./snapshots
+          ./build/waterscape --module-dir ./build --snapshot-dir ./snapshots
           ls -lh snapshots/
+
+      - name: Build & Verify Linux Installers (.deb + Self-Extracting .run + Uninstaller)
+        run: |
+          mkdir -p dist-linux
+          bash installer/linux/build_deb.sh ./build dist-linux/waterscape_1.0.0_amd64.deb
+          bash installer/linux/build_run_installer.sh ./build dist-linux/Waterscape-1.0.0-linux-x86_64.run
+          ./dist-linux/Waterscape-1.0.0-linux-x86_64.run --check
+          ./dist-linux/Waterscape-1.0.0-linux-x86_64.run --prefix /tmp/ws-ci-inst --no-xdg --yes
+          /tmp/ws-ci-inst/bin/waterscape --headless
+          /tmp/ws-ci-inst/uninstall.sh
+          test ! -e /tmp/ws-ci-inst/bin/waterscape
+          ls -lh dist-linux/
+
+      - name: Upload Linux Installers (.deb & .run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: waterscape-linux-x64-installers
+          path: dist-linux/*
 
       - name: Upload Linux Rendered Snapshots
         uses: actions/upload-artifact@v4
         with:
-          name: arcradient-linux-snapshots
+          name: waterscape-linux-snapshots
           path: snapshots/*.png
 
   win2000-x86-sse1:
-    name: Windows 2000 SP4 Legacy x86 (PE 5.0 · SSE1)
+    name: Windows 2000 SP4 Legacy x86 (PE 5.0 · SSE1 · WaterscapeSetup.exe)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -57,7 +78,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ninja-build gcc-mingw-w64-i686 binutils-mingw-w64-i686
 
-      - name: Cross-Build Windows 2000 x86 (Pentium III SSE1 Baseline)
+      - name: Cross-Build Waterscape 1.0 + SFX Installer (Win2000 x86 SSE1)
         run: |
           cmake -B build-win2k -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -66,22 +87,25 @@ jobs:
 
       - name: Verify PE 5.0 Subsystem & Zero Non-System DLL Imports
         run: |
-          i686-w64-mingw32-objdump -p build-win2k/arcradient.exe | grep -E "Major(OperatingSystem|Subsystem)Version|Minor(OperatingSystem|Subsystem)Version|DLL Name:"
-          i686-w64-mingw32-objdump -p build-win2k/arcradient.exe | grep -q "MajorSubsystemVersion.*5"
-          i686-w64-mingw32-objdump -p build-win2k/arcradient.exe | grep -q "MinorSubsystemVersion.*0"
-          ! i686-w64-mingw32-objdump -p build-win2k/arcradient.exe build-win2k/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread|vcruntime|api-ms-win)"
-          mkdir -p dist-win2k
-          cp build-win2k/*.exe build-win2k/*.dll dist-win2k/
-          ls -lh dist-win2k/
+          i686-w64-mingw32-objdump -p build-win2k/waterscape.exe | grep -E "Major(OperatingSystem|Subsystem)Version|Minor(OperatingSystem|Subsystem)Version|DLL Name:"
+          i686-w64-mingw32-objdump -p build-win2k/waterscape.exe | grep -q "MajorSubsystemVersion.*5"
+          i686-w64-mingw32-objdump -p build-win2k/waterscape.exe | grep -q "MinorSubsystemVersion.*0"
+          i686-w64-mingw32-objdump -p build-win2k/WaterscapeSetup.exe | grep -q "MajorSubsystemVersion.*5"
+          ! i686-w64-mingw32-objdump -p build-win2k/waterscape.exe build-win2k/WaterscapeSetup.exe build-win2k/uninstall.exe build-win2k/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread|vcruntime|api-ms-win)"
+          mkdir -p dist-win2k/addons
+          cp build-win2k/WaterscapeSetup.exe dist-win2k/WaterscapeSetup-1.0.0-win2000-x86.exe
+          cp build-win2k/waterscape.exe build-win2k/arcradient.exe build-win2k/uninstall.exe build-win2k/arcr_tests.exe build-win2k/*.dll dist-win2k/
+          cp build-win2k/addons/*.wsx dist-win2k/addons/
+          ls -lh dist-win2k/ dist-win2k/addons/
 
-      - name: Upload Windows 2000 x86 SSE1 Binaries
+      - name: Upload Windows 2000 x86 Installer & Binaries
         uses: actions/upload-artifact@v4
         with:
-          name: arcradient-win2000-x86-sse1
-          path: dist-win2k/*
+          name: waterscape-win2000-x86-sse1
+          path: dist-win2k/**
 
   win-x64-sse3:
-    name: Windows x64 Baseline (SSE3 · No AVX Required)
+    name: Windows x64 (SSE3 Baseline + Runtime AVX2/D3D11/Vulkan · WaterscapeSetup.exe)
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -93,60 +117,78 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ninja-build gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 
-      - name: Cross-Build Windows x64 (SSE3 Baseline)
+      - name: Cross-Build Waterscape 1.0 + SFX Installer (Windows x64)
         run: |
           cmake -B build-win64 -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/win-x64-sse3.cmake
           cmake --build build-win64
 
-      - name: Verify Clean Win32 DLL Imports
+      - name: Verify Clean Win32 System DLL Imports Only
         run: |
-          x86_64-w64-mingw32-objdump -p build-win64/arcradient.exe | grep -E "DLL Name:"
-          ! x86_64-w64-mingw32-objdump -p build-win64/arcradient.exe build-win64/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread)"
-          mkdir -p dist-win64
-          cp build-win64/*.exe build-win64/*.dll dist-win64/
-          ls -lh dist-win64/
+          x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe | grep -E "DLL Name:"
+          ! x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe build-win64/WaterscapeSetup.exe build-win64/uninstall.exe build-win64/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread)"
+          mkdir -p dist-win64/addons
+          cp build-win64/WaterscapeSetup.exe dist-win64/WaterscapeSetup-1.0.0-x64.exe
+          cp build-win64/waterscape.exe build-win64/arcradient.exe build-win64/uninstall.exe build-win64/arcr_tests.exe build-win64/*.dll dist-win64/
+          cp build-win64/addons/*.wsx dist-win64/addons/
+          ls -lh dist-win64/ dist-win64/addons/
 
-      - name: Upload Windows x64 SSE3 Binaries
+      - name: Upload Windows x64 Installer & Binaries
         uses: actions/upload-artifact@v4
         with:
-          name: arcradient-win-x64-sse3
-          path: dist-win64/*
+          name: waterscape-win-x64-sse3
+          path: dist-win64/**
 
   windows-runtime-verify:
-    name: Windows Native Execution (WoW64 x86 & Native x64)
+    name: Windows Native Execution (22-Test Suite + SFX Setup & Uninstall)
     runs-on: windows-latest
     needs: [win2000-x86-sse1, win-x64-sse3]
     steps:
       - name: Download Windows 2000 x86 SSE1 Build
         uses: actions/download-artifact@v4
         with:
-          name: arcradient-win2000-x86-sse1
+          name: waterscape-win2000-x86-sse1
           path: run-win2k
 
       - name: Download Windows x64 SSE3 Build
         uses: actions/download-artifact@v4
         with:
-          name: arcradient-win-x64-sse3
+          name: waterscape-win-x64-sse3
           path: run-win64
 
-      - name: Execute 32-bit Legacy x86 Suite & Headless Shell on Windows (WoW64)
+      - name: Verify 32-bit Legacy x86 Suite, SFX Installer, Browser & Uninstaller on Windows (WoW64)
         shell: pwsh
         run: |
           Push-Location run-win2k
           ./arcr_tests.exe .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./arcradient.exe --module-dir . --headless
+          ./WaterscapeSetup-1.0.0-win2000-x86.exe --verify-stub
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $inst32 = Join-Path $env:RUNNER_TEMP "ws_inst_x86"
+          ./WaterscapeSetup-1.0.0-win2000-x86.exe --silent --dir "$inst32" --no-shortcuts --no-registry
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$inst32\waterscape.exe" --module-dir "$inst32" --headless
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$inst32\uninstall.exe" --silent --dir "$inst32"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
 
-      - name: Execute 64-bit Baseline x64 Suite & Headless Shell on Windows
+      - name: Verify 64-bit x64 Suite, Benchmark, SFX Installer, Browser & Uninstaller on Windows
         shell: pwsh
         run: |
           Push-Location run-win64
           ./arcr_tests.exe .
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./arcradient.exe --module-dir . --headless
+          ./waterscape.exe --module-dir . --benchmark
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./WaterscapeSetup-1.0.0-x64.exe --verify-stub
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $inst64 = Join-Path $env:RUNNER_TEMP "ws_inst_x64"
+          ./WaterscapeSetup-1.0.0-x64.exe --silent --dir "$inst64" --no-shortcuts --no-registry
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$inst64\waterscape.exe" --module-dir "$inst64" --headless
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$inst64\uninstall.exe" --silent --dir "$inst64"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
