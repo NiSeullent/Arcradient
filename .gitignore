@@ -1,0 +1,32 @@
+# Build directories
+/build/
+/build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+.ninja_deps
+.ninja_log
+build.ninja
+
+# Compiled binaries & libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Generated local snapshots & OS metadata
+/snapshots/
+/*.png
+/*.ppm
+.DS_Store
+Thumbs.db

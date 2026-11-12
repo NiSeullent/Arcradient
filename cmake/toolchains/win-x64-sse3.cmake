@@ -1,0 +1,14 @@
+# Arcradient Toolchain: Classic & Modern Windows x64 (SSE3 Baseline, No AVX Required)
+# Usage: cmake -B build-win64 -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/win-x64-sse3.cmake
+set(CMAKE_SYSTEM_NAME Windows)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+
+set(CMAKE_C_COMPILER x86_64-w64-mingw32-gcc)
+set(CMAKE_RC_COMPILER x86_64-w64-mingw32-windres)
+
+set(ARCR_LEGACY_X86_WIN2000 OFF CACHE BOOL "" FORCE)
+set(ARCR_BASELINE_X64_SSE3 ON CACHE BOOL "Target x64 SSE3 baseline" FORCE)
+
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)

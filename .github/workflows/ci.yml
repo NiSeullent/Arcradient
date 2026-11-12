@@ -1,0 +1,152 @@
+name: Arcradient CI & Cross-Platform Builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-c11:
+    name: Linux x64 (Pure C11 + CTest + Snapshots)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build & CJK font dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build pkg-config libfreetype-dev libpng-dev fonts-noto-cjk
+
+      - name: Configure & Build (Strict C11)
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+
+      - name: Run Verification Suite (CTest)
+        run: ctest --test-dir build --output-on-failure -V
+
+      - name: Render Browser Shell Theme Snapshots
+        run: |
+          mkdir -p snapshots
+          ./build/arcradient --module-dir ./build --snapshot-dir ./snapshots
+          ls -lh snapshots/
+
+      - name: Upload Linux Rendered Snapshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcradient-linux-snapshots
+          path: snapshots/*.png
+
+  win2000-x86-sse1:
+    name: Windows 2000 SP4 Legacy x86 (PE 5.0 · SSE1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 i686 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build gcc-mingw-w64-i686 binutils-mingw-w64-i686
+
+      - name: Cross-Build Windows 2000 x86 (Pentium III SSE1 Baseline)
+        run: |
+          cmake -B build-win2k -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/win2000-x86-sse1.cmake
+          cmake --build build-win2k
+
+      - name: Verify PE 5.0 Subsystem & Zero Non-System DLL Imports
+        run: |
+          i686-w64-mingw32-objdump -p build-win2k/arcradient.exe | grep -E "Major(OperatingSystem|Subsystem)Version|Minor(OperatingSystem|Subsystem)Version|DLL Name:"
+          i686-w64-mingw32-objdump -p build-win2k/arcradient.exe | grep -q "MajorSubsystemVersion.*5"
+          i686-w64-mingw32-objdump -p build-win2k/arcradient.exe | grep -q "MinorSubsystemVersion.*0"
+          ! i686-w64-mingw32-objdump -p build-win2k/arcradient.exe build-win2k/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread|vcruntime|api-ms-win)"
+          mkdir -p dist-win2k
+          cp build-win2k/*.exe build-win2k/*.dll dist-win2k/
+          ls -lh dist-win2k/
+
+      - name: Upload Windows 2000 x86 SSE1 Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcradient-win2000-x86-sse1
+          path: dist-win2k/*
+
+  win-x64-sse3:
+    name: Windows x64 Baseline (SSE3 · No AVX Required)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install MinGW-w64 x86_64 toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+
+      - name: Cross-Build Windows x64 (SSE3 Baseline)
+        run: |
+          cmake -B build-win64 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/win-x64-sse3.cmake
+          cmake --build build-win64
+
+      - name: Verify Clean Win32 DLL Imports
+        run: |
+          x86_64-w64-mingw32-objdump -p build-win64/arcradient.exe | grep -E "DLL Name:"
+          ! x86_64-w64-mingw32-objdump -p build-win64/arcradient.exe build-win64/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread)"
+          mkdir -p dist-win64
+          cp build-win64/*.exe build-win64/*.dll dist-win64/
+          ls -lh dist-win64/
+
+      - name: Upload Windows x64 SSE3 Binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: arcradient-win-x64-sse3
+          path: dist-win64/*
+
+  windows-runtime-verify:
+    name: Windows Native Execution (WoW64 x86 & Native x64)
+    runs-on: windows-latest
+    needs: [win2000-x86-sse1, win-x64-sse3]
+    steps:
+      - name: Download Windows 2000 x86 SSE1 Build
+        uses: actions/download-artifact@v4
+        with:
+          name: arcradient-win2000-x86-sse1
+          path: run-win2k
+
+      - name: Download Windows x64 SSE3 Build
+        uses: actions/download-artifact@v4
+        with:
+          name: arcradient-win-x64-sse3
+          path: run-win64
+
+      - name: Execute 32-bit Legacy x86 Suite & Headless Shell on Windows (WoW64)
+        shell: pwsh
+        run: |
+          Push-Location run-win2k
+          ./arcr_tests.exe .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./arcradient.exe --module-dir . --headless
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
+      - name: Execute 64-bit Baseline x64 Suite & Headless Shell on Windows
+        shell: pwsh
+        run: |
+          Push-Location run-win64
+          ./arcr_tests.exe .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./arcradient.exe --module-dir . --headless
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
