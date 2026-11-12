@@ -94,7 +94,7 @@ jobs:
           ! i686-w64-mingw32-objdump -p build-win2k/waterscape.exe build-win2k/WaterscapeSetup.exe build-win2k/uninstall.exe build-win2k/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread|vcruntime|api-ms-win)"
           mkdir -p dist-win2k/addons
           cp build-win2k/WaterscapeSetup.exe dist-win2k/WaterscapeSetup-1.0.0-win2000-x86.exe
-          cp build-win2k/waterscape.exe build-win2k/arcradient.exe build-win2k/uninstall.exe build-win2k/arcr_tests.exe build-win2k/*.dll dist-win2k/
+          cp build-win2k/*.exe build-win2k/*.dll dist-win2k/
           cp build-win2k/addons/*.wsx dist-win2k/addons/
           ls -lh dist-win2k/ dist-win2k/addons/
 
@@ -130,7 +130,7 @@ jobs:
           ! x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe build-win64/WaterscapeSetup.exe build-win64/uninstall.exe build-win64/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread)"
           mkdir -p dist-win64/addons
           cp build-win64/WaterscapeSetup.exe dist-win64/WaterscapeSetup-1.0.0-x64.exe
-          cp build-win64/waterscape.exe build-win64/arcradient.exe build-win64/uninstall.exe build-win64/arcr_tests.exe build-win64/*.dll dist-win64/
+          cp build-win64/*.exe build-win64/*.dll dist-win64/
           cp build-win64/addons/*.wsx dist-win64/addons/
           ls -lh dist-win64/ dist-win64/addons/
 
