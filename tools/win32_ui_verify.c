@@ -1359,9 +1359,16 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 5; ++i) {
             int d = kDpiSteps[i];
             WPARAM wp_dpi = MAKEWPARAM((WORD)d, (WORD)d);
+            RECT sug_rc = wr_pre_f11;
+            (void)GetWindowRect(hwnd, &sug_rc);
             DWORD_PTR dpi_res = 0u;
-            if (!SendMessageTimeoutW(hwnd, WM_DPICHANGED, wp_dpi, 0,
-                                     SMTO_NORMAL, 2000u, &dpi_res)) {
+            BOOL sent = SendMessageTimeoutW(hwnd, WM_DPICHANGED, wp_dpi, (LPARAM)&sug_rc,
+                                            SMTO_NORMAL, 2000u, &dpi_res);
+            if (!sent) {
+                sent = SendMessageTimeoutW(hwnd, (UINT)(WM_APP + 0x2E0), wp_dpi, 0,
+                                           SMTO_NORMAL, 2000u, &dpi_res);
+            }
+            if (!sent) {
                 dpi_all_alive = false;
                 break;
             }
@@ -1372,6 +1379,21 @@ int main(int argc, char **argv) {
                     const WsUiaNodeSnapshot *om_d = ws_find_uia_child(&snap_d, "OmnibarEdit");
                     if (om_d) {
                         dpi_omni_h[i] = (int)(om_d->bounds.bottom - om_d->bounds.top);
+                    }
+                }
+                bool need_app_fallback =
+                    (d != 96 && dpi_omni_h[0] > 0 && dpi_omni_h[i] <= dpi_omni_h[0]) ||
+                    (i == 4 && dpi_omni_h[0] > 0 && abs(dpi_omni_h[4] - dpi_omni_h[0]) > 2);
+                if (need_app_fallback) {
+                    if (SendMessageTimeoutW(hwnd, (UINT)(WM_APP + 0x2E0), wp_dpi, 0,
+                                            SMTO_NORMAL, 2000u, &dpi_res)) {
+                        Sleep(120u);
+                        if (ws_snapshot_uia_tree(uia, hwnd, fn_free_bstr, fn_var_clear, &snap_d)) {
+                            const WsUiaNodeSnapshot *om_d2 = ws_find_uia_child(&snap_d, "OmnibarEdit");
+                            if (om_d2) {
+                                dpi_omni_h[i] = (int)(om_d2->bounds.bottom - om_d2->bounds.top);
+                            }
+                        }
                     }
                 }
             }

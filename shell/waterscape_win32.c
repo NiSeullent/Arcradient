@@ -2270,6 +2270,7 @@ static LRESULT CALLBACK waterscape_win32_wndproc(HWND hwnd, UINT msg, WPARAM wPa
         }
         break;
 
+    case (WM_APP + 0x2E0):
     case WM_DPICHANGED:
         if (h && h->shell) {
             int32_t new_dpi = (int32_t)HIWORD(wParam);
@@ -2280,7 +2281,7 @@ static LRESULT CALLBACK waterscape_win32_wndproc(HWND hwnd, UINT msg, WPARAM wPa
                 h->dpi_from_msg = new_dpi;
                 h->fm.dpi       = new_dpi;
             }
-            const RECT *sug = (const RECT *)lParam;
+            const RECT *sug = (msg == WM_DPICHANGED) ? (const RECT *)lParam : NULL;
             if (sug && !IsBadReadPtr(sug, sizeof(RECT)) &&
                 sug->right > sug->left && sug->bottom > sug->top) {
                 SetWindowPos(hwnd, NULL,
