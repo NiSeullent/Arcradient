@@ -923,8 +923,8 @@ static bool ws_perform_installation(const uint8_t *zip_bytes,
         size_t   fsize = 0u;
         if (!arcr_zip_extract_entry(zip_bytes, zip_len, rel, &fdata, &fsize)) {
             if (h_manifest != INVALID_HANDLE_VALUE) CloseHandle(h_manifest);
-            free(names);
             snprintf(err_buf, err_cap, "Failed extracting archive entry '%s'.", rel);
+            free(names);
             return false;
         }
 
@@ -957,8 +957,8 @@ static bool ws_perform_installation(const uint8_t *zip_bytes,
         if (hf == INVALID_HANDLE_VALUE) {
             free(fdata);
             if (h_manifest != INVALID_HANDLE_VALUE) CloseHandle(h_manifest);
-            free(names);
             snprintf(err_buf, err_cap, "Cannot write target file '%s' (in use or access denied).", rel);
+            free(names);
             return false;
         }
 
@@ -970,8 +970,8 @@ static bool ws_perform_installation(const uint8_t *zip_bytes,
                 CloseHandle(hf);
                 free(fdata);
                 if (h_manifest != INVALID_HANDLE_VALUE) CloseHandle(h_manifest);
-                free(names);
                 snprintf(err_buf, err_cap, "Disk write error while writing '%s'.", rel);
+                free(names);
                 return false;
             }
             written_all += (size_t)wr;

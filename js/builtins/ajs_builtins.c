@@ -2687,12 +2687,20 @@ static double parse_date_string(const char *s) {
     return NAN;
 }
 
+#if defined(_WIN32)
+static double ajs_win32_epoch_ms(void);
+#endif
+
 static double current_epoch_ms(void) {
+#if defined(_WIN32)
+    return ajs_win32_epoch_ms();
+#else
     struct timespec ts;
     if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
         return floor((double)ts.tv_sec * 1000.0 + (double)(ts.tv_nsec / 1000000L));
     }
     return (double)time(NULL) * 1000.0;
+#endif
 }
 
 static void format_date_str(double ms, int style, char *buf, size_t cap) {
@@ -4011,3 +4019,22 @@ void ajs_realm_init_intrinsics(AjsVm *vm, AjsRealm *r) {
     ajs_def_native_method(vm, r, r->global_obj, "escape", js_annexb_escape, 1, AJS_METHOD_FLAGS, 0);
     ajs_def_native_method(vm, r, r->global_obj, "unescape", js_annexb_unescape, 1, AJS_METHOD_FLAGS, 0);
 }
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <windows.h>
+
+static double ajs_win32_epoch_ms(void) {
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t ticks = ((uint64_t)ft.dwHighDateTime << 32) | (uint64_t)ft.dwLowDateTime;
+    /* 100-ns intervals between 1601-01-01 and 1970-01-01 = 116444736000000000ULL */
+    if (ticks >= UINT64_C(116444736000000000)) {
+        return (double)((ticks - UINT64_C(116444736000000000)) / UINT64_C(10000));
+    }
+    return 0.0;
+}
+#endif
+
