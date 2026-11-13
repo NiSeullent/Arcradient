@@ -27,14 +27,32 @@ static void async_gen_drain_queue(AjsVm *vm, AjsObject *gen_obj);
  * 1. Lexical Environment Helpers
  * ============================================================================ */
 
+static void env_rebuild_name_hash(AjsEnv *env, uint32_t ncap) {
+    if (!env || !env->names) return;
+    int32_t *nt = (int32_t *)malloc((size_t)ncap * sizeof(int32_t));
+    if (!nt) return;
+    for (uint32_t i = 0; i < ncap; i++) nt[i] = -1;
+    uint32_t mask = ncap - 1u;
+    for (uint32_t i = 0; i < env->count; i++) {
+        if (!env->names[i]) continue;
+        uint32_t pos = env->names[i]->hash & mask;
+        while (nt[pos] >= 0) pos = (pos + 1u) & mask;
+        nt[pos] = (int32_t)i;
+    }
+    free(env->name_hash);
+    env->name_hash = nt;
+    env->name_hash_cap = ncap;
+}
+
 AjsEnv *ajs_env_new(AjsVm *vm, AjsEnv *parent, uint32_t slot_count, AjsString **names) {
     AjsEnv *env = (AjsEnv *)ajs_gc_alloc(vm, sizeof(AjsEnv), AJS_GC_ENV);
     if (!env) return NULL;
     env->parent = parent;
     env->with_obj = NULL;
     env->count = slot_count;
+    env->cap = slot_count;
     if (slot_count > 0) {
-        env->slots = (AjsValue *)malloc(slot_count * sizeof(AjsValue));
+        env->slots = (AjsValue *)malloc((size_t)slot_count * sizeof(AjsValue));
         env->flags = (uint8_t *)calloc(slot_count, sizeof(uint8_t));
         if (!env->slots || !env->flags) {
             free(env->slots);
@@ -42,16 +60,23 @@ AjsEnv *ajs_env_new(AjsVm *vm, AjsEnv *parent, uint32_t slot_count, AjsString **
             env->slots = NULL;
             env->flags = NULL;
             env->count = 0;
-            return env;
+            env->cap = 0;
+            ajs_throw(vm, vm->oom_error);
+            return NULL;
         }
         for (uint32_t i = 0; i < slot_count; i++) {
             env->slots[i] = AJS_VAL_UNDEFINED;
         }
         if (names) {
-            env->names = (AjsString **)malloc(slot_count * sizeof(AjsString *));
+            env->names = (AjsString **)malloc((size_t)slot_count * sizeof(AjsString *));
             if (env->names) {
                 for (uint32_t i = 0; i < slot_count; i++) {
                     env->names[i] = names[i];
+                }
+                if (slot_count >= 16u) {
+                    uint32_t hcap = 32u;
+                    while (hcap < slot_count * 2u && hcap < (1u << 30)) hcap *= 2u;
+                    env_rebuild_name_hash(env, hcap);
                 }
             }
         }
@@ -61,6 +86,18 @@ AjsEnv *ajs_env_new(AjsVm *vm, AjsEnv *parent, uint32_t slot_count, AjsString **
 
 static int32_t env_find_named_slot(const AjsEnv *env, const AjsString *name) {
     if (!env || !env->names || !name) return -1;
+    if (env->name_hash && env->name_hash_cap > 0) {
+        uint32_t mask = env->name_hash_cap - 1u;
+        uint32_t pos = name->hash & mask;
+        while (env->name_hash[pos] >= 0) {
+            int32_t idx = env->name_hash[pos];
+            if (env->names[idx] && ajs_str_eq(env->names[idx], name)) {
+                return idx;
+            }
+            pos = (pos + 1u) & mask;
+        }
+        return -1;
+    }
     for (uint32_t i = 0; i < env->count; i++) {
         if (env->names[i] && ajs_str_eq(env->names[i], name)) {
             return (int32_t)i;
@@ -71,21 +108,43 @@ static int32_t env_find_named_slot(const AjsEnv *env, const AjsString *name) {
 
 static int32_t env_append_named_slot(AjsEnv *env, AjsString *name, AjsValue init_val, uint8_t flags) {
     uint32_t idx = env->count;
-    uint32_t ncnt = idx + 1u;
-    AjsValue *ns = (AjsValue *)realloc(env->slots, ncnt * sizeof(AjsValue));
-    uint8_t *nf = (uint8_t *)realloc(env->flags, ncnt * sizeof(uint8_t));
-    AjsString **nn = (AjsString **)realloc(env->names, ncnt * sizeof(AjsString *));
-    if (!ns || !nf || !nn) return -1;
-    if (idx == 0 && !env->names) {
-        /* newly allocated */
+    if (idx >= env->cap || !env->names) {
+        uint32_t ncap = env->cap ? env->cap * 2u : 8u;
+        if (ncap <= idx) ncap = idx + 8u;
+        AjsValue *ns = (AjsValue *)realloc(env->slots, (size_t)ncap * sizeof(AjsValue));
+        uint8_t *nf = (uint8_t *)realloc(env->flags, (size_t)ncap * sizeof(uint8_t));
+        AjsString **nn = env->names
+                         ? (AjsString **)realloc(env->names, (size_t)ncap * sizeof(AjsString *))
+                         : (AjsString **)calloc(ncap, sizeof(AjsString *));
+        if (!ns || !nf || !nn) {
+            if (ns) env->slots = ns;
+            if (nf) env->flags = nf;
+            if (nn) env->names = nn;
+            return -1;
+        }
+        env->slots = ns;
+        env->flags = nf;
+        env->names = nn;
+        env->cap = ncap;
     }
-    env->slots = ns;
-    env->flags = nf;
-    env->names = nn;
     env->slots[idx] = init_val;
     env->flags[idx] = flags;
     env->names[idx] = name;
-    env->count = ncnt;
+    env->count = idx + 1u;
+    if (name) {
+        if (env->name_hash) {
+            if ((env->count + 1u) * 10u >= env->name_hash_cap * 7u) {
+                env_rebuild_name_hash(env, env->name_hash_cap * 2u);
+            } else {
+                uint32_t mask = env->name_hash_cap - 1u;
+                uint32_t pos = name->hash & mask;
+                while (env->name_hash[pos] >= 0) pos = (pos + 1u) & mask;
+                env->name_hash[pos] = (int32_t)idx;
+            }
+        } else if (env->count >= 16u) {
+            env_rebuild_name_hash(env, 64u);
+        }
+    }
     return (int32_t)idx;
 }
 
@@ -183,6 +242,15 @@ static bool with_obj_has_binding(AjsVm *vm, AjsObject *wobj, AjsValue key_val, b
  * 2. Closures, Execution Frames & Tagged Template Objects
  * ============================================================================ */
 
+AjsString *ajs_bytecode_get_source_text(AjsVm *vm, AjsBytecode *bc) {
+    if (!bc) return NULL;
+    if (bc->source_text) return bc->source_text;
+    if (bc->source_buf && (size_t)bc->src_offset + (size_t)bc->src_len <= bc->source_buf->len) {
+        bc->source_text = ajs_str_from_utf8(vm, bc->source_buf->utf8 + bc->src_offset, bc->src_len, false);
+    }
+    return bc->source_text;
+}
+
 AjsObject *ajs_closure_new(AjsVm *vm, AjsRealm *realm, AjsBytecode *bc, AjsEnv *env, AjsModuleRecord *mod) {
     size_t rs = ajs_temp_root_save(vm);
     if (bc) ajs_temp_root_push(vm, ajs_val_from_gc(bc));
@@ -213,54 +281,19 @@ AjsObject *ajs_closure_new(AjsVm *vm, AjsRealm *realm, AjsBytecode *bc, AjsEnv *
     fn->u.fn.bound_this = AJS_VAL_UNDEFINED;
     fn->u.fn.owner_module = mod;
 
-    /* Define `length` (configurable, non-writable, non-enumerable) */
-    AjsPropDesc ldesc = {
-        .flags = AJS_DESC_HAS_VALUE | AJS_DESC_HAS_WRITABLE | AJS_DESC_HAS_ENUMERABLE |
-                 AJS_DESC_HAS_CONFIGURABLE | AJS_DESC_CONFIGURABLE,
-        .value = ajs_val_number((double)bc->arity)
-    };
-    ajs_obj_define_own_prop(vm, fn, ajs_val_from_gc(vm->str_length), &ldesc, false);
-
-    /* Define `name` if non-NULL (configurable, non-writable, non-enumerable) */
+    /* Fast own-slot insertion for `length` & `name` (configurable, non-writable, non-enumerable) */
+    ajs_obj_insert_own_slot(fn, ajs_val_from_gc(vm->str_length), AJS_DESC_CONFIGURABLE,
+                            ajs_val_number((double)bc->arity), AJS_VAL_UNDEFINED);
     if (bc->name) {
-        AjsPropDesc ndesc = {
-            .flags = AJS_DESC_HAS_VALUE | AJS_DESC_HAS_WRITABLE | AJS_DESC_HAS_ENUMERABLE |
-                     AJS_DESC_HAS_CONFIGURABLE | AJS_DESC_CONFIGURABLE,
-            .value = ajs_val_from_gc(bc->name)
-        };
-        ajs_obj_define_own_prop(vm, fn, ajs_val_from_gc(vm->str_name), &ndesc, false);
+        ajs_obj_insert_own_slot(fn, ajs_val_from_gc(vm->str_name), AJS_DESC_CONFIGURABLE,
+                                ajs_val_from_gc(bc->name), AJS_VAL_UNDEFINED);
     }
 
-    /* Plain functions & generators get an own `.prototype` object */
-    if (bc->fn_kind == AJS_FN_BC_NORMAL) {
-        AjsObject *proto = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, realm->object_proto);
-        if (proto) {
-            ajs_temp_root_push(vm, ajs_val_from_gc(proto));
-            AjsPropDesc cdesc = {
-                .flags = AJS_DESC_HAS_VALUE | AJS_DESC_HAS_WRITABLE | AJS_DESC_WRITABLE |
-                         AJS_DESC_HAS_ENUMERABLE | AJS_DESC_HAS_CONFIGURABLE | AJS_DESC_CONFIGURABLE,
-                .value = ajs_val_from_gc(fn)
-            };
-            ajs_obj_define_own_prop(vm, proto, ajs_val_from_gc(vm->str_constructor), &cdesc, false);
-            AjsPropDesc pdesc = {
-                .flags = AJS_DESC_HAS_VALUE | AJS_DESC_HAS_WRITABLE | AJS_DESC_WRITABLE |
-                         AJS_DESC_HAS_ENUMERABLE | AJS_DESC_HAS_CONFIGURABLE,
-                .value = ajs_val_from_gc(proto)
-            };
-            ajs_obj_define_own_prop(vm, fn, ajs_val_from_gc(vm->str_prototype), &pdesc, false);
-        }
-    } else if (bc->fn_kind == AJS_FN_BC_GENERATOR || bc->fn_kind == AJS_FN_BC_ASYNC_GENERATOR) {
-        AjsValue gp = (bc->fn_kind == AJS_FN_BC_GENERATOR) ? realm->gen_proto : realm->async_gen_proto;
-        AjsObject *proto = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, gp);
-        if (proto) {
-            ajs_temp_root_push(vm, ajs_val_from_gc(proto));
-            AjsPropDesc pdesc = {
-                .flags = AJS_DESC_HAS_VALUE | AJS_DESC_HAS_WRITABLE | AJS_DESC_WRITABLE |
-                         AJS_DESC_HAS_ENUMERABLE | AJS_DESC_HAS_CONFIGURABLE,
-                .value = ajs_val_from_gc(proto)
-            };
-            ajs_obj_define_own_prop(vm, fn, ajs_val_from_gc(vm->str_prototype), &pdesc, false);
-        }
+    /* Defer `.prototype` object allocation until first access */
+    if (bc->fn_kind == AJS_FN_BC_NORMAL ||
+        bc->fn_kind == AJS_FN_BC_GENERATOR ||
+        bc->fn_kind == AJS_FN_BC_ASYNC_GENERATOR) {
+        fn->u.fn.has_lazy_proto = true;
     }
 
     ajs_temp_root_restore(vm, rs);
@@ -312,8 +345,12 @@ AjsExecFrame *ajs_frame_new(AjsVm *vm, AjsRealm *realm, AjsObject *func_obj, Ajs
         base_env = mod->env;
     } else {
         base_env = ajs_env_new(vm, env, bc->env_slot_count, bc->env_slot_names);
-        if (base_env && bc->env_slot_flags) {
-            for (uint16_t i = 0; i < bc->env_slot_count; i++) {
+        if (!base_env) {
+            ajs_temp_root_restore(vm, rs);
+            return NULL;
+        }
+        if (bc->env_slot_flags) {
+            for (uint32_t i = 0; i < bc->env_slot_count; i++) {
                 uint8_t fl = bc->env_slot_flags[i];
                 base_env->flags[i] = (uint8_t)(fl & (AJS_SLOT_CONST | AJS_SLOT_FUNC_NAME));
                 if (fl & AJS_SLOT_INIT_TDZ) {
@@ -331,13 +368,13 @@ AjsExecFrame *ajs_frame_new(AjsVm *vm, AjsRealm *realm, AjsObject *func_obj, Ajs
     f->env_depth = 0;
 
     if (base_env) {
-        if (bc->this_slot != 0xFFFF && bc->this_slot < base_env->count) {
+        if (bc->this_slot != AJS_NO_SLOT && bc->this_slot < base_env->count) {
             base_env->slots[bc->this_slot] = bc->is_derived_ctor ? AJS_VAL_TDZ : this_val;
         }
-        if (bc->new_target_slot != 0xFFFF && bc->new_target_slot < base_env->count) {
+        if (bc->new_target_slot != AJS_NO_SLOT && bc->new_target_slot < base_env->count) {
             base_env->slots[bc->new_target_slot] = new_target;
         }
-        if (bc->active_fn_slot != 0xFFFF && bc->active_fn_slot < base_env->count) {
+        if (bc->active_fn_slot != AJS_NO_SLOT && bc->active_fn_slot < base_env->count) {
             base_env->slots[bc->active_fn_slot] = func_obj ? ajs_val_from_gc(func_obj) : AJS_VAL_UNDEFINED;
         }
     }
@@ -394,7 +431,7 @@ static bool setup_call_frame_args(AjsVm *vm, AjsExecFrame *f, int argc, const Aj
                 aobj->u.args.mapped = true;
                 aobj->u.args.env = f->base_env;
                 aobj->u.args.param_count = mcnt;
-                aobj->u.args.param_slots = (uint16_t *)malloc(mcnt * sizeof(uint16_t));
+                aobj->u.args.param_slots = (uint32_t *)malloc((size_t)mcnt * sizeof(uint32_t));
                 if (aobj->u.args.param_slots) {
                     for (uint32_t i = 0; i < mcnt; i++) {
                         aobj->u.args.param_slots[i] = bc->mapped_param_slots[i];
@@ -430,8 +467,7 @@ static bool setup_call_frame_args(AjsVm *vm, AjsExecFrame *f, int argc, const Aj
             AjsString *s_callee = ajs_str_from_cstr(vm, "callee", true);
             ajs_obj_define_own_prop(vm, aobj, ajs_val_from_gc(s_callee), &tte_desc, false);
         }
-
-        if (bc->arguments_slot != 0xFFFF && f->base_env && bc->arguments_slot < f->base_env->count) {
+        if (bc->arguments_slot != AJS_NO_SLOT && f->base_env && bc->arguments_slot < f->base_env->count) {
             f->base_env->slots[bc->arguments_slot] = ajs_val_from_gc(aobj);
         }
     }
@@ -571,19 +607,14 @@ static void pop_call_stack(AjsVm *vm) {
 }
 
 /* Native reaction callbacks for `await` inside async functions & async generators */
-typedef struct AjsAwaitResumeCtx {
-    uint32_t pin_gen;
-    bool     is_reject;
-} AjsAwaitResumeCtx;
-
 static AjsValue async_await_reaction_cb(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *userdata) {
     (void)this_val;
-    AjsAwaitResumeCtx *ctx = (AjsAwaitResumeCtx *)userdata;
-    if (!ctx) return AJS_VAL_UNDEFINED;
-    AjsValue gen_val = ajs_get_pinned(vm, ctx->pin_gen);
-    bool is_rej = ctx->is_reject;
-    ajs_unpin_value(vm, ctx->pin_gen);
-    free(ctx);
+    (void)userdata;
+    AjsObject *fn_obj = vm->call_depth > 0 ? vm->call_stack[vm->call_depth - 1u].native_fn_obj : NULL;
+    if (!fn_obj) return AJS_VAL_UNDEFINED;
+    AjsValue gen_val = fn_obj->u.fn.home_object;
+    bool is_rej = (fn_obj->u.fn.native_magic != 0);
+    fn_obj->u.fn.home_object = AJS_VAL_UNDEFINED;
 
     if (!ajs_val_is_gc_kind(gen_val, AJS_GC_OBJECT)) return AJS_VAL_UNDEFINED;
     AjsObject *gen_obj = (AjsObject *)ajs_val_to_gc(gen_val);
@@ -749,29 +780,18 @@ static bool attach_await_continuation(AjsVm *vm, AjsRealm *realm, AjsObject *gen
     }
     ajs_temp_root_push(vm, prom);
 
-    AjsAwaitResumeCtx *ok_ctx = (AjsAwaitResumeCtx *)malloc(sizeof(AjsAwaitResumeCtx));
-    AjsAwaitResumeCtx *err_ctx = (AjsAwaitResumeCtx *)malloc(sizeof(AjsAwaitResumeCtx));
-    if (!ok_ctx || !err_ctx) {
-        free(ok_ctx);
-        free(err_ctx);
-        ajs_temp_root_restore(vm, rs);
-        return false;
-    }
-    ok_ctx->pin_gen = ajs_pin_value(vm, ajs_val_from_gc(gen_obj));
-    ok_ctx->is_reject = false;
-    err_ctx->pin_gen = ajs_pin_value(vm, ajs_val_from_gc(gen_obj));
-    err_ctx->is_reject = true;
-
     AjsObject *ok_fn = ajs_obj_new(vm, realm, AJS_OBJ_FUNCTION, realm->function_proto);
     ok_fn->u.fn.fn_kind = AJS_FN_NATIVE;
     ok_fn->u.fn.native_fn = async_await_reaction_cb;
-    ok_fn->u.fn.native_userdata = ok_ctx;
+    ok_fn->u.fn.home_object = ajs_val_from_gc(gen_obj);
+    ok_fn->u.fn.native_magic = 0;
     ajs_temp_root_push(vm, ajs_val_from_gc(ok_fn));
 
     AjsObject *err_fn = ajs_obj_new(vm, realm, AJS_OBJ_FUNCTION, realm->function_proto);
     err_fn->u.fn.fn_kind = AJS_FN_NATIVE;
     err_fn->u.fn.native_fn = async_await_reaction_cb;
-    err_fn->u.fn.native_userdata = err_ctx;
+    err_fn->u.fn.home_object = ajs_val_from_gc(gen_obj);
+    err_fn->u.fn.native_magic = 1;
     ajs_temp_root_push(vm, ajs_val_from_gc(err_fn));
 
     AjsObject *prom_obj = (AjsObject *)ajs_val_to_gc(prom);
@@ -1494,7 +1514,7 @@ AjsValue ajs_construct_internal(AjsVm *vm, AjsValue ctor_val, int argc, const Aj
                                   "Derived constructors may only return object or undefined");
     }
     /* Check `this_slot` on `frame->base_env` */
-    AjsValue dthis = (bc->this_slot != 0xFFFF && frame->base_env && bc->this_slot < frame->base_env->count)
+    AjsValue dthis = (bc->this_slot != AJS_NO_SLOT && frame->base_env && bc->this_slot < frame->base_env->count)
                      ? frame->base_env->slots[bc->this_slot] : frame->this_val;
     ajs_temp_root_restore(vm, rs);
     if (dthis == AJS_VAL_TDZ) {
@@ -1575,7 +1595,7 @@ AjsValue ajs_exec_script_bc(AjsVm *vm, AjsRealm *realm, AjsBytecode *bc, AjsEnv 
      * Hoisted `var` / `function` declarations bind into `caller_var_env`, throwing `SyntaxError`
      * if any intermediate lexical scope between `eval_env` and `caller_var_env` has a lexical binding! */
     if (caller_var_env && frame->base_env && bc->env_slot_names && bc->env_slot_flags) {
-        for (uint16_t i = 0; i < bc->env_slot_count; i++) {
+        for (uint32_t i = 0; i < bc->env_slot_count; i++) {
             AjsString *vname = bc->env_slot_names[i];
             uint8_t fl = bc->env_slot_flags[i];
             if (!vname || (fl & AJS_SLOT_INIT_TDZ)) continue;
@@ -2392,6 +2412,48 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 PUSH(val);
                 break;
             }
+            case OP_GET_LOCAL8: {
+                uint8_t s = bc_u8(code, &frame->pc);
+                AjsValue val = AJS_VAL_UNDEFINED;
+                if (!env_read_slot(vm, frame->env, s, &val)) goto handle_exception;
+                PUSH(val);
+                break;
+            }
+            case OP_SET_LOCAL8: {
+                uint8_t s = bc_u8(code, &frame->pc);
+                uint8_t st = bc_u8(code, &frame->pc);
+                AjsValue val = TOP();
+                if (!env_write_slot(vm, frame->env, s, val, st != 0)) goto handle_exception;
+                break;
+            }
+            case OP_INIT_LOCAL8: {
+                uint8_t s = bc_u8(code, &frame->pc);
+                AjsValue val = TOP();
+                AjsEnv *e = frame->env;
+                if (e && s < e->count) {
+                    e->slots[s] = val;
+                    if (bc->is_eval && !bc->strict && e == frame->base_env &&
+                        bc->env_slot_names && bc->env_slot_names[s] &&
+                        !(bc->env_slot_flags[s] & AJS_SLOT_INIT_TDZ) &&
+                        (!e->names || e->names[s] == NULL)) {
+                        for (AjsEnv *pe = e->parent; pe; pe = pe->parent) {
+                            if (pe->with_obj) continue;
+                            int32_t pslot = env_find_named_slot(pe, bc->env_slot_names[s]);
+                            if (pslot >= 0) { pe->slots[pslot] = val; break; }
+                        }
+                    }
+                }
+                break;
+            }
+            case OP_GET_LEX32: {
+                uint16_t d = bc_u16(code, &frame->pc);
+                uint32_t s = bc_u32(code, &frame->pc);
+                AjsEnv *e = env_at_depth(frame->env, d);
+                AjsValue val = AJS_VAL_UNDEFINED;
+                if (!env_read_slot(vm, e, s, &val)) goto handle_exception;
+                PUSH(val);
+                break;
+            }
             case OP_SET_LEX: {
                 uint16_t d = bc_u16(code, &frame->pc);
                 uint16_t s = bc_u16(code, &frame->pc);
@@ -2401,9 +2463,19 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 if (!env_write_slot(vm, e, s, val, st != 0)) goto handle_exception;
                 break;
             }
-            case OP_INIT_LEX: {
+            case OP_SET_LEX32: {
                 uint16_t d = bc_u16(code, &frame->pc);
-                uint16_t s = bc_u16(code, &frame->pc);
+                uint32_t s = bc_u32(code, &frame->pc);
+                uint8_t st = bc_u8(code, &frame->pc);
+                AjsValue val = TOP();
+                AjsEnv *e = env_at_depth(frame->env, d);
+                if (!env_write_slot(vm, e, s, val, st != 0)) goto handle_exception;
+                break;
+            }
+            case OP_INIT_LEX:
+            case OP_INIT_LEX32: {
+                uint16_t d = bc_u16(code, &frame->pc);
+                uint32_t s = (op == OP_INIT_LEX32) ? bc_u32(code, &frame->pc) : (uint32_t)bc_u16(code, &frame->pc);
                 AjsValue val = TOP();
                 AjsEnv *e = env_at_depth(frame->env, d);
                 if (e && s < e->count) {
@@ -2422,9 +2494,10 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 }
                 break;
             }
-            case OP_CHECK_LEX_TDZ: {
+            case OP_CHECK_LEX_TDZ:
+            case OP_CHECK_LEX_TDZ32: {
                 uint16_t d = bc_u16(code, &frame->pc);
-                uint16_t s = bc_u16(code, &frame->pc);
+                uint32_t s = (op == OP_CHECK_LEX_TDZ32) ? bc_u32(code, &frame->pc) : (uint32_t)bc_u16(code, &frame->pc);
                 AjsEnv *e = env_at_depth(frame->env, d);
                 AjsValue dummy;
                 if (!env_read_slot(vm, e, s, &dummy)) goto handle_exception;
@@ -2501,7 +2574,10 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                                        "Identifier '%s' has already been declared", nm->utf8);
                     goto handle_exception;
                 }
-                env_append_named_slot(realm->global_lex_env, nm, AJS_VAL_TDZ, is_const ? AJS_SLOT_CONST : 0u);
+                if (env_append_named_slot(realm->global_lex_env, nm, AJS_VAL_TDZ, is_const ? AJS_SLOT_CONST : 0u) < 0) {
+                    ajs_throw(vm, vm->oom_error);
+                    goto handle_exception;
+                }
                 break;
             }
             case OP_INIT_GLOBAL_LEX: {
@@ -2710,15 +2786,23 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 break;
             }
 
-            case OP_PUSH_ENV: {
-                uint16_t cnt = bc_u16(code, &frame->pc);
-                uint16_t ed_idx = bc_u16(code, &frame->pc);
-                AjsString **names = (ed_idx != 0xFFFF && ed_idx < bc->env_desc_count)
+            case OP_PUSH_ENV:
+            case OP_PUSH_ENV32: {
+                uint32_t cnt = (op == OP_PUSH_ENV32) ? bc_u32(code, &frame->pc) : (uint32_t)bc_u16(code, &frame->pc);
+                uint32_t ed_idx = AJS_NO_SLOT;
+                if (op == OP_PUSH_ENV32) {
+                    ed_idx = bc_u32(code, &frame->pc);
+                } else {
+                    uint16_t ed16 = bc_u16(code, &frame->pc);
+                    ed_idx = (ed16 == 0xFFFFu) ? AJS_NO_SLOT : (uint32_t)ed16;
+                }
+                AjsString **names = (ed_idx != AJS_NO_SLOT && ed_idx < bc->env_desc_count)
                                     ? bc->env_descs[ed_idx].names : NULL;
                 AjsEnv *ne = ajs_env_new(vm, frame->env, cnt, names);
-                if (ne && ed_idx != 0xFFFF && ed_idx < bc->env_desc_count) {
+                if (!ne || vm->has_exception) goto handle_exception;
+                if (ed_idx != AJS_NO_SLOT && ed_idx < bc->env_desc_count) {
                     AjsEnvNamesDesc *ed = &bc->env_descs[ed_idx];
-                    for (uint16_t i = 0; i < cnt && i < ed->count; i++) {
+                    for (uint32_t i = 0; i < cnt && i < ed->count; i++) {
                         uint8_t fl = ed->slot_flags[i];
                         ne->flags[i] = (uint8_t)(fl & (AJS_SLOT_CONST | AJS_SLOT_FUNC_NAME));
                         if (fl & AJS_SLOT_INIT_TDZ) ne->slots[i] = AJS_VAL_TDZ;
@@ -2734,11 +2818,13 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                     frame->env_depth--;
                 }
                 break;
-            case OP_CLONE_ENV: {
-                uint16_t cnt = bc_u16(code, &frame->pc);
+            case OP_CLONE_ENV:
+            case OP_CLONE_ENV32: {
+                uint32_t cnt = (op == OP_CLONE_ENV32) ? bc_u32(code, &frame->pc) : (uint32_t)bc_u16(code, &frame->pc);
                 AjsEnv *old_e = frame->env;
                 if (old_e) {
                     AjsEnv *ce = ajs_env_new(vm, old_e->parent, cnt, old_e->names);
+                    if (!ce || vm->has_exception) goto handle_exception;
                     uint32_t copy_n = cnt < old_e->count ? cnt : old_e->count;
                     for (uint32_t i = 0; i < copy_n; i++) {
                         ce->slots[i] = old_e->slots[i];
@@ -2753,9 +2839,11 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 size_t rs = ajs_temp_root_save(vm);
                 ajs_temp_root_push(vm, wv);
                 AjsObject *wobj = ajs_to_object(vm, wv);
-                ajs_temp_root_restore(vm, rs);
                 CHECK_EXC();
+                ajs_temp_root_push(vm, ajs_val_from_gc(wobj));
                 AjsEnv *we = ajs_env_new(vm, frame->env, 0, NULL);
+                ajs_temp_root_restore(vm, rs);
+                if (!we || vm->has_exception) goto handle_exception;
                 we->with_obj = wobj;
                 frame->env = we;
                 frame->env_depth++;
@@ -2764,23 +2852,29 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
 
             case OP_NEW_OBJECT: {
                 AjsObject *o = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, realm->object_proto);
+                if (!o || vm->has_exception) goto handle_exception;
                 PUSH(ajs_val_from_gc(o));
                 break;
             }
             case OP_NEW_OBJECT_PROTO: {
                 AjsValue pv = POP();
                 if (!ajs_is_null(pv) && !ajs_is_object(vm, pv)) pv = realm->object_proto;
+                size_t rs = ajs_temp_root_save(vm);
+                ajs_temp_root_push(vm, pv);
                 AjsObject *o = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, pv);
+                ajs_temp_root_restore(vm, rs);
+                if (!o || vm->has_exception) goto handle_exception;
                 PUSH(ajs_val_from_gc(o));
                 break;
             }
             case OP_NEW_ARRAY: {
                 uint32_t cap = bc_u32(code, &frame->pc);
                 AjsObject *a = ajs_obj_new(vm, realm, AJS_OBJ_ARRAY, realm->array_proto);
+                if (!a || vm->has_exception) goto handle_exception;
                 a->u.arr.length_writable = true;
                 if (cap > 0 && cap <= 4096u) {
-                    a->u.arr.dense_cap = cap;
-                    a->u.arr.dense = (AjsValue *)malloc(cap * sizeof(AjsValue));
+                    a->u.arr.dense = (AjsValue *)malloc((size_t)cap * sizeof(AjsValue));
+                    if (a->u.arr.dense) a->u.arr.dense_cap = cap;
                 }
                 PUSH(ajs_val_from_gc(a));
                 break;
@@ -2888,6 +2982,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 ajs_temp_root_push(vm, excl_val);
                 ajs_temp_root_push(vm, src);
                 AjsObject *rest = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, realm->object_proto);
+                if (!rest || vm->has_exception) { ajs_temp_root_restore(vm, rs); goto handle_exception; }
                 ajs_temp_root_push(vm, ajs_val_from_gc(rest));
                 if (!ajs_is_nullish(src)) {
                     AjsObject *sobj = ajs_to_object(vm, src);
@@ -3106,7 +3201,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
             case OP_SET_SUPER_PROP:
             case OP_SET_SUPER_ELEM: {
                 uint16_t d = bc_u16(code, &frame->pc);
-                uint16_t fn_slot = bc_u16(code, &frame->pc);
+                uint32_t fn_slot = bc_u32(code, &frame->pc);
                 AjsValue key = AJS_VAL_UNDEFINED, rhs = AJS_VAL_UNDEFINED, recv = AJS_VAL_UNDEFINED;
                 uint8_t st = 0;
                 if (op == OP_GET_SUPER_PROP) {
@@ -3139,7 +3234,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                     goto handle_exception;
                 }
                 AjsObject *fn_obj = frame->func_obj;
-                if (fn_slot != 0xFFFF) {
+                if (fn_slot != AJS_NO_SLOT) {
                     AjsEnv *fe = env_at_depth(frame->env, d);
                     if (fe && fn_slot < fe->count && ajs_val_is_gc_kind(fe->slots[fn_slot], AJS_GC_OBJECT)) {
                         fn_obj = (AjsObject *)ajs_val_to_gc(fe->slots[fn_slot]);
@@ -3185,6 +3280,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
             case OP_NEW_PRIV_SYM: {
                 uint32_t d_idx = bc_u32(code, &frame->pc);
                 AjsSymbol *sym = (AjsSymbol *)ajs_gc_alloc(vm, sizeof(AjsSymbol), AJS_GC_SYMBOL);
+                if (!sym || vm->has_exception) goto handle_exception;
                 sym->id = ++vm->next_symbol_id;
                 sym->is_private = true;
                 if (d_idx < bc->const_count && ajs_val_is_gc_kind(bc->consts[d_idx], AJS_GC_STRING)) {
@@ -3196,7 +3292,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
             }
             case OP_DEF_PRIVATE: {
                 uint16_t d = bc_u16(code, &frame->pc);
-                uint16_t s = bc_u16(code, &frame->pc);
+                uint32_t s = bc_u32(code, &frame->pc);
                 uint8_t pk = bc_u8(code, &frame->pc);
                 AjsValue val = POP();
                 AjsValue tgt_v = TOP();
@@ -3225,7 +3321,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
             }
             case OP_GET_PRIVATE: {
                 uint16_t d = bc_u16(code, &frame->pc);
-                uint16_t s = bc_u16(code, &frame->pc);
+                uint32_t s = bc_u32(code, &frame->pc);
                 AjsValue tgt_v = POP();
                 AjsEnv *e = env_at_depth(frame->env, d);
                 AjsSymbol *sym = (AjsSymbol *)ajs_val_to_gc(e->slots[s]);
@@ -3239,7 +3335,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
             }
             case OP_SET_PRIVATE: {
                 uint16_t d = bc_u16(code, &frame->pc);
-                uint16_t s = bc_u16(code, &frame->pc);
+                uint32_t s = bc_u32(code, &frame->pc);
                 AjsValue val = POP();
                 AjsValue tgt_v = POP();
                 AjsEnv *e = env_at_depth(frame->env, d);
@@ -3255,7 +3351,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
             }
             case OP_IN_PRIVATE: {
                 uint16_t d = bc_u16(code, &frame->pc);
-                uint16_t s = bc_u16(code, &frame->pc);
+                uint32_t s = bc_u32(code, &frame->pc);
                 AjsValue tgt_v = POP();
                 AjsEnv *e = env_at_depth(frame->env, d);
                 AjsSymbol *sym = (AjsSymbol *)ajs_val_to_gc(e->slots[s]);
@@ -3271,6 +3367,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 AjsModuleRecord *m = frame->module;
                 if (!m && frame->func_obj) m = frame->func_obj->u.fn.owner_module;
                 AjsObject *fn = ajs_closure_new(vm, realm, cbc, frame->env, m);
+                if (!fn || vm->has_exception) goto handle_exception;
                 PUSH(ajs_val_from_gc(fn));
                 break;
             }
@@ -3332,6 +3429,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 ajs_temp_root_push(vm, proto_parent);
 
                 AjsObject *proto = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, proto_parent);
+                if (!proto || vm->has_exception) { ajs_temp_root_restore(vm, rs); goto handle_exception; }
                 AjsValue proto_v = ajs_val_from_gc(proto);
                 ajs_temp_root_push(vm, proto_v);
 
@@ -3371,9 +3469,9 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
             }
             case OP_SUPER_CALL: {
                 uint16_t d = bc_u16(code, &frame->pc);
-                uint16_t this_slot = bc_u16(code, &frame->pc);
-                uint16_t nt_slot = bc_u16(code, &frame->pc);
-                uint16_t fn_slot = bc_u16(code, &frame->pc);
+                uint32_t this_slot = bc_u32(code, &frame->pc);
+                uint32_t nt_slot = bc_u32(code, &frame->pc);
+                uint32_t fn_slot = bc_u32(code, &frame->pc);
                 AjsValue args_arr_v = POP();
 
                 AjsEnv *fe = env_at_depth(frame->env, d);
@@ -4025,7 +4123,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                         }
                         ajs_temp_root_push(vm, ajs_val_from_gc(ebc));
                         AjsValue ethis = frame->this_val;
-                        if (bc->this_slot != 0xFFFF && frame->base_env && bc->this_slot < frame->base_env->count) {
+                        if (bc->this_slot != AJS_NO_SLOT && frame->base_env && bc->this_slot < frame->base_env->count) {
                             ethis = frame->base_env->slots[bc->this_slot];
                         }
                         res = ajs_exec_script_bc(vm, realm, ebc, frame->env, ethis);
@@ -4095,7 +4193,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 return AJS_RUN_RETURNED;
             }
             case OP_RETURN_DERIVED: {
-                uint16_t this_slot = bc_u16(code, &frame->pc);
+                uint32_t this_slot = bc_u32(code, &frame->pc);
                 AjsValue rv = POP();
                 if (ajs_is_object(vm, rv)) {
                     *out_val = rv;
@@ -4106,7 +4204,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                                        "Derived constructors may only return object or undefined");
                     goto handle_exception;
                 }
-                AjsValue dthis = (this_slot != 0xFFFF && frame->base_env && this_slot < frame->base_env->count)
+                AjsValue dthis = (this_slot != AJS_NO_SLOT && frame->base_env && this_slot < frame->base_env->count)
                                  ? frame->base_env->slots[this_slot] : frame->this_val;
                 if (dthis == AJS_VAL_TDZ) {
                     ajs_throw_err_kind(vm, AJS_ERR_KIND_REFERENCE,
@@ -4210,7 +4308,7 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                                            "Derived constructors may only return object or undefined");
                         goto handle_exception;
                     }
-                    AjsValue dthis = (bc->this_slot != 0xFFFF && frame->base_env && bc->this_slot < frame->base_env->count)
+                    AjsValue dthis = (bc->this_slot != AJS_NO_SLOT && frame->base_env && bc->this_slot < frame->base_env->count)
                                      ? frame->base_env->slots[bc->this_slot] : frame->this_val;
                     if (dthis == AJS_VAL_TDZ) {
                         ajs_throw_err_kind(vm, AJS_ERR_KIND_REFERENCE,
@@ -4509,6 +4607,93 @@ static AjsFrameRunStatus ajs_run_frame(AjsVm *vm, AjsExecFrame *frame, AjsValue 
                 AjsValue av = POP();
                 *out_val = av;
                 return AJS_RUN_AWAITED;
+            }
+            case OP_DISPOSE_NEW: {
+                AjsValue sv = ajs_erm_disp_stack_new_internal(vm, realm, false);
+                CHECK_EXC();
+                PUSH(sv);
+                break;
+            }
+            case OP_DISPOSE_ADD: {
+                uint8_t is_async = bc_u8(code, &frame->pc);
+                AjsValue val = POP();
+                AjsValue sv = POP();
+                size_t rs = ajs_temp_root_save(vm);
+                ajs_temp_root_push(vm, sv);
+                ajs_temp_root_push(vm, val);
+                bool ok = ajs_val_is_gc_kind(sv, AJS_GC_OBJECT) &&
+                          ajs_erm_add_disposable(vm, (AjsObject *)ajs_val_to_gc(sv), val, is_async != 0);
+                ajs_temp_root_restore(vm, rs);
+                if (!ok || vm->has_exception) goto handle_exception;
+                PUSH(val);
+                break;
+            }
+            case OP_DISPOSE_STEP: {
+                AjsValue sv = POP();
+                if (!ajs_val_is_gc_kind(sv, AJS_GC_OBJECT)) {
+                    PUSH(AJS_VAL_UNDEFINED);
+                    PUSH(ajs_val_number(0.0));
+                    break;
+                }
+                AjsObject *sobj = (AjsObject *)ajs_val_to_gc(sv);
+                /* Seed pending throw completion into disposal state on first step so
+                 * SuppressedError(disposeErr, prevErr) associates left-to-right per ES2026! */
+                for (uint32_t ti = frame->try_sp; ti > 0; ti--) {
+                    AjsTryState *ts = &frame->try_stack[ti - 1u];
+                    if (ts->in_finally) {
+                        if (ts->pending_kind == AJS_COMP_THROW) {
+                            ajs_erm_dispose_record_error(vm, sobj, ts->pending_val);
+                            ts->pending_kind = AJS_COMP_NORMAL;
+                            ts->pending_val = AJS_VAL_UNDEFINED;
+                        }
+                        break;
+                    }
+                }
+                AjsValue await_val = AJS_VAL_UNDEFINED;
+                uint8_t mode = 0;
+                size_t rs = ajs_temp_root_save(vm);
+                ajs_temp_root_push(vm, sv);
+                bool ok = ajs_erm_dispose_step(vm, sobj, &await_val, &mode);
+                ajs_temp_root_restore(vm, rs);
+                if (!ok || vm->has_exception) goto handle_exception;
+                PUSH(await_val);
+                PUSH(ajs_val_number((double)mode));
+                break;
+            }
+            case OP_DISPOSE_CATCH: {
+                AjsValue err = POP();
+                AjsValue sv = POP();
+                if (ajs_val_is_gc_kind(sv, AJS_GC_OBJECT)) {
+                    ajs_erm_dispose_record_error(vm, (AjsObject *)ajs_val_to_gc(sv), err);
+                }
+                break;
+            }
+            case OP_DISPOSE_FINISH: {
+                AjsValue sv = POP();
+                if (ajs_val_is_gc_kind(sv, AJS_GC_OBJECT)) {
+                    AjsObject *sobj = (AjsObject *)ajs_val_to_gc(sv);
+                    bool has_pending_throw = false;
+                    AjsValue pending_err = AJS_VAL_UNDEFINED;
+                    AjsTryState *ts = (frame->try_sp > 0 && frame->try_stack[frame->try_sp - 1u].in_finally)
+                                      ? &frame->try_stack[frame->try_sp - 1u] : NULL;
+                    if (ts && ts->pending_kind == AJS_COMP_THROW) {
+                        has_pending_throw = true;
+                        pending_err = ts->pending_val;
+                    }
+                    bool threw = !ajs_erm_dispose_finish(vm, sobj, has_pending_throw, &pending_err);
+                    if (threw) {
+                        if (ts) {
+                            ts->pending_kind = AJS_COMP_THROW;
+                            ts->pending_val = pending_err;
+                            vm->has_exception = false;
+                            vm->exception = AJS_VAL_UNDEFINED;
+                        } else {
+                            ajs_throw(vm, pending_err);
+                            goto handle_exception;
+                        }
+                    }
+                }
+                break;
             }
         }
         next_opcode:;

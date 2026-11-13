@@ -284,11 +284,15 @@ typedef enum AjsFuncKind {
     AJS_FN_BOUND
 } AjsFuncKind;
 
+#define AJS_DEFAULT_HEAP_LIMIT_BYTES ((sizeof(void *) >= 8u) ? ((size_t)256u * 1024u * 1024u) : ((size_t)32u * 1024u * 1024u))
+#define AJS_NO_SLOT                  UINT32_MAX
+
 typedef struct AjsFuncData {
     AjsFuncKind   fn_kind;
     bool          is_constructor;
     bool          is_derived_ctor;
     bool          strict;
+    bool          has_lazy_proto; /* Defer allocating `.prototype` object until accessed */
     AjsNativeFn   native_fn;
     void         *native_userdata;
     int32_t       native_magic; /* Optional helper dispatch ID for built-ins */
@@ -318,7 +322,7 @@ typedef struct AjsArgsData {
     bool      mapped;
     AjsEnv   *env;
     uint32_t  param_count;
-    uint16_t *param_slots;      /* UINT16_MAX if unmapped slot */
+    uint32_t *param_slots;      /* AJS_NO_SLOT if unmapped slot */
 } AjsArgsData;
 
 typedef struct AjsErrorData {
@@ -609,11 +613,42 @@ struct AjsEnv {
     AjsEnv        *parent;
     AjsObject     *with_obj;        /* Non-NULL for sloppy `with (obj)` or global obj */
     uint32_t       count;
+    uint32_t       cap;
     AjsValue      *slots;
     uint8_t       *flags;
     AjsString    **names;           /* Optional slot names for direct eval / globals */
+    uint32_t       name_hash_cap;   /* 0 or power-of-2 >= 32 when count >= 16 */
+    int32_t       *name_hash;       /* -1 empty, >=0 slot index */
     AjsImportLink *import_links;    /* Non-NULL only for module environments with imports */
 };
+
+typedef struct AjsSourceBuf {
+    uint32_t refcount;
+    size_t   len;
+    char     utf8[];
+} AjsSourceBuf;
+
+static inline AjsSourceBuf *ajs_source_buf_new(const char *src, size_t len) {
+    if (!src || len == 0) return NULL;
+    AjsSourceBuf *sb = (AjsSourceBuf *)malloc(sizeof(AjsSourceBuf) + len + 1u);
+    if (!sb) return NULL;
+    sb->refcount = 1u;
+    sb->len = len;
+    memcpy(sb->utf8, src, len);
+    sb->utf8[len] = '\0';
+    return sb;
+}
+
+static inline AjsSourceBuf *ajs_source_buf_retain(AjsSourceBuf *sb) {
+    if (sb) sb->refcount++;
+    return sb;
+}
+
+static inline void ajs_source_buf_release(AjsSourceBuf *sb) {
+    if (sb && --sb->refcount == 0u) {
+        free(sb);
+    }
+}
 
 typedef enum AjsOpcode {
     OP_NOP = 0,
@@ -768,7 +803,25 @@ typedef enum AjsOpcode {
 
     OP_YIELD,           /* [val] -> [resumed_val] */
     OP_YIELD_STAR,      /* u8 is_async: [iterable] -> [final_val] */
-    OP_AWAIT            /* [val] -> [awaited_val] */
+    OP_AWAIT,           /* [val] -> [awaited_val] */
+
+    /* Fast 8-bit frame-local slot ops & 32-bit large-scope slot ops (>65,535 bindings) */
+    OP_GET_LOCAL8,      /* u8 slot */
+    OP_SET_LOCAL8,      /* u8 slot, u8 strict */
+    OP_INIT_LOCAL8,     /* u8 slot */
+    OP_GET_LEX32,       /* u16 depth, u32 slot */
+    OP_SET_LEX32,       /* u16 depth, u32 slot, u8 strict */
+    OP_INIT_LEX32,      /* u16 depth, u32 slot */
+    OP_CHECK_LEX_TDZ32, /* u16 depth, u32 slot */
+    OP_PUSH_ENV32,      /* u32 count, u32 env_desc_idx (UINT32_MAX = none) */
+    OP_CLONE_ENV32,     /* u32 count */
+
+    /* ES2025/ES2026 Explicit Resource Management (`using` / `await using`) */
+    OP_DISPOSE_NEW,     /* [] -> [disp_stack_obj] */
+    OP_DISPOSE_ADD,     /* u8 is_async: [disp_stack_obj, val] -> [val] */
+    OP_DISPOSE_STEP,    /* [disp_stack_obj] -> [await_val, mode_u8] */
+    OP_DISPOSE_CATCH,   /* [disp_stack_obj, err] -> [] */
+    OP_DISPOSE_FINISH   /* [disp_stack_obj] -> [] */
 } AjsOpcode;
 
 typedef struct AjsLineSpan {
@@ -785,7 +838,7 @@ typedef struct AjsTplSiteDesc {
 } AjsTplSiteDesc;
 
 typedef struct AjsEnvNamesDesc {
-    uint16_t    count;
+    uint32_t    count;
     uint8_t    *slot_flags;
     AjsString **names;
 } AjsEnvNamesDesc;
@@ -802,20 +855,23 @@ struct AjsBytecode {
     bool             needs_arguments;
     bool             is_module;
     bool             is_eval;
-    uint16_t         arity;             /* Expected Function.length */
-    uint16_t         param_count;
-    uint16_t         env_slot_count;    /* Top-level frame lexical/var slots */
-    uint16_t         this_slot;         /* 0xFFFF if none */
-    uint16_t         new_target_slot;   /* 0xFFFF if none */
-    uint16_t         arguments_slot;    /* 0xFFFF if none */
-    uint16_t         active_fn_slot;    /* 0xFFFF if none */
-    uint16_t        *mapped_param_slots;/* For sloppy mapped arguments */
+    uint32_t         arity;             /* Expected Function.length */
+    uint32_t         param_count;
+    uint32_t         env_slot_count;    /* Top-level frame lexical/var slots */
+    uint32_t         this_slot;         /* AJS_NO_SLOT if none */
+    uint32_t         new_target_slot;   /* AJS_NO_SLOT if none */
+    uint32_t         arguments_slot;    /* AJS_NO_SLOT if none */
+    uint32_t         active_fn_slot;    /* AJS_NO_SLOT if none */
+    uint32_t        *mapped_param_slots;/* For sloppy mapped arguments */
     uint8_t         *env_slot_flags;    /* Initial slot flags + AJS_SLOT_INIT_TDZ */
     AjsString      **env_slot_names;
 
     AjsString       *name;
     AjsString       *source_url;
     AjsString       *source_text;
+    AjsSourceBuf    *source_buf;
+    uint32_t         src_offset;
+    uint32_t         src_len;
 
     uint32_t         code_len;
     uint32_t         code_cap;
@@ -836,7 +892,7 @@ struct AjsBytecode {
     AjsLineSpan     *lines;
 };
 
-#define AJS_MAX_TRY_DEPTH 32
+#define AJS_MAX_TRY_DEPTH 128
 
 typedef enum AjsCompletionKind {
     AJS_COMP_NORMAL = 0,
@@ -904,7 +960,7 @@ typedef struct AjsImportEntry {
     AjsString *module_specifier;
     AjsString *import_name;     /* NULL for `import "mod"`, "*" for `import * as ns` */
     AjsString *local_name;
-    uint16_t   local_slot;
+    uint32_t   local_slot;
     uint32_t   line;
     uint32_t   col;
 } AjsImportEntry;
@@ -914,13 +970,13 @@ typedef struct AjsExportEntry {
     AjsString *module_specifier;/* NULL for local export */
     AjsString *import_name;     /* "*" for `export * as ns from "mod"` or `export * from "mod"` */
     AjsString *local_name;      /* Local binding name when module_specifier == NULL */
-    uint16_t   local_slot;
+    uint32_t   local_slot;
     uint32_t   line;
     uint32_t   col;
 } AjsExportEntry;
 
 typedef struct AjsFuncInitEntry {
-    uint16_t     slot;
+    uint32_t     slot;
     AjsBytecode *fn_bc;
 } AjsFuncInitEntry;
 
@@ -1030,6 +1086,8 @@ struct AjsRealm {
     AjsValue          intl_locale_proto, intl_collator_proto, intl_numfmt_proto;
     AjsValue          intl_dtfmt_proto, intl_plural_proto, intl_reltime_proto;
     AjsValue          intl_segmenter_proto, intl_segments_proto, intl_dispnames_proto, intl_listfmt_proto;
+    AjsValue          disp_stack_proto, disp_stack_ctor;
+    AjsValue          async_disp_stack_proto, async_disp_stack_ctor;
 
     AjsValue          intrinsic_eval;
     AjsValue          throw_type_error_fn;
@@ -1338,5 +1396,15 @@ AjsValue   ajs_module_dynamic_import(AjsVm *vm, AjsRealm *realm, const char *ref
 AjsValue   ajs_module_get_import_meta(AjsVm *vm, AjsModuleRecord *mod);
 AjsValue   ajs_module_ns_get(AjsVm *vm, AjsObject *ns_obj, AjsValue key);
 bool       ajs_module_ns_has(AjsVm *vm, AjsObject *ns_obj, AjsValue key, bool *out_has);
+
+/* Fast own-slot insertion & lazy source-text / ERM helpers */
+AjsPropSlot *ajs_obj_insert_own_slot(AjsObject *obj, AjsValue key, uint32_t flags, AjsValue val, AjsValue setter);
+AjsString   *ajs_bytecode_get_source_text(AjsVm *vm, AjsBytecode *bc);
+void       ajs_init_erm_builtins(AjsVm *vm, AjsRealm *r);
+AjsValue   ajs_erm_disp_stack_new_internal(AjsVm *vm, AjsRealm *realm, bool is_async);
+bool       ajs_erm_add_disposable(AjsVm *vm, AjsObject *stack_obj, AjsValue val, bool is_async);
+bool       ajs_erm_dispose_step(AjsVm *vm, AjsObject *stack_obj, AjsValue *out_await_val, uint8_t *out_mode);
+void       ajs_erm_dispose_record_error(AjsVm *vm, AjsObject *stack_obj, AjsValue err);
+bool       ajs_erm_dispose_finish(AjsVm *vm, AjsObject *stack_obj, bool has_pending_throw, AjsValue *io_pending_err);
 
 #endif /* AJS_INTERNAL_H */

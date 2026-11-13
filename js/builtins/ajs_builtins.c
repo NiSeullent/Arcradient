@@ -1865,7 +1865,10 @@ static AjsValue js_func_proto_toString(AjsVm *vm, AjsValue this_val, int argc, c
     AjsObject *o = (AjsObject *)ajs_val_to_gc(this_val);
     if (o->kind == AJS_OBJ_FUNCTION) {
         if (o->u.fn.source_text) return ajs_val_from_gc(o->u.fn.source_text);
-        if (o->u.fn.bc && o->u.fn.bc->source_text) return ajs_val_from_gc(o->u.fn.bc->source_text);
+        if (o->u.fn.bc) {
+            AjsString *st = ajs_bytecode_get_source_text(vm, o->u.fn.bc);
+            if (st) return ajs_val_from_gc(st);
+        }
     }
     AjsValue nv = ajs_obj_get(vm, this_val, ajs_val_from_gc(vm->str_name), this_val);
     if (vm->has_exception) ajs_clear_exception(vm);
@@ -2384,6 +2387,264 @@ static AjsValue js_math_random(AjsVm *vm, AjsValue t, int c, const AjsValue *v, 
     vm->rng_state[1] = s1 ^ s0 ^ (s1 >> 18) ^ (s0 >> 5);
     uint64_t rnd = vm->rng_state[1] + s0;
     return ajs_val_number((double)(rnd >> 11) * (1.0 / 9007199254740992.0));
+}
+
+/* ES2026 Math.sumPrecise(items) — Pure-integer 2400-bit IEEE-754 superaccumulator
+ * (60-bit signed limbs covering 2^-1074 .. 2^+1325, 100% immune to x87 extended precision) */
+#define AJS_SUM_ACC_WORDS      40
+#define AJS_SUM_ACC_CHUNK_BITS 60
+#define AJS_SUM_ACC_BASE       (UINT64_C(1) << AJS_SUM_ACC_CHUNK_BITS)
+#define AJS_SUM_ACC_MASK       (AJS_SUM_ACC_BASE - 1u)
+
+static int64_t sum_acc_normalize(int64_t acc[AJS_SUM_ACC_WORDS]) {
+    int64_t carry = 0;
+    for (int i = 0; i < AJS_SUM_ACC_WORDS; i++) {
+        int64_t v = acc[i] + carry;
+        if (v < 0) {
+            uint64_t mag = (uint64_t)(-(v + 1)) + 1u;
+            uint64_t rem = mag & AJS_SUM_ACC_MASK;
+            uint64_t quot = mag >> AJS_SUM_ACC_CHUNK_BITS;
+            if (rem == 0) {
+                acc[i] = 0;
+                carry = -(int64_t)quot;
+            } else {
+                acc[i] = (int64_t)(AJS_SUM_ACC_BASE - rem);
+                carry = -(int64_t)(quot + 1u);
+            }
+        } else {
+            acc[i] = (int64_t)((uint64_t)v & AJS_SUM_ACC_MASK);
+            carry = (int64_t)((uint64_t)v >> AJS_SUM_ACC_CHUNK_BITS);
+        }
+    }
+    return carry;
+}
+
+static void sum_acc_add_bits(int64_t acc[AJS_SUM_ACC_WORDS], uint64_t bits, uint32_t *io_pending) {
+    uint64_t sign = bits >> 63;
+    uint32_t raw_exp = (uint32_t)((bits >> 52) & 0x7FFu);
+    uint64_t raw_mant = bits & UINT64_C(0x000FFFFFFFFFFFFF);
+    uint64_t mant = (raw_exp == 0) ? raw_mant : (UINT64_C(0x0010000000000000) | raw_mant);
+    int bit_pos = (raw_exp == 0) ? 0 : ((int)raw_exp - 1); /* weight = 2^(bit_pos - 1074) */
+    int w = bit_pos / AJS_SUM_ACC_CHUNK_BITS;
+    int b = bit_pos % AJS_SUM_ACC_CHUNK_BITS;
+
+    uint64_t lo = (mant << b) & AJS_SUM_ACC_MASK;
+    uint64_t hi = (b <= (AJS_SUM_ACC_CHUNK_BITS - 53)) ? 0u : (mant >> (AJS_SUM_ACC_CHUNK_BITS - b));
+    if (sign == 0) {
+        acc[w] += (int64_t)lo;
+        if (hi != 0) acc[w + 1] += (int64_t)hi;
+    } else {
+        acc[w] -= (int64_t)lo;
+        if (hi != 0) acc[w + 1] -= (int64_t)hi;
+    }
+    if ((++(*io_pending) & 3u) == 0u) {
+        (void)sum_acc_normalize(acc);
+    }
+}
+
+static AjsValue sum_acc_to_ieee754(int64_t acc[AJS_SUM_ACC_WORDS]) {
+    int64_t top_carry = sum_acc_normalize(acc);
+    uint64_t res_sign = 0;
+    if (top_carry < 0) {
+        res_sign = 1u;
+        uint64_t borrow = 0;
+        for (int i = 0; i < AJS_SUM_ACC_WORDS; i++) {
+            uint64_t cur = (uint64_t)acc[i];
+            if (borrow == 0) {
+                if (cur != 0) {
+                    acc[i] = (int64_t)(AJS_SUM_ACC_BASE - cur);
+                    borrow = 1u;
+                }
+            } else {
+                acc[i] = (int64_t)((AJS_SUM_ACC_BASE - 1u) - cur);
+            }
+        }
+    }
+
+    int top = AJS_SUM_ACC_WORDS - 1;
+    while (top >= 0 && acc[top] == 0) top--;
+    if (top < 0) {
+        return ajs_val_number(0.0); /* +0.0 */
+    }
+
+    uint64_t top_word = (uint64_t)acc[top];
+    int msb_in_top = 0;
+    while ((top_word >> (msb_in_top + 1)) != 0) msb_in_top++;
+    int msb_pos = top * AJS_SUM_ACC_CHUNK_BITS + msb_in_top;
+    int unbiased_exp = msb_pos - 1074;
+
+    if (unbiased_exp > 1023) {
+        return res_sign ? AJS_VAL_NEG_INF : AJS_VAL_POS_INF;
+    }
+    if (msb_pos < 52) {
+        /* Exact subnormal (no bits exist below 2^-1074) */
+        uint64_t sub_bits = (res_sign << 63) | (uint64_t)acc[0];
+        return sub_bits;
+    }
+
+    int lsb_pos = msb_pos - 52;
+    int lw = lsb_pos / AJS_SUM_ACC_CHUNK_BITS;
+    int lb = lsb_pos % AJS_SUM_ACC_CHUNK_BITS;
+    uint64_t sig53 = ((uint64_t)acc[lw] >> lb);
+    if (lb > (AJS_SUM_ACC_CHUNK_BITS - 53) && lw + 1 < AJS_SUM_ACC_WORDS) {
+        sig53 |= ((uint64_t)acc[lw + 1] << (AJS_SUM_ACC_CHUNK_BITS - lb));
+    }
+    sig53 &= UINT64_C(0x001FFFFFFFFFFFFF);
+
+    if (lsb_pos > 0) {
+        int round_pos = lsb_pos - 1;
+        int rw = round_pos / AJS_SUM_ACC_CHUNK_BITS;
+        int rb = round_pos % AJS_SUM_ACC_CHUNK_BITS;
+        uint64_t round_bit = ((uint64_t)acc[rw] >> rb) & 1u;
+        if (round_bit != 0) {
+            bool sticky = false;
+            if (rb > 0 && (((uint64_t)acc[rw] & ((UINT64_C(1) << rb) - 1u)) != 0)) {
+                sticky = true;
+            }
+            for (int k = 0; k < rw && !sticky; k++) {
+                if (acc[k] != 0) sticky = true;
+            }
+            if (sticky || (sig53 & 1u) != 0) {
+                sig53++;
+                if (sig53 == (UINT64_C(1) << 53)) {
+                    sig53 >>= 1;
+                    unbiased_exp++;
+                    if (unbiased_exp > 1023) {
+                        return res_sign ? AJS_VAL_NEG_INF : AJS_VAL_POS_INF;
+                    }
+                }
+            }
+        }
+    }
+
+    uint64_t out_bits = (res_sign << 63) |
+                        ((uint64_t)(unbiased_exp + 1023) << 52) |
+                        (sig53 & UINT64_C(0x000FFFFFFFFFFFFF));
+    return out_bits;
+}
+
+static void sum_precise_iter_close_throw(AjsVm *vm, AjsValue iter) {
+    size_t rs = ajs_temp_root_save(vm);
+    AjsValue saved_exc = vm->exception;
+    ajs_temp_root_push(vm, saved_exc);
+    ajs_temp_root_push(vm, iter);
+    ajs_clear_exception(vm);
+    AjsValue rfn = ajs_obj_get(vm, iter, ajs_val_from_gc(vm->str_return), iter);
+    if (!vm->has_exception && !ajs_is_nullish(rfn) && ajs_is_callable(vm, rfn)) {
+        (void)ajs_call_internal(vm, rfn, iter, 0, NULL);
+    }
+    ajs_clear_exception(vm);
+    ajs_throw(vm, saved_exc);
+    ajs_temp_root_restore(vm, rs);
+}
+
+static AjsValue js_math_sumPrecise(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)this_val; (void)ud;
+    AjsValue items = argc > 0 ? argv[0] : AJS_VAL_UNDEFINED;
+    if (ajs_is_nullish(items)) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Math.sumPrecise called on null or undefined");
+    }
+
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, items);
+    AjsValue it_fn = ajs_obj_get(vm, items, ajs_val_from_gc(vm->well_known_syms[AJS_SYM_ITERATOR]), items);
+    if (vm->has_exception || !ajs_is_callable(vm, it_fn)) {
+        ajs_temp_root_restore(vm, rs);
+        if (!vm->has_exception) ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Math.sumPrecise argument is not iterable");
+        return AJS_VAL_EXCEPTION;
+    }
+    ajs_temp_root_push(vm, it_fn);
+    AjsValue iter = ajs_call_internal(vm, it_fn, items, 0, NULL);
+    if (vm->has_exception || !ajs_val_is_gc_kind(iter, AJS_GC_OBJECT)) {
+        ajs_temp_root_restore(vm, rs);
+        if (!vm->has_exception) ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Iterator must be an object");
+        return AJS_VAL_EXCEPTION;
+    }
+    ajs_temp_root_push(vm, iter);
+    AjsValue next_fn = ajs_obj_get(vm, iter, ajs_val_from_gc(vm->str_next), iter);
+    if (vm->has_exception) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    ajs_temp_root_push(vm, next_fn);
+
+    enum { SP_MINUS_ZERO = 0, SP_FINITE, SP_PLUS_INF, SP_MINUS_INF, SP_NAN } state = SP_MINUS_ZERO;
+    int64_t acc[AJS_SUM_ACC_WORDS];
+    memset(acc, 0, sizeof(acc));
+    uint32_t pending_norm = 0;
+    uint64_t count = 0;
+
+    for (;;) {
+        size_t ls = ajs_temp_root_save(vm);
+        AjsValue step = ajs_call_internal(vm, next_fn, iter, 0, NULL);
+        if (vm->has_exception || !ajs_val_is_gc_kind(step, AJS_GC_OBJECT)) {
+            ajs_temp_root_restore(vm, rs);
+            if (!vm->has_exception) ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Iterator result is not an object");
+            return AJS_VAL_EXCEPTION;
+        }
+        ajs_temp_root_push(vm, step);
+        AjsValue dn = ajs_obj_get(vm, step, ajs_val_from_gc(vm->str_done), step);
+        if (vm->has_exception) {
+            ajs_temp_root_restore(vm, rs);
+            return AJS_VAL_EXCEPTION;
+        }
+        if (ajs_to_bool(vm, dn)) {
+            ajs_temp_root_restore(vm, ls);
+            break;
+        }
+        AjsValue val = ajs_obj_get(vm, step, ajs_val_from_gc(vm->str_value), step);
+        if (vm->has_exception) {
+            ajs_temp_root_restore(vm, rs);
+            return AJS_VAL_EXCEPTION;
+        }
+        if (!ajs_val_is_number(val)) {
+            ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Math.sumPrecise requires Number elements");
+            sum_precise_iter_close_throw(vm, iter);
+            ajs_temp_root_restore(vm, rs);
+            return AJS_VAL_EXCEPTION;
+        }
+        if (count >= UINT64_C(9007199254740992)) {
+            ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Math.sumPrecise exceeded 2**53 elements");
+            sum_precise_iter_close_throw(vm, iter);
+            ajs_temp_root_restore(vm, rs);
+            return AJS_VAL_EXCEPTION;
+        }
+        count++;
+
+        if (state != SP_NAN) {
+            uint64_t bits = val;
+            uint32_t raw_exp = (uint32_t)((bits >> 52) & 0x7FFu);
+            uint64_t raw_mant = bits & UINT64_C(0x000FFFFFFFFFFFFF);
+            uint64_t sign = bits >> 63;
+            if (raw_exp == 0x7FFu) {
+                if (raw_mant != 0) {
+                    state = SP_NAN;
+                } else if (sign == 0) {
+                    state = (state == SP_MINUS_INF) ? SP_NAN : SP_PLUS_INF;
+                } else {
+                    state = (state == SP_PLUS_INF) ? SP_NAN : SP_MINUS_INF;
+                }
+            } else if (bits != UINT64_C(0x8000000000000000)) { /* not -0.0 */
+                if (state == SP_MINUS_ZERO || state == SP_FINITE) {
+                    state = SP_FINITE;
+                    if (bits != UINT64_C(0)) {
+                        sum_acc_add_bits(acc, bits, &pending_norm);
+                    }
+                }
+            }
+        }
+        ajs_temp_root_restore(vm, ls);
+    }
+
+    ajs_temp_root_restore(vm, rs);
+    switch (state) {
+        case SP_NAN:        return AJS_VAL_NAN;
+        case SP_PLUS_INF:   return AJS_VAL_POS_INF;
+        case SP_MINUS_INF:  return AJS_VAL_NEG_INF;
+        case SP_MINUS_ZERO: return UINT64_C(0x8000000000000000); /* -0.0 */
+        case SP_FINITE:     return sum_acc_to_ieee754(acc);
+    }
+    return AJS_VAL_NAN;
 }
 
 /* Symbol */
@@ -3858,10 +4119,11 @@ void ajs_realm_init_intrinsics(AjsVm *vm, AjsRealm *r) {
     ajs_def_native_method(vm, r, math_obj, "sign",     js_math_1, 1, AJS_METHOD_FLAGS, 23);
     ajs_def_native_method(vm, r, math_obj, "sin",      js_math_1, 1, AJS_METHOD_FLAGS, 24);
     ajs_def_native_method(vm, r, math_obj, "sinh",     js_math_1, 1, AJS_METHOD_FLAGS, 25);
-    ajs_def_native_method(vm, r, math_obj, "sqrt",     js_math_1, 1, AJS_METHOD_FLAGS, 26);
-    ajs_def_native_method(vm, r, math_obj, "tan",      js_math_1, 1, AJS_METHOD_FLAGS, 27);
-    ajs_def_native_method(vm, r, math_obj, "tanh",     js_math_1, 1, AJS_METHOD_FLAGS, 28);
-    ajs_def_native_method(vm, r, math_obj, "trunc",    js_math_1, 1, AJS_METHOD_FLAGS, 29);
+    ajs_def_native_method(vm, r, math_obj, "sqrt",       js_math_1, 1, AJS_METHOD_FLAGS, 26);
+    ajs_def_native_method(vm, r, math_obj, "sumPrecise", js_math_sumPrecise, 1, AJS_METHOD_FLAGS, 0);
+    ajs_def_native_method(vm, r, math_obj, "tan",        js_math_1, 1, AJS_METHOD_FLAGS, 27);
+    ajs_def_native_method(vm, r, math_obj, "tanh",       js_math_1, 1, AJS_METHOD_FLAGS, 28);
+    ajs_def_native_method(vm, r, math_obj, "trunc",      js_math_1, 1, AJS_METHOD_FLAGS, 29);
 
     /* 7. Symbol & BigInt */
     r->symbol_proto = ajs_val_from_gc(ajs_obj_new(vm, r, AJS_OBJ_ORDINARY, r->object_proto));

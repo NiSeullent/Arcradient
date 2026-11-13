@@ -28,6 +28,7 @@
 #define INTL_MAGIC_SEGMENTER    (-207)
 #define INTL_MAGIC_DISPNAMES    (-208)
 #define INTL_MAGIC_LISTFMT      (-209)
+#define INTL_MAGIC_DURFMT       (-210)
 
 /* ============================================================================
  * 1. Core Allocation, Prototype & Option Parsing Helpers
@@ -4265,6 +4266,969 @@ static AjsValue js_intl_listfmt_resolvedOptions(AjsVm *vm, AjsValue this_val, in
 }
 
 /* ============================================================================
+ * 11b. Intl.DurationFormat (ECMA-402 13th Edition §14)
+ * ============================================================================ */
+
+#define AJS_DURFMT_PROTO_TAG 0x49445550u /* 'IDUP' on realm->intl_listfmt_proto */
+#define AJS_DURFMT_INST_TAG  0x49445552u /* 'IDUR' on DurationFormat instance */
+
+typedef enum DurUnitIdx {
+    DUR_YEARS = 0,
+    DUR_MONTHS,
+    DUR_WEEKS,
+    DUR_DAYS,
+    DUR_HOURS,
+    DUR_MINUTES,
+    DUR_SECONDS,
+    DUR_MILLISECONDS,
+    DUR_MICROSECONDS,
+    DUR_NANOSECONDS,
+    DUR_UNIT_COUNT
+} DurUnitIdx;
+
+static const char *const k_dur_plural_names[DUR_UNIT_COUNT] = {
+    "years", "months", "weeks", "days", "hours",
+    "minutes", "seconds", "milliseconds", "microseconds", "nanoseconds"
+};
+
+static const char *const k_dur_singular_names[DUR_UNIT_COUNT] = {
+    "year", "month", "week", "day", "hour",
+    "minute", "second", "millisecond", "microsecond", "nanosecond"
+};
+
+static const char *const k_dur_display_opts[DUR_UNIT_COUNT] = {
+    "yearsDisplay", "monthsDisplay", "weeksDisplay", "daysDisplay", "hoursDisplay",
+    "minutesDisplay", "secondsDisplay", "millisecondsDisplay", "microsecondsDisplay", "nanosecondsDisplay"
+};
+
+/* Alphabetical order required by ECMA-402 ToDurationRecord */
+static const DurUnitIdx k_dur_alpha_order[DUR_UNIT_COUNT] = {
+    DUR_DAYS, DUR_HOURS, DUR_MICROSECONDS, DUR_MILLISECONDS, DUR_MINUTES,
+    DUR_MONTHS, DUR_NANOSECONDS, DUR_SECONDS, DUR_WEEKS, DUR_YEARS
+};
+
+typedef struct AjsDurationFormatData {
+    char locale[64];
+    char numbering_system[32];
+    char style[16];
+    char unit_style[DUR_UNIT_COUNT][16];
+    char unit_display[DUR_UNIT_COUNT][16];
+    bool has_fractional_digits;
+    int  fractional_digits;
+} AjsDurationFormatData;
+
+typedef struct AjsDurationRecord {
+    double vals[DUR_UNIT_COUNT];
+} AjsDurationRecord;
+
+static void durfmt_proto_gc_mark(AjsVm *vm, void *opaque, void (*mark_val)(AjsVm *vm, AjsValue v)) {
+    if (opaque) mark_val(vm, ajs_val_from_gc(opaque));
+}
+
+static void durfmt_inst_finalizer(AjsVm *vm, void *opaque) {
+    (void)vm;
+    free(opaque);
+}
+
+static AjsValue intl_get_realm_durfmt_proto(AjsRealm *r) {
+    if (!r || !ajs_val_is_gc_kind(r->intl_listfmt_proto, AJS_GC_OBJECT)) return AJS_VAL_UNDEFINED;
+    AjsObject *lf = (AjsObject *)ajs_val_to_gc(r->intl_listfmt_proto);
+    if (lf->opaque_tag == AJS_DURFMT_PROTO_TAG && lf->opaque_ptr) {
+        return ajs_val_from_gc(lf->opaque_ptr);
+    }
+    return r->object_proto;
+}
+
+static AjsValue intl_durfmt_proto_from_nt(AjsVm *vm, AjsValue nt) {
+    AjsRealm *fallback_r = vm->active_realm ? vm->active_realm : vm->main_realm;
+    if (ajs_val_is_gc_kind(nt, AJS_GC_OBJECT)) {
+        AjsValue p = ajs_obj_get(vm, nt, ajs_val_from_gc(vm->str_prototype), nt);
+        if (vm->has_exception) return AJS_VAL_EXCEPTION;
+        if (ajs_val_is_gc_kind(p, AJS_GC_OBJECT)) return p;
+        AjsObject *nto = (AjsObject *)ajs_val_to_gc(nt);
+        while (nto && nto->kind == AJS_OBJ_FUNCTION && nto->u.fn.fn_kind == AJS_FN_BOUND &&
+               ajs_val_is_gc_kind(nto->u.fn.bound_target, AJS_GC_OBJECT)) {
+            nto = (AjsObject *)ajs_val_to_gc(nto->u.fn.bound_target);
+        }
+        if (nto && nto->realm) fallback_r = nto->realm;
+    }
+    return intl_get_realm_durfmt_proto(fallback_r);
+}
+
+static AjsDurationFormatData *intl_require_durfmt(AjsVm *vm, AjsValue this_val) {
+    if (!ajs_val_is_gc_kind(this_val, AJS_GC_OBJECT)) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE,
+                           "Method called on incompatible receiver (expected Intl.DurationFormat)");
+        return NULL;
+    }
+    AjsObject *o = (AjsObject *)ajs_val_to_gc(this_val);
+    if (o->kind != AJS_OBJ_INTL || o->opaque_tag != AJS_DURFMT_INST_TAG || !o->opaque_ptr) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE,
+                           "Method called on incompatible receiver (expected Intl.DurationFormat)");
+        return NULL;
+    }
+    return (AjsDurationFormatData *)o->opaque_ptr;
+}
+
+static bool dur_style_is_numeric(const char *s) {
+    return strcmp(s, "numeric") == 0 || strcmp(s, "2-digit") == 0;
+}
+
+static bool dur_validate_record(AjsVm *vm, const AjsDurationRecord *rec) {
+    bool saw_pos = false, saw_neg = false;
+    for (int i = 0; i < DUR_UNIT_COUNT; i++) {
+        double v = rec->vals[i];
+        if (!isfinite(v) || floor(fabs(v)) != fabs(v)) {
+            ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Duration field must be a finite integer");
+            return false;
+        }
+        if (v > 0.0) saw_pos = true;
+        else if (v < 0.0) saw_neg = true;
+    }
+    if (saw_pos && saw_neg) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Duration cannot mix positive and negative units");
+        return false;
+    }
+    const double two32 = 4294967296.0;
+    if (fabs(rec->vals[DUR_YEARS]) >= two32 ||
+        fabs(rec->vals[DUR_MONTHS]) >= two32 ||
+        fabs(rec->vals[DUR_WEEKS]) >= two32) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Duration calendar unit out of range (>= 2**32)");
+        return false;
+    }
+    double norm_sec = rec->vals[DUR_DAYS] * 86400.0 +
+                      rec->vals[DUR_HOURS] * 3600.0 +
+                      rec->vals[DUR_MINUTES] * 60.0 +
+                      rec->vals[DUR_SECONDS] +
+                      rec->vals[DUR_MILLISECONDS] * 1e-3 +
+                      rec->vals[DUR_MICROSECONDS] * 1e-6 +
+                      rec->vals[DUR_NANOSECONDS] * 1e-9;
+    if (!isfinite(norm_sec) || fabs(norm_sec) >= 9007199254740992.0) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Duration time value out of range (>= 2**53 seconds)");
+        return false;
+    }
+    return true;
+}
+
+/* Parse ISO-8601 duration string: [+|-|U+2212]P[nY][nM][nW][nD][T[nH][nM][n[.f]S]] */
+static bool dur_parse_iso8601(AjsVm *vm, const char *s, AjsDurationRecord *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !s[0]) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Empty ISO-8601 duration string");
+        return false;
+    }
+    const char *p = s;
+    double sign = 1.0;
+    if (*p == '+') {
+        p++;
+    } else if (*p == '-') {
+        sign = -1.0;
+        p++;
+    } else if ((unsigned char)p[0] == 0xE2 && (unsigned char)p[1] == 0x88 && (unsigned char)p[2] == 0x92) {
+        sign = -1.0;
+        p += 3;
+    }
+    if (*p != 'P' && *p != 'p') {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Invalid ISO-8601 duration '%s'", s);
+        return false;
+    }
+    p++;
+
+    bool in_time = false;
+    bool any_unit = false;
+    bool any_after_t = false;
+    bool saw_frac = false;
+    int prev_date_rank = -1; /* Y=0, M=1, W=2, D=3 */
+    int prev_time_rank = -1; /* H=0, M=1, S=2 */
+
+    while (*p) {
+        if (!in_time && (*p == 'T' || *p == 't')) {
+            in_time = true;
+            p++;
+            if (!*p) {
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Empty time designator in duration '%s'", s);
+                return false;
+            }
+            continue;
+        }
+        if (saw_frac || !intl_is_digit((unsigned char)*p)) {
+            ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Malformed ISO-8601 duration '%s'", s);
+            return false;
+        }
+        double whole = 0.0;
+        while (intl_is_digit((unsigned char)*p)) {
+            whole = whole * 10.0 + (double)(*p - '0');
+            p++;
+        }
+        bool has_frac = false;
+        uint64_t frac_ns = 0; /* 9-digit scaled [0 .. 999,999,999] */
+        if (*p == '.' || *p == ',') {
+            if (!in_time) {
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Fractional date unit not allowed in '%s'", s);
+                return false;
+            }
+            p++;
+            if (!intl_is_digit((unsigned char)*p)) {
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Invalid fraction in duration '%s'", s);
+                return false;
+            }
+            has_frac = true;
+            saw_frac = true;
+            int fdigits = 0;
+            uint64_t scale = 100000000u;
+            while (intl_is_digit((unsigned char)*p)) {
+                if (fdigits >= 9) {
+                    ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "More than 9 fractional digits in '%s'", s);
+                    return false;
+                }
+                frac_ns += (uint64_t)(*p - '0') * scale;
+                scale /= 10u;
+                fdigits++;
+                p++;
+            }
+        }
+
+        char des = (char)intl_ascii_toupper((unsigned char)*p);
+        if (!des) {
+            ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Missing unit designator in duration '%s'", s);
+            return false;
+        }
+        p++;
+        any_unit = true;
+
+        if (!in_time) {
+            int rank = -1;
+            DurUnitIdx uidx = DUR_YEARS;
+            if (des == 'Y')      { rank = 0; uidx = DUR_YEARS; }
+            else if (des == 'M') { rank = 1; uidx = DUR_MONTHS; }
+            else if (des == 'W') { rank = 2; uidx = DUR_WEEKS; }
+            else if (des == 'D') { rank = 3; uidx = DUR_DAYS; }
+            else {
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Invalid date unit '%c' in '%s'", des, s);
+                return false;
+            }
+            if (rank <= prev_date_rank) {
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Out-of-order date units in '%s'", s);
+                return false;
+            }
+            prev_date_rank = rank;
+            out->vals[uidx] = (whole == 0.0) ? 0.0 : (sign * whole);
+        } else {
+            any_after_t = true;
+            int rank = -1;
+            if (des == 'H')      rank = 0;
+            else if (des == 'M') rank = 1;
+            else if (des == 'S') rank = 2;
+            else {
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Invalid time unit '%c' in '%s'", des, s);
+                return false;
+            }
+            if (rank <= prev_time_rank) {
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Out-of-order time units in '%s'", s);
+                return false;
+            }
+            prev_time_rank = rank;
+            if (des == 'H') {
+                out->vals[DUR_HOURS] = (whole == 0.0) ? 0.0 : (sign * whole);
+                if (has_frac && frac_ns > 0) {
+                    uint64_t total_ns = frac_ns * UINT64_C(3600);
+                    uint64_t mins = total_ns / UINT64_C(60000000000);
+                    total_ns %= UINT64_C(60000000000);
+                    uint64_t secs = total_ns / UINT64_C(1000000000);
+                    total_ns %= UINT64_C(1000000000);
+                    if (mins) out->vals[DUR_MINUTES] = sign * (double)mins;
+                    if (secs) out->vals[DUR_SECONDS] = sign * (double)secs;
+                    uint64_t ms = total_ns / UINT64_C(1000000);
+                    uint64_t us = (total_ns / UINT64_C(1000)) % UINT64_C(1000);
+                    uint64_t ns = total_ns % UINT64_C(1000);
+                    if (ms) out->vals[DUR_MILLISECONDS] = sign * (double)ms;
+                    if (us) out->vals[DUR_MICROSECONDS] = sign * (double)us;
+                    if (ns) out->vals[DUR_NANOSECONDS]  = sign * (double)ns;
+                }
+            } else if (des == 'M') {
+                out->vals[DUR_MINUTES] = (whole == 0.0) ? 0.0 : (sign * whole);
+                if (has_frac && frac_ns > 0) {
+                    uint64_t total_ns = frac_ns * UINT64_C(60);
+                    uint64_t secs = total_ns / UINT64_C(1000000000);
+                    total_ns %= UINT64_C(1000000000);
+                    if (secs) out->vals[DUR_SECONDS] = sign * (double)secs;
+                    uint64_t ms = total_ns / UINT64_C(1000000);
+                    uint64_t us = (total_ns / UINT64_C(1000)) % UINT64_C(1000);
+                    uint64_t ns = total_ns % UINT64_C(1000);
+                    if (ms) out->vals[DUR_MILLISECONDS] = sign * (double)ms;
+                    if (us) out->vals[DUR_MICROSECONDS] = sign * (double)us;
+                    if (ns) out->vals[DUR_NANOSECONDS]  = sign * (double)ns;
+                }
+            } else {
+                out->vals[DUR_SECONDS] = (whole == 0.0) ? 0.0 : (sign * whole);
+                if (has_frac && frac_ns > 0) {
+                    uint64_t ms = frac_ns / UINT64_C(1000000);
+                    uint64_t us = (frac_ns / UINT64_C(1000)) % UINT64_C(1000);
+                    uint64_t ns = frac_ns % UINT64_C(1000);
+                    if (ms) out->vals[DUR_MILLISECONDS] = sign * (double)ms;
+                    if (us) out->vals[DUR_MICROSECONDS] = sign * (double)us;
+                    if (ns) out->vals[DUR_NANOSECONDS]  = sign * (double)ns;
+                }
+            }
+        }
+    }
+
+    if (!any_unit || (in_time && !any_after_t)) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Invalid empty ISO-8601 duration '%s'", s);
+        return false;
+    }
+    return dur_validate_record(vm, out);
+}
+
+/* ECMA-402 §14.5.2 ToDurationRecord(input) */
+static bool intl_to_duration_record(AjsVm *vm, AjsValue input, AjsDurationRecord *out) {
+    memset(out, 0, sizeof(*out));
+    if (ajs_val_is_gc_kind(input, AJS_GC_STRING)) {
+        const AjsString *s = (const AjsString *)ajs_val_to_gc(input);
+        return dur_parse_iso8601(vm, s->utf8, out);
+    }
+    if (!ajs_val_is_gc_kind(input, AJS_GC_OBJECT)) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE,
+                           "Intl.DurationFormat requires a Duration-like object or ISO-8601 string");
+        return false;
+    }
+
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, input);
+    bool any_defined = false;
+    for (int k = 0; k < DUR_UNIT_COUNT; k++) {
+        DurUnitIdx uidx = k_dur_alpha_order[k];
+        AjsValue v = ajs_get_prop_str(vm, input, k_dur_plural_names[uidx]);
+        if (vm->has_exception) { ajs_temp_root_restore(vm, rs); return false; }
+        if (!ajs_is_undefined(v)) {
+            any_defined = true;
+            double d = 0.0;
+            if (!ajs_to_number(vm, v, &d)) { ajs_temp_root_restore(vm, rs); return false; }
+            if (!isfinite(d) || floor(fabs(d)) != fabs(d)) {
+                ajs_temp_root_restore(vm, rs);
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE,
+                                   "Duration property '%s' must be an integer", k_dur_plural_names[uidx]);
+                return false;
+            }
+            out->vals[uidx] = (d == 0.0) ? 0.0 : d;
+        }
+    }
+    ajs_temp_root_restore(vm, rs);
+
+    if (!any_defined) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE,
+                           "Duration object must have at least one defined duration property");
+        return false;
+    }
+    return dur_validate_record(vm, out);
+}
+
+static void dur_transliterate_digits(const char *ascii, const char *numsys, char *out, size_t cap) {
+    uint32_t zero_cp = 0;
+    static const char *const k_hanidec[10] = {
+        "\xE3\x80\x87", "\xE4\xB8\x80", "\xE4\xBA\x8C", "\xE4\xB8\x89", "\xE5\x9B\x9B",
+        "\xE4\xBA\x94", "\xE5\x85\xAD", "\xE4\xB8\x83", "\xE5\x85\xAB", "\xE4\xB9\x9D"
+    };
+    bool is_hani = (strcmp(numsys, "hanidec") == 0);
+    if (!is_hani) {
+        if (strcmp(numsys, "arab") == 0)          zero_cp = 0x0660u;
+        else if (strcmp(numsys, "arabext") == 0)  zero_cp = 0x06F0u;
+        else if (strcmp(numsys, "deva") == 0)     zero_cp = 0x0966u;
+        else if (strcmp(numsys, "beng") == 0)     zero_cp = 0x09E6u;
+        else if (strcmp(numsys, "guru") == 0)     zero_cp = 0x0A66u;
+        else if (strcmp(numsys, "gujr") == 0)     zero_cp = 0x0AE6u;
+        else if (strcmp(numsys, "orya") == 0)     zero_cp = 0x0B66u;
+        else if (strcmp(numsys, "tamldec") == 0)  zero_cp = 0x0BE6u;
+        else if (strcmp(numsys, "telu") == 0)     zero_cp = 0x0C66u;
+        else if (strcmp(numsys, "knda") == 0)     zero_cp = 0x0CE6u;
+        else if (strcmp(numsys, "mlym") == 0)     zero_cp = 0x0D66u;
+        else if (strcmp(numsys, "thai") == 0)     zero_cp = 0x0E50u;
+        else if (strcmp(numsys, "laoo") == 0)     zero_cp = 0x0ED0u;
+        else if (strcmp(numsys, "tibt") == 0)     zero_cp = 0x0F20u;
+        else if (strcmp(numsys, "mymr") == 0)     zero_cp = 0x1040u;
+        else if (strcmp(numsys, "khmr") == 0)     zero_cp = 0x17E0u;
+        else if (strcmp(numsys, "mong") == 0)     zero_cp = 0x1810u;
+        else if (strcmp(numsys, "limb") == 0)     zero_cp = 0x1946u;
+        else if (strcmp(numsys, "bali") == 0)     zero_cp = 0x1B50u;
+        else if (strcmp(numsys, "fullwide") == 0) zero_cp = 0xFF10u;
+    }
+    if (!is_hani && zero_cp == 0) {
+        snprintf(out, cap, "%s", ascii);
+        return;
+    }
+    size_t pos = 0;
+    for (size_t i = 0; ascii[i] && pos + 5 < cap; i++) {
+        unsigned char c = (unsigned char)ascii[i];
+        if (c >= '0' && c <= '9') {
+            int d = (int)(c - '0');
+            if (is_hani) {
+                const char *hs = k_hanidec[d];
+                size_t hl = strlen(hs);
+                if (pos + hl < cap) { ajs_memcpy(out + pos, hs, hl); pos += hl; }
+            } else {
+                char u8[4];
+                size_t n = ajs_code_point_to_utf8(zero_cp + (uint32_t)d, u8);
+                if (pos + n < cap) { ajs_memcpy(out + pos, u8, n); pos += n; }
+            }
+        } else {
+            out[pos++] = (char)c;
+        }
+    }
+    out[pos] = '\0';
+}
+
+static void dur_unit_label_and_space(const char *locale, DurUnitIdx u, const char *ustyle,
+                                     bool is_plural, const char **out_label, bool *out_space) {
+    bool ko = intl_lang_is(locale, "ko");
+    bool ja = intl_lang_is(locale, "ja");
+    bool zh = intl_lang_is(locale, "zh");
+    bool de = intl_lang_is(locale, "de");
+    bool fr = intl_lang_is(locale, "fr");
+    bool es = intl_lang_is(locale, "es");
+    bool lg = (strcmp(ustyle, "long") == 0);
+    bool nr = (strcmp(ustyle, "narrow") == 0);
+
+    if (ko) {
+        *out_space = false;
+        switch (u) {
+            case DUR_YEARS:        *out_label = "\xEB\x85\x84"; return; /* 년 */
+            case DUR_MONTHS:       *out_label = "\xEA\xB0\x9C\xEC\x9B\x94"; return; /* 개월 */
+            case DUR_WEEKS:        *out_label = "\xEC\xA3\xBC"; return; /* 주 */
+            case DUR_DAYS:         *out_label = "\xEC\x9D\xBC"; return; /* 일 */
+            case DUR_HOURS:        *out_label = "\xEC\x8B\x9C\xEA\xB0\x84"; return; /* 시간 */
+            case DUR_MINUTES:      *out_label = "\xEB\xB6\x84"; return; /* 분 */
+            case DUR_SECONDS:      *out_label = "\xEC\xB4\x88"; return; /* 초 */
+            case DUR_MILLISECONDS: *out_label = lg ? "\xEB\xB0\x80\xEB\xA6\xAC\xEC\xB4\x88" : "ms"; return;
+            case DUR_MICROSECONDS: *out_label = lg ? "\xEB\xA7\x88\xEC\x9D\xB4\xED\x81\xAC\xEB\xA1\x9C\xEC\xB4\x88" : "\xCE\xBCs"; return;
+            case DUR_NANOSECONDS:  *out_label = lg ? "\xEB\x82\x98\xEB\x85\xB8\xEC\xB4\x88" : "ns"; return;
+            default: break;
+        }
+    }
+    if (ja) {
+        *out_space = false;
+        switch (u) {
+            case DUR_YEARS:        *out_label = "\xE5\xB9\xB4"; return; /* 年 */
+            case DUR_MONTHS:       *out_label = "\xE3\x81\x8B\xE6\x9C\x88"; return; /* か月 */
+            case DUR_WEEKS:        *out_label = lg ? "\xE9\x80\xB1\xE9\x96\x93" : "\xE9\x80\xB1"; return; /* 週間 / 週 */
+            case DUR_DAYS:         *out_label = "\xE6\x97\xA5"; return; /* 日 */
+            case DUR_HOURS:        *out_label = "\xE6\x99\x82\xE9\x96\x93"; return; /* 時間 */
+            case DUR_MINUTES:      *out_label = "\xE5\x88\x86"; return; /* 分 */
+            case DUR_SECONDS:      *out_label = "\xE7\xA7\x92"; return; /* 秒 */
+            case DUR_MILLISECONDS: *out_label = lg ? "\xE3\x83\x9F\xE3\x83\xAA\xE7\xA7\x92" : "ms"; return;
+            case DUR_MICROSECONDS: *out_label = lg ? "\xE3\x83\x9E\xE3\x82\xA4\xE3\x82\xAF\xE3\x83\xAD\xE7\xA7\x92" : "\xCE\xBCs"; return;
+            case DUR_NANOSECONDS:  *out_label = lg ? "\xE3\x83\x8A\xE3\x83\x8E\xE7\xA7\x92" : "ns"; return;
+            default: break;
+        }
+    }
+    if (zh) {
+        *out_space = false;
+        switch (u) {
+            case DUR_YEARS:        *out_label = "\xE5\xB9\xB4"; return;
+            case DUR_MONTHS:       *out_label = nr ? "\xE6\x9C\x88" : "\xE4\xB8\xAA\xE6\x9C\x88"; return;
+            case DUR_WEEKS:        *out_label = "\xE5\x91\xA8"; return;
+            case DUR_DAYS:         *out_label = "\xE5\xA4\xA9"; return;
+            case DUR_HOURS:        *out_label = "\xE5\xB0\x8F\xE6\x97\xB6"; return;
+            case DUR_MINUTES:      *out_label = nr ? "\xE5\x88\x86" : "\xE5\x88\x86\xE9\x92\x9F"; return;
+            case DUR_SECONDS:      *out_label = "\xE7\xA7\x92"; return;
+            case DUR_MILLISECONDS: *out_label = lg ? "\xE6\xAF\xAB\xE7\xA7\x92" : "ms"; return;
+            case DUR_MICROSECONDS: *out_label = lg ? "\xE5\xBE\xAE\xE7\xA7\x92" : "\xCE\xBCs"; return;
+            case DUR_NANOSECONDS:  *out_label = lg ? "\xE7\xBA\xB3\xE7\xA7\x92" : "ns"; return;
+            default: break;
+        }
+    }
+    if (de && !nr) {
+        *out_space = true;
+        switch (u) {
+            case DUR_YEARS:   *out_label = lg ? (is_plural ? "Jahre" : "Jahr") : "J"; return;
+            case DUR_MONTHS:  *out_label = lg ? (is_plural ? "Monate" : "Monat") : "Mon."; return;
+            case DUR_WEEKS:   *out_label = lg ? (is_plural ? "Wochen" : "Woche") : "Wo."; return;
+            case DUR_DAYS:    *out_label = lg ? (is_plural ? "Tage" : "Tag") : (is_plural ? "Tage" : "Tag"); return;
+            case DUR_HOURS:   *out_label = lg ? (is_plural ? "Stunden" : "Stunde") : "Std."; return;
+            case DUR_MINUTES: *out_label = lg ? (is_plural ? "Minuten" : "Minute") : "Min."; return;
+            case DUR_SECONDS: *out_label = lg ? (is_plural ? "Sekunden" : "Sekunde") : "Sek."; return;
+            default: break;
+        }
+    }
+    if ((fr || es) && !nr && lg) {
+        *out_space = true;
+        if (fr) {
+            switch (u) {
+                case DUR_YEARS:   *out_label = is_plural ? "ans" : "an"; return;
+                case DUR_MONTHS:  *out_label = "mois"; return;
+                case DUR_WEEKS:   *out_label = is_plural ? "semaines" : "semaine"; return;
+                case DUR_DAYS:    *out_label = is_plural ? "jours" : "jour"; return;
+                case DUR_HOURS:   *out_label = is_plural ? "heures" : "heure"; return;
+                case DUR_MINUTES: *out_label = is_plural ? "minutes" : "minute"; return;
+                case DUR_SECONDS: *out_label = is_plural ? "secondes" : "seconde"; return;
+                default: break;
+            }
+        } else {
+            switch (u) {
+                case DUR_YEARS:   *out_label = is_plural ? "a\xC3\xB1os" : "a\xC3\xB1o"; return;
+                case DUR_MONTHS:  *out_label = is_plural ? "meses" : "mes"; return;
+                case DUR_WEEKS:   *out_label = is_plural ? "semanas" : "semana"; return;
+                case DUR_DAYS:    *out_label = is_plural ? "d\xC3\xAD" "as" : "d\xC3\xAD" "a"; return;
+                case DUR_HOURS:   *out_label = is_plural ? "horas" : "hora"; return;
+                case DUR_MINUTES: *out_label = is_plural ? "minutos" : "minuto"; return;
+                case DUR_SECONDS: *out_label = is_plural ? "segundos" : "segundo"; return;
+                default: break;
+            }
+        }
+    }
+
+    *out_space = !nr;
+    switch (u) {
+        case DUR_YEARS:        *out_label = lg ? (is_plural ? "years" : "year") : (nr ? "y" : (is_plural ? "yrs" : "yr")); return;
+        case DUR_MONTHS:       *out_label = lg ? (is_plural ? "months" : "month") : (nr ? "m" : (is_plural ? "mths" : "mth")); return;
+        case DUR_WEEKS:        *out_label = lg ? (is_plural ? "weeks" : "week") : (nr ? "w" : (is_plural ? "wks" : "wk")); return;
+        case DUR_DAYS:         *out_label = lg ? (is_plural ? "days" : "day") : (nr ? "d" : (is_plural ? "days" : "day")); return;
+        case DUR_HOURS:        *out_label = lg ? (is_plural ? "hours" : "hour") : (nr ? "h" : "hr"); return;
+        case DUR_MINUTES:      *out_label = lg ? (is_plural ? "minutes" : "minute") : (nr ? "m" : "min"); return;
+        case DUR_SECONDS:      *out_label = lg ? (is_plural ? "seconds" : "second") : (nr ? "s" : "sec"); return;
+        case DUR_MILLISECONDS: *out_label = lg ? (is_plural ? "milliseconds" : "millisecond") : "ms"; return;
+        case DUR_MICROSECONDS: *out_label = lg ? (is_plural ? "microseconds" : "microsecond") : "\xCE\xBCs"; return;
+        case DUR_NANOSECONDS:  *out_label = lg ? (is_plural ? "nanoseconds" : "nanosecond") : "ns"; return;
+        default:               *out_label = ""; return;
+    }
+}
+
+typedef struct DurPart {
+    char        type[16];
+    char        val[96];
+    const char *unit; /* NULL for list / digital ':' separators */
+} DurPart;
+
+typedef struct DurGroup {
+    DurPart parts[24];
+    int     count;
+} DurGroup;
+
+static void dur_group_push(DurGroup *g, const char *type, const char *val, const char *unit) {
+    if (!val || !val[0] || g->count >= 24) return;
+    snprintf(g->parts[g->count].type, sizeof(g->parts[0].type), "%s", type);
+    snprintf(g->parts[g->count].val, sizeof(g->parts[0].val), "%s", val);
+    g->parts[g->count].unit = unit;
+    g->count++;
+}
+
+static void dur_emit_int_parts(DurGroup *g, const AjsDurationFormatData *d, double abs_int,
+                               int min_int_digits, bool use_grouping, const char *unit_name) {
+    char raw[48];
+    snprintf(raw, sizeof(raw), "%.0f", floor(abs_int));
+    size_t rlen = strlen(raw);
+    char padded[64];
+    size_t pad = ((int)rlen < min_int_digits) ? (size_t)(min_int_digits - (int)rlen) : 0;
+    size_t pp = 0;
+    for (size_t i = 0; i < pad && pp + 1 < sizeof(padded); i++) padded[pp++] = '0';
+    snprintf(padded + pp, sizeof(padded) - pp, "%s", raw);
+
+    const char *grp_sep = ",", *dec_sep = ".";
+    intl_locale_separators(d->locale, &grp_sep, &dec_sep);
+    size_t plen = strlen(padded);
+    if (!use_grouping || plen <= 3) {
+        char loc_buf[96];
+        dur_transliterate_digits(padded, d->numbering_system, loc_buf, sizeof(loc_buf));
+        dur_group_push(g, "integer", loc_buf, unit_name);
+        return;
+    }
+    size_t pos = 0;
+    size_t first = plen % 3;
+    if (first == 0) first = 3;
+    while (pos < plen) {
+        size_t chunk = (pos == 0) ? first : 3;
+        char cbuf[16], loc_buf[64];
+        ajs_memcpy(cbuf, padded + pos, chunk);
+        cbuf[chunk] = '\0';
+        dur_transliterate_digits(cbuf, d->numbering_system, loc_buf, sizeof(loc_buf));
+        dur_group_push(g, "integer", loc_buf, unit_name);
+        pos += chunk;
+        if (pos < plen) dur_group_push(g, "group", grp_sep, unit_name);
+    }
+}
+
+static void dur_partition_parts(const AjsDurationFormatData *d, const AjsDurationRecord *rec,
+                                DurGroup groups[DUR_UNIT_COUNT], int *out_group_count) {
+    int gcnt = 0;
+    memset(groups, 0, sizeof(DurGroup) * DUR_UNIT_COUNT);
+
+    bool is_neg_duration = false;
+    for (int i = 0; i < DUR_UNIT_COUNT; i++) {
+        if (rec->vals[i] < 0.0) { is_neg_duration = true; break; }
+    }
+    bool need_neg_sign = is_neg_duration;
+    bool numeric_group_open = false;
+
+    const char *grp_sep = ",", *dec_sep = ".";
+    intl_locale_separators(d->locale, &grp_sep, &dec_sep);
+
+    /* Check whether sub-seconds coalesce as fractional seconds (ECMA-402 §14.5.8) */
+    bool coalesce_subsec = dur_style_is_numeric(d->unit_style[DUR_MILLISECONDS]) ||
+                           strcmp(d->unit_style[DUR_SECONDS], "numeric") == 0 ||
+                           strcmp(d->unit_style[DUR_SECONDS], "2-digit") == 0;
+    double combined_abs_sec = fabs(rec->vals[DUR_SECONDS]);
+    uint64_t rem_ns = 0;
+    if (coalesce_subsec) {
+        double sub_ns_f = fabs(rec->vals[DUR_MILLISECONDS]) * 1e6 +
+                          fabs(rec->vals[DUR_MICROSECONDS]) * 1e3 +
+                          fabs(rec->vals[DUR_NANOSECONDS]);
+        double extra_s = floor(sub_ns_f / 1e9);
+        combined_abs_sec += extra_s;
+        rem_ns = (uint64_t)floor(sub_ns_f - extra_s * 1e9 + 0.5);
+        if (rem_ns >= UINT64_C(1000000000)) {
+            combined_abs_sec += 1.0;
+            rem_ns -= UINT64_C(1000000000);
+        }
+    }
+
+    bool hours_will_show = (rec->vals[DUR_HOURS] != 0.0) ||
+                           (strcmp(d->unit_display[DUR_HOURS], "auto") != 0);
+    bool secs_will_show = ((coalesce_subsec ? (combined_abs_sec != 0.0 || rem_ns != 0) : (rec->vals[DUR_SECONDS] != 0.0))) ||
+                          (strcmp(d->unit_display[DUR_SECONDS], "auto") != 0);
+
+    for (int u = 0; u < DUR_UNIT_COUNT; u++) {
+        if (coalesce_subsec && u >= DUR_MILLISECONDS) break;
+
+        const char *ustyle = d->unit_style[u];
+        const char *udisp  = d->unit_display[u];
+        bool is_num_style  = dur_style_is_numeric(ustyle);
+        double abs_val     = (u == DUR_SECONDS && coalesce_subsec) ? combined_abs_sec : fabs(rec->vals[u]);
+        bool has_frac_part = (u == DUR_SECONDS && coalesce_subsec && (rem_ns != 0 || (d->has_fractional_digits && d->fractional_digits > 0)));
+
+        bool force_mid_min = (u == DUR_MINUTES && is_num_style && hours_will_show && secs_will_show);
+        bool show = (abs_val != 0.0) || has_frac_part || (strcmp(udisp, "auto") != 0) || force_mid_min;
+        if (!show) continue;
+
+        DurGroup *g = NULL;
+        if (is_num_style) {
+            if (!numeric_group_open) {
+                g = &groups[gcnt++];
+                numeric_group_open = true;
+            } else {
+                g = &groups[gcnt - 1];
+                dur_group_push(g, "literal", ":", NULL);
+            }
+        } else {
+            numeric_group_open = false;
+            g = &groups[gcnt++];
+        }
+
+        const char *uname = k_dur_singular_names[u];
+        if (need_neg_sign) {
+            dur_group_push(g, "minusSign", "-", uname);
+            need_neg_sign = false;
+        }
+
+        int min_id = (strcmp(ustyle, "2-digit") == 0) ? 2 : 1;
+        bool use_grp = (strcmp(ustyle, "2-digit") != 0);
+        dur_emit_int_parts(g, d, abs_val, min_id, use_grp, uname);
+
+        bool has_emitted_frac = false;
+        if (u == DUR_SECONDS && coalesce_subsec) {
+            char f9[32];
+            snprintf(f9, sizeof(f9), "%09llu", (unsigned long long)(rem_ns % UINT64_C(1000000000)));
+            int flen = 0;
+            if (d->has_fractional_digits) {
+                flen = d->fractional_digits; /* Truncate to exact fractionalDigits [0..9] */
+            } else if (rem_ns != 0) {
+                flen = 9;
+                while (flen > 0 && f9[flen - 1] == '0') flen--;
+            }
+            if (flen > 0) {
+                f9[flen] = '\0';
+                char loc_frac[64];
+                dur_transliterate_digits(f9, d->numbering_system, loc_frac, sizeof(loc_frac));
+                dur_group_push(g, "decimal", dec_sep, uname);
+                dur_group_push(g, "fraction", loc_frac, uname);
+                has_emitted_frac = true;
+            }
+        }
+
+        if (!is_num_style) {
+            bool is_plural = (abs_val != 1.0) || has_emitted_frac;
+            const char *ulabel = "";
+            bool uspace = false;
+            dur_unit_label_and_space(d->locale, (DurUnitIdx)u, ustyle, is_plural, &ulabel, &uspace);
+            if (uspace) dur_group_push(g, "literal", " ", uname);
+            dur_group_push(g, "unit", ulabel, uname);
+        }
+    }
+
+    *out_group_count = gcnt;
+}
+
+static void dur_list_seps(const AjsDurationFormatData *d,
+                          const char **out_mid, const char **out_pair, const char **out_end) {
+    const char *eff_style = (strcmp(d->style, "digital") == 0) ? "short" : d->style;
+    bool nr = (strcmp(eff_style, "narrow") == 0);
+    if (intl_lang_is(d->locale, "ko")) {
+        *out_mid = " "; *out_pair = " "; *out_end = " ";
+        return;
+    }
+    if (intl_lang_is(d->locale, "ja") || intl_lang_is(d->locale, "zh")) {
+        const char *s = nr ? "" : " ";
+        *out_mid = s; *out_pair = s; *out_end = s;
+        return;
+    }
+    const char *s = nr ? " " : ", ";
+    *out_mid = s; *out_pair = s; *out_end = s;
+}
+
+static AjsValue js_intl_durfmt_ctor(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)this_val; (void)ud;
+    AjsValue nt = ajs_get_native_new_target(vm);
+    if (ajs_is_undefined(nt)) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Constructor Intl.DurationFormat requires 'new'");
+    }
+    size_t rs = ajs_temp_root_save(vm);
+    AjsValue proto = intl_durfmt_proto_from_nt(vm, nt);
+    if (vm->has_exception) return AJS_VAL_EXCEPTION;
+    ajs_temp_root_push(vm, proto);
+
+    AjsValue opts = AJS_VAL_UNDEFINED;
+    if (!intl_coerce_options_obj(vm, argc > 1 ? argv[1] : AJS_VAL_UNDEFINED, &opts)) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    ajs_temp_root_push(vm, opts);
+
+    IntlParsedTag pt;
+    char full_loc[64];
+    if (!intl_resolve_locale(vm, argc > 0 ? argv[0] : AJS_VAL_UNDEFINED, opts, &pt, full_loc, sizeof(full_loc))) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+
+    char nu_opt[32];
+    bool nu_pres = false;
+    if (!intl_get_opt_str(vm, opts, "numberingSystem", NULL, 0, "", nu_opt, sizeof(nu_opt), &nu_pres)) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    if (nu_pres) {
+        if (!intl_is_valid_unicode_type_seq(nu_opt)) {
+            ajs_temp_root_restore(vm, rs);
+            return ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Invalid numberingSystem '%s'", nu_opt);
+        }
+        for (size_t k = 0; nu_opt[k]; k++) nu_opt[k] = (char)intl_ascii_tolower((unsigned char)nu_opt[k]);
+    }
+    const char *chosen_nu = "latn";
+    const char *cand_nu = nu_pres ? nu_opt : pt.u_nu;
+    if (cand_nu[0]) {
+        for (size_t i = 0; i < sizeof(k_sv_numsys) / sizeof(k_sv_numsys[0]); i++) {
+            if (strcmp(cand_nu, k_sv_numsys[i]) == 0) { chosen_nu = k_sv_numsys[i]; break; }
+        }
+    }
+
+    AjsDurationFormatData tmp;
+    memset(&tmp, 0, sizeof(tmp));
+    format_parsed_tag(&pt, NULL, 0, tmp.locale, sizeof(tmp.locale));
+    if (strcmp(chosen_nu, "latn") != 0 && strcmp(chosen_nu, pt.u_nu) == 0) {
+        size_t bl = strlen(tmp.locale);
+        snprintf(tmp.locale + bl, sizeof(tmp.locale) - bl, "-u-nu-%s", chosen_nu);
+    }
+    snprintf(tmp.numbering_system, sizeof(tmp.numbering_system), "%s", chosen_nu);
+
+    static const char *const k_base_styles[4] = { "long", "short", "narrow", "digital" };
+    if (!intl_get_opt_str(vm, opts, "style", k_base_styles, 4, "short", tmp.style, sizeof(tmp.style), NULL)) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+
+    static const char *const k_date_styles[3]   = { "long", "short", "narrow" };
+    static const char *const k_hms_styles[5]    = { "long", "short", "narrow", "numeric", "2-digit" };
+    static const char *const k_subsec_styles[4] = { "long", "short", "narrow", "numeric" };
+    static const char *const k_disp_vals[2]     = { "auto", "always" };
+
+    const char *prev_style = "";
+    for (int u = 0; u < DUR_UNIT_COUNT; u++) {
+        const char *const *slist = k_date_styles;
+        int scnt = 3;
+        const char *dig_base = "short";
+        if (u >= DUR_HOURS && u <= DUR_SECONDS) {
+            slist = k_hms_styles; scnt = 5; dig_base = "numeric";
+        } else if (u >= DUR_MILLISECONDS) {
+            slist = k_subsec_styles; scnt = 4; dig_base = "numeric";
+        }
+
+        char uval[16];
+        bool upres = false;
+        if (!intl_get_opt_str(vm, opts, k_dur_plural_names[u], slist, scnt, "", uval, sizeof(uval), &upres)) {
+            ajs_temp_root_restore(vm, rs);
+            return AJS_VAL_EXCEPTION;
+        }
+        const char *disp_def = "always";
+        if (!upres) {
+            if (strcmp(tmp.style, "digital") == 0) {
+                if (u != DUR_HOURS && u != DUR_MINUTES && u != DUR_SECONDS) disp_def = "auto";
+                snprintf(uval, sizeof(uval), "%s", dig_base);
+            } else if (dur_style_is_numeric(prev_style)) {
+                if (u != DUR_MINUTES && u != DUR_SECONDS) disp_def = "auto";
+                snprintf(uval, sizeof(uval), "numeric");
+            } else {
+                disp_def = "auto";
+                snprintf(uval, sizeof(uval), "%s", tmp.style);
+            }
+        } else if (dur_style_is_numeric(prev_style) && !dur_style_is_numeric(uval)) {
+            ajs_temp_root_restore(vm, rs);
+            return ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE,
+                                      "Option '%s' must be 'numeric' or '2-digit' after numeric unit",
+                                      k_dur_plural_names[u]);
+        }
+
+        if (dur_style_is_numeric(prev_style) && (u == DUR_MINUTES || u == DUR_SECONDS)) {
+            snprintf(uval, sizeof(uval), "2-digit");
+        }
+
+        char dval[16];
+        if (!intl_get_opt_str(vm, opts, k_dur_display_opts[u], k_disp_vals, 2, disp_def, dval, sizeof(dval), NULL)) {
+            ajs_temp_root_restore(vm, rs);
+            return AJS_VAL_EXCEPTION;
+        }
+
+        snprintf(tmp.unit_style[u], sizeof(tmp.unit_style[u]), "%s", uval);
+        snprintf(tmp.unit_display[u], sizeof(tmp.unit_display[u]), "%s", dval);
+        prev_style = tmp.unit_style[u];
+    }
+
+    int fd = 0;
+    bool has_fd = false;
+    if (!intl_get_opt_int(vm, opts, "fractionalDigits", 0, 9, 0, &fd, &has_fd)) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    tmp.has_fractional_digits = has_fd;
+    tmp.fractional_digits = fd;
+
+    AjsObject *obj = ajs_obj_new(vm, vm->active_realm, AJS_OBJ_INTL, proto);
+    if (!obj) { ajs_temp_root_restore(vm, rs); return AJS_VAL_EXCEPTION; }
+    AjsDurationFormatData *heap_d = (AjsDurationFormatData *)malloc(sizeof(AjsDurationFormatData));
+    if (!heap_d) {
+        ajs_temp_root_restore(vm, rs);
+        return ajs_throw(vm, vm->oom_error);
+    }
+    *heap_d = tmp;
+    obj->u.intl = NULL;
+    obj->opaque_tag = AJS_DURFMT_INST_TAG;
+    obj->opaque_ptr = heap_d;
+    obj->finalizer = durfmt_inst_finalizer;
+
+    ajs_temp_root_restore(vm, rs);
+    return ajs_val_from_gc(obj);
+}
+
+static AjsValue js_intl_durfmt_formatToParts(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    AjsDurationFormatData *d = intl_require_durfmt(vm, this_val);
+    if (!d) return AJS_VAL_EXCEPTION;
+
+    AjsDurationRecord rec;
+    if (!intl_to_duration_record(vm, argc > 0 ? argv[0] : AJS_VAL_UNDEFINED, &rec)) {
+        return AJS_VAL_EXCEPTION;
+    }
+
+    DurGroup groups[DUR_UNIT_COUNT];
+    int gcnt = 0;
+    dur_partition_parts(d, &rec, groups, &gcnt);
+
+    const char *mid = ", ", *pair = ", ", *end = ", ";
+    dur_list_seps(d, &mid, &pair, &end);
+
+    size_t rs = ajs_temp_root_save(vm);
+    AjsValue out = ajs_new_array(vm, 0);
+    ajs_temp_root_push(vm, out);
+    uint32_t idx = 0;
+
+    for (int i = 0; i < gcnt; i++) {
+        for (int j = 0; j < groups[i].count; j++) {
+            const DurPart *pt = &groups[i].parts[j];
+            if (!intl_push_part_ex(vm, out, &idx, pt->type, pt->val, pt->unit)) {
+                ajs_temp_root_restore(vm, rs);
+                return AJS_VAL_EXCEPTION;
+            }
+        }
+        if (i + 1 < gcnt) {
+            const char *sep = (gcnt == 2) ? pair : ((i + 2 == gcnt) ? end : mid);
+            if (sep && sep[0]) {
+                if (!intl_push_part_ex(vm, out, &idx, "literal", sep, NULL)) {
+                    ajs_temp_root_restore(vm, rs);
+                    return AJS_VAL_EXCEPTION;
+                }
+            }
+        }
+    }
+
+    ajs_temp_root_restore(vm, rs);
+    return out;
+}
+
+static AjsValue js_intl_durfmt_format(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    AjsDurationFormatData *d = intl_require_durfmt(vm, this_val);
+    if (!d) return AJS_VAL_EXCEPTION;
+
+    AjsDurationRecord rec;
+    if (!intl_to_duration_record(vm, argc > 0 ? argv[0] : AJS_VAL_UNDEFINED, &rec)) {
+        return AJS_VAL_EXCEPTION;
+    }
+
+    DurGroup groups[DUR_UNIT_COUNT];
+    int gcnt = 0;
+    dur_partition_parts(d, &rec, groups, &gcnt);
+
+    const char *mid = ", ", *pair = ", ", *end = ", ";
+    dur_list_seps(d, &mid, &pair, &end);
+
+    char buf[1024];
+    size_t pos = 0;
+    buf[0] = '\0';
+    for (int i = 0; i < gcnt; i++) {
+        for (int j = 0; j < groups[i].count; j++) {
+            const char *v = groups[i].parts[j].val;
+            size_t vl = strlen(v);
+            if (pos + vl + 1 < sizeof(buf)) {
+                ajs_memcpy(buf + pos, v, vl);
+                pos += vl;
+            }
+        }
+        if (i + 1 < gcnt) {
+            const char *sep = (gcnt == 2) ? pair : ((i + 2 == gcnt) ? end : mid);
+            size_t sl = sep ? strlen(sep) : 0;
+            if (sl > 0 && pos + sl + 1 < sizeof(buf)) {
+                ajs_memcpy(buf + pos, sep, sl);
+                pos += sl;
+            }
+        }
+    }
+    buf[pos] = '\0';
+    AjsString *res = ajs_str_from_utf8(vm, buf, pos, false);
+    return res ? ajs_val_from_gc(res) : AJS_VAL_EXCEPTION;
+}
+
+static AjsValue js_intl_durfmt_resolvedOptions(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)argc; (void)argv; (void)ud;
+    AjsDurationFormatData *d = intl_require_durfmt(vm, this_val);
+    if (!d) return AJS_VAL_EXCEPTION;
+
+    size_t rs = ajs_temp_root_save(vm);
+    AjsValue res = ajs_new_object(vm);
+    ajs_temp_root_push(vm, res);
+    ajs_define_prop_str(vm, res, "locale", ajs_val_from_gc(ajs_str_from_cstr(vm, d->locale, false)), AJS_PROP_DEFAULT);
+    ajs_define_prop_str(vm, res, "numberingSystem", ajs_val_from_gc(ajs_str_from_cstr(vm, d->numbering_system, true)), AJS_PROP_DEFAULT);
+    ajs_define_prop_str(vm, res, "style", ajs_val_from_gc(ajs_str_from_cstr(vm, d->style, true)), AJS_PROP_DEFAULT);
+    for (int u = 0; u < DUR_UNIT_COUNT; u++) {
+        ajs_define_prop_str(vm, res, k_dur_plural_names[u],
+                            ajs_val_from_gc(ajs_str_from_cstr(vm, d->unit_style[u], true)), AJS_PROP_DEFAULT);
+        ajs_define_prop_str(vm, res, k_dur_display_opts[u],
+                            ajs_val_from_gc(ajs_str_from_cstr(vm, d->unit_display[u], true)), AJS_PROP_DEFAULT);
+    }
+    if (d->has_fractional_digits) {
+        ajs_define_prop_str(vm, res, "fractionalDigits", ajs_val_number((double)d->fractional_digits), AJS_PROP_DEFAULT);
+    }
+    ajs_temp_root_restore(vm, rs);
+    return res;
+}
+
+/* ============================================================================
  * 12. Realm Initialization (`ajs_init_intl_builtins`)
  * ============================================================================ */
 
@@ -4432,6 +5396,27 @@ void ajs_init_intl_builtins(AjsVm *vm, AjsRealm *r) {
     ajs_temp_root_push(vm, lf_ctor);
     ajs_def_native_method(vm, r, lf_ctor, "supportedLocalesOf", js_intl_supported_locales_of, 1, AJS_METHOD_FLAGS, 0);
     ajs_define_prop_str(vm, intl_obj, "ListFormat", lf_ctor, AJS_METHOD_FLAGS);
+
+    /* 10. Intl.DurationFormat */
+    AjsObject *df_proto_ptr = ajs_obj_new(vm, r, AJS_OBJ_ORDINARY, r->object_proto);
+    if (df_proto_ptr) {
+        AjsValue df_proto = ajs_val_from_gc(df_proto_ptr);
+        ajs_temp_root_push(vm, df_proto);
+        if (ajs_val_is_gc_kind(r->intl_listfmt_proto, AJS_GC_OBJECT)) {
+            AjsObject *lf_proto_obj = (AjsObject *)ajs_val_to_gc(r->intl_listfmt_proto);
+            lf_proto_obj->opaque_tag = AJS_DURFMT_PROTO_TAG;
+            lf_proto_obj->opaque_ptr = df_proto_ptr;
+            lf_proto_obj->gc_mark = durfmt_proto_gc_mark;
+        }
+        intl_def_to_string_tag(vm, df_proto, "Intl.DurationFormat");
+        ajs_def_native_method(vm, r, df_proto, "format",          js_intl_durfmt_format,          1, AJS_METHOD_FLAGS, 0);
+        ajs_def_native_method(vm, r, df_proto, "formatToParts",   js_intl_durfmt_formatToParts,   1, AJS_METHOD_FLAGS, 0);
+        ajs_def_native_method(vm, r, df_proto, "resolvedOptions", js_intl_durfmt_resolvedOptions, 0, AJS_METHOD_FLAGS, 0);
+        AjsValue df_ctor = intl_make_ctor(vm, r, js_intl_durfmt_ctor, "DurationFormat", 0, INTL_MAGIC_DURFMT, df_proto);
+        ajs_temp_root_push(vm, df_ctor);
+        ajs_def_native_method(vm, r, df_ctor, "supportedLocalesOf", js_intl_supported_locales_of, 1, AJS_METHOD_FLAGS, 0);
+        ajs_define_prop_str(vm, intl_obj, "DurationFormat", df_ctor, AJS_METHOD_FLAGS);
+    }
 
     /* Expose global `Intl` (writable, configurable, non-enumerable per ECMA-402 §8) */
     ajs_define_prop_str(vm, r->global_obj, "Intl", intl_obj, AJS_METHOD_FLAGS);

@@ -82,6 +82,9 @@ uint32_t ajs_map_hash_value(AjsValue v) {
         if (hdr->gc_kind == AJS_GC_STRING) {
             return ((const AjsString *)hdr)->hash;
         }
+        if (hdr->gc_kind == AJS_GC_SYMBOL) {
+            return ((const AjsSymbol *)hdr)->id * 2654435761u;
+        }
         if (hdr->gc_kind == AJS_GC_BIGINT) {
             const AjsBigInt *bi = (const AjsBigInt *)hdr;
             uint32_t h = 2166136261u ^ (uint32_t)(bi->sign + 2);
@@ -142,7 +145,20 @@ static bool col_put(AjsVm *vm, AjsCollectionData *c, AjsValue key, AjsValue val)
     if (c->bucket_cap == 0) {
         if (!col_rehash(c, 16u)) { ajs_throw(vm, vm->oom_error); return false; }
     } else if ((c->entries_len + 1u) * 4u >= c->bucket_cap * 3u) {
-        if (!col_rehash(c, c->bucket_cap * 2u)) { ajs_throw(vm, vm->oom_error); return false; }
+        if (c->is_weak && c->live_count * 2u < c->entries_len) {
+            uint32_t w = 0;
+            for (uint32_t i = 0; i < c->entries_len; i++) {
+                if (c->entries[i].key != AJS_VAL_EMPTY) {
+                    if (w != i) c->entries[w] = c->entries[i];
+                    w++;
+                }
+            }
+            c->entries_len = w;
+            c->live_count = w;
+            if (!col_rehash(c, c->bucket_cap)) { ajs_throw(vm, vm->oom_error); return false; }
+        } else {
+            if (!col_rehash(c, c->bucket_cap * 2u)) { ajs_throw(vm, vm->oom_error); return false; }
+        }
     }
     if (c->entries_len >= c->entries_cap) {
         uint32_t ncap = c->entries_cap ? c->entries_cap * 2u : 8u;
@@ -198,7 +214,8 @@ static void col_clear(AjsCollectionData *c) {
 static bool can_be_held_weakly(AjsValue v) {
     if (ajs_val_is_gc_kind(v, AJS_GC_OBJECT)) return true;
     if (ajs_val_is_gc_kind(v, AJS_GC_SYMBOL)) {
-        return !((const AjsSymbol *)ajs_val_to_gc(v))->is_registered;
+        const AjsSymbol *sym = (const AjsSymbol *)ajs_val_to_gc(v);
+        return !sym->is_registered && !sym->is_private;
     }
     return false;
 }
@@ -326,6 +343,44 @@ static AjsValue js_map_set(AjsVm *vm, AjsValue this_val, int argc, const AjsValu
     AjsValue k = argc > 0 ? argv[0] : AJS_VAL_UNDEFINED;
     AjsValue v = argc > 1 ? argv[1] : AJS_VAL_UNDEFINED;
     return col_put(vm, &m->u.col, k, v) ? this_val : AJS_VAL_EXCEPTION;
+}
+static AjsValue js_map_getOrInsert(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    AjsObject *m = require_col_kind(vm, this_val, AJS_OBJ_MAP, "Map.prototype.getOrInsert");
+    if (!m) return AJS_VAL_EXCEPTION;
+    AjsValue k = canonicalize_map_key(argc > 0 ? argv[0] : AJS_VAL_UNDEFINED);
+    uint32_t h = ajs_map_hash_value(k);
+    int32_t idx = col_find_entry(&m->u.col, k, h);
+    if (idx >= 0) return m->u.col.entries[idx].val;
+    AjsValue v = argc > 1 ? argv[1] : AJS_VAL_UNDEFINED;
+    return col_put(vm, &m->u.col, k, v) ? v : AJS_VAL_EXCEPTION;
+}
+static AjsValue js_map_getOrInsertComputed(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    AjsObject *m = require_col_kind(vm, this_val, AJS_OBJ_MAP, "Map.prototype.getOrInsertComputed");
+    if (!m) return AJS_VAL_EXCEPTION;
+    AjsValue cb = argc > 1 ? argv[1] : AJS_VAL_UNDEFINED;
+    if (!ajs_is_callable(vm, cb)) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Map.prototype.getOrInsertComputed: callbackfn is not callable");
+    }
+    AjsValue k = canonicalize_map_key(argc > 0 ? argv[0] : AJS_VAL_UNDEFINED);
+    uint32_t h = ajs_map_hash_value(k);
+    int32_t idx = col_find_entry(&m->u.col, k, h);
+    if (idx >= 0) return m->u.col.entries[idx].val;
+
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, this_val);
+    ajs_temp_root_push(vm, k);
+    ajs_temp_root_push(vm, cb);
+    AjsValue val = ajs_call_internal(vm, cb, AJS_VAL_UNDEFINED, 1, &k);
+    if (vm->has_exception) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    ajs_temp_root_push(vm, val);
+    bool ok = col_put(vm, &m->u.col, k, val);
+    ajs_temp_root_restore(vm, rs);
+    return ok ? val : AJS_VAL_EXCEPTION;
 }
 static AjsValue js_map_has(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
     (void)ud;
@@ -1079,6 +1134,50 @@ static AjsValue js_weakmap_set(AjsVm *vm, AjsValue this_val, int argc, const Ajs
     AjsValue v = argc > 1 ? argv[1] : AJS_VAL_UNDEFINED;
     return col_put(vm, &wm->u.col, k, v) ? this_val : AJS_VAL_EXCEPTION;
 }
+static AjsValue js_weakmap_getOrInsert(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    AjsObject *wm = require_col_kind(vm, this_val, AJS_OBJ_WEAKMAP, "WeakMap.prototype.getOrInsert");
+    if (!wm) return AJS_VAL_EXCEPTION;
+    AjsValue k = argc > 0 ? argv[0] : AJS_VAL_UNDEFINED;
+    if (!can_be_held_weakly(k)) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Invalid value used as weak map key");
+    }
+    uint32_t h = ajs_map_hash_value(k);
+    int32_t idx = col_find_entry(&wm->u.col, k, h);
+    if (idx >= 0) return wm->u.col.entries[idx].val;
+    AjsValue v = argc > 1 ? argv[1] : AJS_VAL_UNDEFINED;
+    return col_put(vm, &wm->u.col, k, v) ? v : AJS_VAL_EXCEPTION;
+}
+static AjsValue js_weakmap_getOrInsertComputed(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    AjsObject *wm = require_col_kind(vm, this_val, AJS_OBJ_WEAKMAP, "WeakMap.prototype.getOrInsertComputed");
+    if (!wm) return AJS_VAL_EXCEPTION;
+    AjsValue k = argc > 0 ? argv[0] : AJS_VAL_UNDEFINED;
+    if (!can_be_held_weakly(k)) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Invalid value used as weak map key");
+    }
+    AjsValue cb = argc > 1 ? argv[1] : AJS_VAL_UNDEFINED;
+    if (!ajs_is_callable(vm, cb)) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "WeakMap.prototype.getOrInsertComputed: callbackfn is not callable");
+    }
+    uint32_t h = ajs_map_hash_value(k);
+    int32_t idx = col_find_entry(&wm->u.col, k, h);
+    if (idx >= 0) return wm->u.col.entries[idx].val;
+
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, this_val);
+    ajs_temp_root_push(vm, k);
+    ajs_temp_root_push(vm, cb);
+    AjsValue val = ajs_call_internal(vm, cb, AJS_VAL_UNDEFINED, 1, &k);
+    if (vm->has_exception) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    ajs_temp_root_push(vm, val);
+    bool ok = col_put(vm, &wm->u.col, k, val);
+    ajs_temp_root_restore(vm, rs);
+    return ok ? val : AJS_VAL_EXCEPTION;
+}
 static AjsValue js_weakmap_has(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
     (void)ud;
     AjsObject *wm = require_col_kind(vm, this_val, AJS_OBJ_WEAKMAP, "WeakMap.prototype.has");
@@ -1324,6 +1423,8 @@ void ajs_init_collections_builtins(AjsVm *vm, AjsRealm *r) {
     ajs_def_native_method(vm, r, r->map_ctor, "groupBy", js_map_groupBy, 2, AJS_METHOD_FLAGS, 0);
 
     ajs_def_native_method(vm, r, r->map_proto, "get", js_map_get, 1, AJS_METHOD_FLAGS, 0);
+    ajs_def_native_method(vm, r, r->map_proto, "getOrInsert", js_map_getOrInsert, 2, AJS_METHOD_FLAGS, 0);
+    ajs_def_native_method(vm, r, r->map_proto, "getOrInsertComputed", js_map_getOrInsertComputed, 2, AJS_METHOD_FLAGS, 0);
     ajs_def_native_method(vm, r, r->map_proto, "set", js_map_set, 2, AJS_METHOD_FLAGS, 0);
     ajs_def_native_method(vm, r, r->map_proto, "has", js_map_has, 1, AJS_METHOD_FLAGS, 0);
     ajs_def_native_method(vm, r, r->map_proto, "delete", js_map_delete, 1, AJS_METHOD_FLAGS, 0);
@@ -1388,6 +1489,8 @@ void ajs_init_collections_builtins(AjsVm *vm, AjsRealm *r) {
     r->weakmap_ctor = col_make_fn(vm, r, js_weakmap_ctor, "WeakMap", 0, true, -32, r->function_proto);
     link_ctor_proto(vm, r, r->weakmap_ctor, r->weakmap_proto, "WeakMap");
     ajs_def_native_method(vm, r, r->weakmap_proto, "get", js_weakmap_get, 1, AJS_METHOD_FLAGS, 0);
+    ajs_def_native_method(vm, r, r->weakmap_proto, "getOrInsert", js_weakmap_getOrInsert, 2, AJS_METHOD_FLAGS, 0);
+    ajs_def_native_method(vm, r, r->weakmap_proto, "getOrInsertComputed", js_weakmap_getOrInsertComputed, 2, AJS_METHOD_FLAGS, 0);
     ajs_def_native_method(vm, r, r->weakmap_proto, "set", js_weakmap_set, 2, AJS_METHOD_FLAGS, 0);
     ajs_def_native_method(vm, r, r->weakmap_proto, "has", js_weakmap_has, 1, AJS_METHOD_FLAGS, 0);
     ajs_def_native_method(vm, r, r->weakmap_proto, "delete", js_weakmap_delete, 1, AJS_METHOD_FLAGS, 0);

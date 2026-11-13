@@ -16,7 +16,7 @@ SetCompressor /SOLID lzma
   !define APP_NAME "Waterscape Browser"
 !endif
 !ifndef APP_VERSION
-  !define APP_VERSION "2.0.0"
+  !define APP_VERSION "2.1.0"
 !endif
 !ifndef APP_PUBLISHER
   !define APP_PUBLISHER "Arcradient Project"

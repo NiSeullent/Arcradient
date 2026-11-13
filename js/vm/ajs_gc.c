@@ -31,7 +31,7 @@ void ajs_handle_record(AjsVm *vm, AjsValue v) {
 
 void *ajs_gc_alloc(AjsVm *vm, size_t size, AjsGcKind kind) {
     if (size < sizeof(AjsGcHeader)) size = sizeof(AjsGcHeader);
-    size_t limit = vm->cfg.heap_limit_bytes ? vm->cfg.heap_limit_bytes : (32u * 1024u * 1024u);
+    size_t limit = vm->cfg.heap_limit_bytes ? vm->cfg.heap_limit_bytes : AJS_DEFAULT_HEAP_LIMIT_BYTES;
 
     if (!vm->gc_running && vm->gc_suppress == 0) {
         if (vm->gc_bytes + size > vm->gc_threshold || vm->gc_bytes + size > limit) {
@@ -152,6 +152,10 @@ static void ajs_gc_mark_realm(AjsVm *vm, AjsRealm *r) {
     ajs_gc_mark_value(vm, r->intl_segments_proto);
     ajs_gc_mark_value(vm, r->intl_dispnames_proto);
     ajs_gc_mark_value(vm, r->intl_listfmt_proto);
+    ajs_gc_mark_value(vm, r->disp_stack_proto);
+    ajs_gc_mark_value(vm, r->disp_stack_ctor);
+    ajs_gc_mark_value(vm, r->async_disp_stack_proto);
+    ajs_gc_mark_value(vm, r->async_disp_stack_ctor);
     ajs_gc_mark_value(vm, r->intrinsic_eval);
     ajs_gc_mark_value(vm, r->throw_type_error_fn);
     ajs_gc_mark_value(vm, r->array_proto_values_fn);
@@ -200,7 +204,7 @@ void ajs_gc_mark_ptr(AjsVm *vm, void *ptr) {
             ajs_gc_mark_ptr(vm, bc->source_url);
             ajs_gc_mark_ptr(vm, bc->source_text);
             if (bc->env_slot_names) {
-                for (uint16_t i = 0; i < bc->env_slot_count; i++) {
+                for (uint32_t i = 0; i < bc->env_slot_count; i++) {
                     ajs_gc_mark_ptr(vm, bc->env_slot_names[i]);
                 }
             }
@@ -214,8 +218,10 @@ void ajs_gc_mark_ptr(AjsVm *vm, void *ptr) {
                 }
             }
             for (uint32_t i = 0; i < bc->env_desc_count; i++) {
-                for (uint16_t j = 0; j < bc->env_descs[i].count; j++) {
-                    ajs_gc_mark_ptr(vm, bc->env_descs[i].names[j]);
+                if (bc->env_descs[i].names) {
+                    for (uint32_t j = 0; j < bc->env_descs[i].count; j++) {
+                        ajs_gc_mark_ptr(vm, bc->env_descs[i].names[j]);
+                    }
                 }
             }
             break;
@@ -421,11 +427,13 @@ void ajs_gc_free_header(AjsVm *vm, AjsGcHeader *hdr) {
             free(env->slots);
             free(env->flags);
             free(env->names);
+            free(env->name_hash);
             free(env->import_links);
             break;
         }
         case AJS_GC_BYTECODE: {
             AjsBytecode *bc = (AjsBytecode *)hdr;
+            ajs_source_buf_release(bc->source_buf);
             free(bc->mapped_param_slots);
             free(bc->env_slot_flags);
             free(bc->env_slot_names);
@@ -678,7 +686,7 @@ void ajs_gc_collect(AjsVm *vm) {
         cur = next;
     }
 
-    size_t limit = vm->cfg.heap_limit_bytes ? vm->cfg.heap_limit_bytes : (32u * 1024u * 1024u);
+    size_t limit = vm->cfg.heap_limit_bytes ? vm->cfg.heap_limit_bytes : AJS_DEFAULT_HEAP_LIMIT_BYTES;
     size_t next_thresh = vm->gc_bytes * 2u;
     if (next_thresh < 256u * 1024u) next_thresh = 256u * 1024u;
     if (next_thresh > limit) next_thresh = limit;

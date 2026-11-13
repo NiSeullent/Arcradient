@@ -320,6 +320,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
     char clean[512];
     size_t clen = 0;
     size_t clean_cap = sizeof(clean);
+    char *heap_cbuf = NULL;
     char *cbuf = clean;
     bool legacy_octal = false;
     bool has_dot = false, has_exp = false;
@@ -330,7 +331,8 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
             size_t nc = clean_cap * 2u; \
             char *nb = (char *)malloc(nc); \
             ajs_memcpy(nb, cbuf, clen); \
-            if (cbuf != clean) free(cbuf); \
+            free(heap_cbuf); \
+            heap_cbuf = nb; \
             cbuf = nb; clean_cap = nc; \
         } \
         cbuf[clen++] = (char)(ch); \
@@ -345,14 +347,14 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
             lex->pos += 2;
             lex->col += 2;
             if (lex->pos >= lex->len || !is_radix_digit((uint8_t)lex->src[lex->pos], base)) {
-                if (cbuf != clean) free(cbuf);
+                free(heap_cbuf);
                 return lex_error(lex, start_line, start_col, "Invalid numeric literal");
             }
             bool prev_sep = false;
             while (lex->pos < lex->len) {
                 uint8_t c = (uint8_t)lex->src[lex->pos];
                 if (c == '_') {
-                    if (prev_sep) { if (cbuf != clean) free(cbuf); return lex_error(lex, lex->line, lex->col, "Numeric separator cannot be adjacent"); }
+                    if (prev_sep) { free(heap_cbuf); return lex_error(lex, lex->line, lex->col, "Numeric separator cannot be adjacent"); }
                     prev_sep = true;
                     lex->pos++; lex->col++;
                     continue;
@@ -362,7 +364,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
                 PUSH_CLEAN(c);
                 lex->pos++; lex->col++;
             }
-            if (prev_sep) { if (cbuf != clean) free(cbuf); return lex_error(lex, lex->line, lex->col, "Trailing numeric separator"); }
+            if (prev_sep) { free(heap_cbuf); return lex_error(lex, lex->line, lex->col, "Trailing numeric separator"); }
         } else if (nxt >= '0' && nxt <= '9') {
             legacy_octal = true;
             /* Check if pure legacy octal (all digits 0..7) vs non-octal decimal (contains 8 or 9) */
@@ -373,7 +375,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
                 scan++;
             }
             if (lex->pos < lex->len && lex->src[scan] == '_') {
-                if (cbuf != clean) free(cbuf);
+                free(heap_cbuf);
                 return lex_error(lex, start_line, start_col, "Numeric separator not allowed in legacy octal");
             }
             if (all_oct) {
@@ -387,7 +389,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
                 }
             }
         } else if (nxt == '_') {
-            if (cbuf != clean) free(cbuf);
+            free(heap_cbuf);
             return lex_error(lex, start_line, start_col, "Numeric separator not allowed after leading 0");
         }
     }
@@ -398,7 +400,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
         while (lex->pos < lex->len) {
             uint8_t c = (uint8_t)lex->src[lex->pos];
             if (c == '_') {
-                if (prev_sep || clen == 0) { if (cbuf != clean) free(cbuf); return lex_error(lex, lex->line, lex->col, "Invalid numeric separator"); }
+                if (prev_sep || clen == 0) { free(heap_cbuf); return lex_error(lex, lex->line, lex->col, "Invalid numeric separator"); }
                 prev_sep = true;
                 lex->pos++; lex->col++;
                 continue;
@@ -408,21 +410,21 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
             PUSH_CLEAN(c);
             lex->pos++; lex->col++;
         }
-        if (prev_sep) { if (cbuf != clean) free(cbuf); return lex_error(lex, lex->line, lex->col, "Invalid numeric separator"); }
+        if (prev_sep) { free(heap_cbuf); return lex_error(lex, lex->line, lex->col, "Invalid numeric separator"); }
 
         if (lex->pos < lex->len && lex->src[lex->pos] == '.') {
             has_dot = true;
             PUSH_CLEAN('.');
             lex->pos++; lex->col++;
             if (lex->pos < lex->len && lex->src[lex->pos] == '_') {
-                if (cbuf != clean) free(cbuf);
+                free(heap_cbuf);
                 return lex_error(lex, lex->line, lex->col, "Invalid numeric separator after decimal point");
             }
             prev_sep = false;
             while (lex->pos < lex->len) {
                 uint8_t c = (uint8_t)lex->src[lex->pos];
                 if (c == '_') {
-                    if (prev_sep) { if (cbuf != clean) free(cbuf); return lex_error(lex, lex->line, lex->col, "Invalid numeric separator"); }
+                    if (prev_sep) { free(heap_cbuf); return lex_error(lex, lex->line, lex->col, "Invalid numeric separator"); }
                     prev_sep = true;
                     lex->pos++; lex->col++;
                     continue;
@@ -432,7 +434,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
                 PUSH_CLEAN(c);
                 lex->pos++; lex->col++;
             }
-            if (prev_sep) { if (cbuf != clean) free(cbuf); return lex_error(lex, lex->line, lex->col, "Trailing numeric separator"); }
+            if (prev_sep) { free(heap_cbuf); return lex_error(lex, lex->line, lex->col, "Trailing numeric separator"); }
         }
 
         if (lex->pos < lex->len && (lex->src[lex->pos] == 'e' || lex->src[lex->pos] == 'E')) {
@@ -444,14 +446,14 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
                 lex->pos++; lex->col++;
             }
             if (lex->pos >= lex->len || lex->src[lex->pos] < '0' || lex->src[lex->pos] > '9') {
-                if (cbuf != clean) free(cbuf);
+                free(heap_cbuf);
                 return lex_error(lex, start_line, start_col, "Invalid exponent in numeric literal");
             }
             prev_sep = false;
             while (lex->pos < lex->len) {
                 uint8_t c = (uint8_t)lex->src[lex->pos];
                 if (c == '_') {
-                    if (prev_sep) { if (cbuf != clean) free(cbuf); return lex_error(lex, lex->line, lex->col, "Invalid numeric separator"); }
+                    if (prev_sep) { free(heap_cbuf); return lex_error(lex, lex->line, lex->col, "Invalid numeric separator"); }
                     prev_sep = true;
                     lex->pos++; lex->col++;
                     continue;
@@ -461,7 +463,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
                 PUSH_CLEAN(c);
                 lex->pos++; lex->col++;
             }
-            if (prev_sep) { if (cbuf != clean) free(cbuf); return lex_error(lex, lex->line, lex->col, "Trailing numeric separator"); }
+            if (prev_sep) { free(heap_cbuf); return lex_error(lex, lex->line, lex->col, "Trailing numeric separator"); }
         }
     }
     cbuf[clen] = '\0';
@@ -470,7 +472,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
     bool is_bigint = false;
     if (lex->pos < lex->len && lex->src[lex->pos] == 'n') {
         if (has_dot || has_exp || legacy_octal) {
-            if (cbuf != clean) free(cbuf);
+            free(heap_cbuf);
             return lex_error(lex, start_line, start_col, "Invalid BigInt literal");
         }
         is_bigint = true;
@@ -482,13 +484,13 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
         size_t adv = 0;
         uint32_t next_cp = lex_peek_cp(lex, &adv);
         if (ajs_unicode_is_id_start(next_cp) || (next_cp >= '0' && next_cp <= '9') || next_cp == '\\') {
-            if (cbuf != clean) free(cbuf);
+            free(heap_cbuf);
             return lex_error(lex, lex->line, lex->col, "Identifier starts immediately after numeric literal");
         }
     }
 
     if (legacy_octal && lex->strict) {
-        if (cbuf != clean) free(cbuf);
+        free(heap_cbuf);
         return lex_error(lex, start_line, start_col, "Octal literals are not allowed in strict mode");
     }
 
@@ -517,7 +519,7 @@ static AjsToken lex_scan_number(AjsLexer *lex, uint32_t start_line, uint32_t sta
             t.num_val = ajs_f64_round(strtod(cbuf, NULL));
         }
     }
-    if (cbuf != clean) free(cbuf);
+    free(heap_cbuf);
     return t;
 }
 

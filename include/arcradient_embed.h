@@ -16,8 +16,8 @@
 extern "C" {
 #endif
 
-#define WATERSCAPE_VERSION_STR "2.0.0"
-#define ARCRADIENT_VERSION_STR "2.0.0"
+#define WATERSCAPE_VERSION_STR "2.1.0"
+#define ARCRADIENT_VERSION_STR "2.1.0"
 
 typedef struct ArcrEngine  ArcrEngine;
 typedef struct ArcrWebView ArcrWebView;

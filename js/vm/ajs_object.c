@@ -72,8 +72,8 @@ static int32_t ajs_obj_find_own_slot(AjsObject *obj, AjsValue key) {
     return -1;
 }
 
-static AjsPropSlot *ajs_obj_insert_own_slot(AjsObject *obj, AjsValue key, uint32_t flags,
-                                            AjsValue val, AjsValue setter) {
+AjsPropSlot *ajs_obj_insert_own_slot(AjsObject *obj, AjsValue key, uint32_t flags,
+                                     AjsValue val, AjsValue setter) {
     if (obj->prop_count >= obj->prop_cap) {
         uint32_t ncap = obj->prop_cap ? obj->prop_cap * 2u : 8u;
         AjsPropSlot *np = (AjsPropSlot *)realloc(obj->props, ncap * sizeof(AjsPropSlot));
@@ -103,6 +103,37 @@ static AjsPropSlot *ajs_obj_insert_own_slot(AjsObject *obj, AjsValue key, uint32
         ajs_obj_rebuild_hash(obj, 32u);
     }
     return slot;
+}
+
+static void ajs_fn_materialize_lazy_proto(AjsVm *vm, AjsObject *fn) {
+    if (!fn || fn->kind != AJS_OBJ_FUNCTION || !fn->u.fn.has_lazy_proto) return;
+    fn->u.fn.has_lazy_proto = false;
+    AjsRealm *realm = fn->realm ? fn->realm : (vm->active_realm ? vm->active_realm : vm->main_realm);
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, ajs_val_from_gc(fn));
+    AjsFuncKind fk = fn->u.fn.fn_kind;
+    if (fk == AJS_FN_BC_NORMAL) {
+        AjsObject *proto = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, realm->object_proto);
+        if (proto) {
+            ajs_temp_root_push(vm, ajs_val_from_gc(proto));
+            ajs_obj_insert_own_slot(proto, ajs_val_from_gc(vm->str_constructor),
+                                    AJS_DESC_WRITABLE | AJS_DESC_CONFIGURABLE,
+                                    ajs_val_from_gc(fn), AJS_VAL_UNDEFINED);
+            ajs_obj_insert_own_slot(fn, ajs_val_from_gc(vm->str_prototype),
+                                    AJS_DESC_WRITABLE,
+                                    ajs_val_from_gc(proto), AJS_VAL_UNDEFINED);
+        }
+    } else if (fk == AJS_FN_BC_GENERATOR || fk == AJS_FN_BC_ASYNC_GENERATOR) {
+        AjsValue gp = (fk == AJS_FN_BC_GENERATOR) ? realm->gen_proto : realm->async_gen_proto;
+        AjsObject *proto = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, gp);
+        if (proto) {
+            ajs_temp_root_push(vm, ajs_val_from_gc(proto));
+            ajs_obj_insert_own_slot(fn, ajs_val_from_gc(vm->str_prototype),
+                                    AJS_DESC_WRITABLE,
+                                    ajs_val_from_gc(proto), AJS_VAL_UNDEFINED);
+        }
+    }
+    ajs_temp_root_restore(vm, rs);
 }
 
 static void ajs_obj_remove_own_slot(AjsObject *obj, int32_t slot_idx) {
@@ -773,6 +804,12 @@ bool ajs_obj_get_own_desc(AjsVm *vm, AjsObject *obj, AjsValue key, AjsPropDesc *
         if (is_canon) return true;
     }
 
+    if (obj->kind == AJS_OBJ_FUNCTION && obj->u.fn.has_lazy_proto &&
+        ajs_val_is_gc_kind(key, AJS_GC_STRING) &&
+        ajs_str_eq((AjsString *)ajs_val_to_gc(key), vm->str_prototype)) {
+        ajs_fn_materialize_lazy_proto(vm, obj);
+    }
+
     int32_t slot = ajs_obj_find_own_slot(obj, key);
     if (slot < 0) return true;
 
@@ -789,8 +826,8 @@ bool ajs_obj_get_own_desc(AjsVm *vm, AjsObject *obj, AjsValue key, AjsPropDesc *
         if (obj->kind == AJS_OBJ_ARGUMENTS && obj->u.args.mapped && ajs_val_is_gc_kind(key, AJS_GC_STRING)) {
             AjsString *sk = (AjsString *)ajs_val_to_gc(key);
             if (sk->is_array_idx && sk->array_idx < obj->u.args.param_count) {
-                uint16_t env_slot = obj->u.args.param_slots[sk->array_idx];
-                if (env_slot != UINT16_MAX) {
+                uint32_t env_slot = obj->u.args.param_slots[sk->array_idx];
+                if (env_slot != AJS_NO_SLOT) {
                     out_desc->value = obj->u.args.env->slots[env_slot];
                 }
             }
@@ -994,6 +1031,9 @@ bool ajs_obj_define_own_prop(AjsVm *vm, AjsObject *obj, AjsValue key, const AjsP
         if (!obj->extensible) {
             return ajs_define_fail(vm, throw_on_err, "Cannot define property on non-extensible object");
         }
+        if (obj->kind == AJS_OBJ_FUNCTION && obj->u.fn.has_lazy_proto) {
+            ajs_fn_materialize_lazy_proto(vm, obj);
+        }
         uint32_t f = 0;
         if (desc->flags & AJS_DESC_ENUMERABLE) f |= AJS_DESC_ENUMERABLE;
         if (desc->flags & AJS_DESC_CONFIGURABLE) f |= AJS_DESC_CONFIGURABLE;
@@ -1083,8 +1123,8 @@ bool ajs_obj_define_own_prop(AjsVm *vm, AjsObject *obj, AjsValue key, const AjsP
             if (obj->kind == AJS_OBJ_ARGUMENTS && obj->u.args.mapped && ajs_val_is_gc_kind(key, AJS_GC_STRING)) {
                 AjsString *sk = (AjsString *)ajs_val_to_gc(key);
                 if (sk->is_array_idx && sk->array_idx < obj->u.args.param_count) {
-                    uint16_t eslot = obj->u.args.param_slots[sk->array_idx];
-                    if (eslot != UINT16_MAX) obj->u.args.env->slots[eslot] = desc->value;
+                    uint32_t eslot = obj->u.args.param_slots[sk->array_idx];
+                    if (eslot != AJS_NO_SLOT) obj->u.args.env->slots[eslot] = desc->value;
                 }
             }
         }
@@ -1092,7 +1132,7 @@ bool ajs_obj_define_own_prop(AjsVm *vm, AjsObject *obj, AjsValue key, const AjsP
             obj->kind == AJS_OBJ_ARGUMENTS && obj->u.args.mapped && ajs_val_is_gc_kind(key, AJS_GC_STRING)) {
             AjsString *sk = (AjsString *)ajs_val_to_gc(key);
             if (sk->is_array_idx && sk->array_idx < obj->u.args.param_count) {
-                obj->u.args.param_slots[sk->array_idx] = UINT16_MAX;
+                obj->u.args.param_slots[sk->array_idx] = AJS_NO_SLOT;
             }
         }
     }
@@ -1637,7 +1677,7 @@ bool ajs_obj_delete(AjsVm *vm, AjsObject *obj, AjsValue key, bool strict) {
         if (obj->kind == AJS_OBJ_ARGUMENTS && obj->u.args.mapped && ajs_val_is_gc_kind(key, AJS_GC_STRING)) {
             AjsString *sk = (AjsString *)ajs_val_to_gc(key);
             if (sk->is_array_idx && sk->array_idx < obj->u.args.param_count) {
-                obj->u.args.param_slots[sk->array_idx] = UINT16_MAX;
+                obj->u.args.param_slots[sk->array_idx] = AJS_NO_SLOT;
             }
         }
         ajs_obj_remove_own_slot(obj, slot);
@@ -1744,6 +1784,10 @@ bool ajs_obj_own_keys(AjsVm *vm, AjsObject *obj, bool enumerable_only, bool incl
         *out_keys = keys;
         *out_count = n;
         return true;
+    }
+
+    if (include_strings && obj->kind == AJS_OBJ_FUNCTION && obj->u.fn.has_lazy_proto) {
+        ajs_fn_materialize_lazy_proto(vm, obj);
     }
 
     /* 1. Collect ascending array index keys */

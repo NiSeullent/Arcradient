@@ -305,7 +305,7 @@ AjsValue ajs_throw_err_kind(AjsVm *vm, AjsErrKind kind, const char *fmt, ...) {
 void ajs_default_config(AjsVmConfig *out_cfg) {
     if (!out_cfg) return;
     memset(out_cfg, 0, sizeof(*out_cfg));
-    out_cfg->heap_limit_bytes = 32u * 1024u * 1024u;
+    out_cfg->heap_limit_bytes = AJS_DEFAULT_HEAP_LIMIT_BYTES;
     out_cfg->max_call_depth = 512u;
 }
 
@@ -392,6 +392,10 @@ AjsRealm *ajs_realm_create(AjsVm *vm) {
     r->intl_segments_proto = AJS_VAL_UNDEFINED;
     r->intl_dispnames_proto = AJS_VAL_UNDEFINED;
     r->intl_listfmt_proto = AJS_VAL_UNDEFINED;
+    r->disp_stack_proto = AJS_VAL_UNDEFINED;
+    r->disp_stack_ctor = AJS_VAL_UNDEFINED;
+    r->async_disp_stack_proto = AJS_VAL_UNDEFINED;
+    r->async_disp_stack_ctor = AJS_VAL_UNDEFINED;
     r->intrinsic_eval = AJS_VAL_UNDEFINED;
     r->throw_type_error_fn = AJS_VAL_UNDEFINED;
     r->array_proto_values_fn = AJS_VAL_UNDEFINED;
@@ -413,6 +417,7 @@ AjsRealm *ajs_realm_create(AjsVm *vm) {
     ajs_init_promise_builtins(vm, r);
     ajs_init_typedarray_builtins(vm, r);
     ajs_init_intl_builtins(vm, r);
+    ajs_init_erm_builtins(vm, r);
 
     vm->gc_suppress--;
     vm->active_realm = prev_active ? prev_active : r;
@@ -428,7 +433,7 @@ AjsVm *ajs_vm_create(const AjsVmConfig *cfg) {
     } else {
         ajs_default_config(&vm->cfg);
     }
-    if (vm->cfg.heap_limit_bytes == 0) vm->cfg.heap_limit_bytes = 32u * 1024u * 1024u;
+    if (vm->cfg.heap_limit_bytes == 0) vm->cfg.heap_limit_bytes = AJS_DEFAULT_HEAP_LIMIT_BYTES;
     if (vm->cfg.max_call_depth == 0) vm->cfg.max_call_depth = 512u;
 
     vm->gc_threshold = 512u * 1024u;

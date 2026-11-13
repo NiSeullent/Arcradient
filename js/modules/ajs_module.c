@@ -744,7 +744,7 @@ static bool mod_initialize_environment(AjsVm *vm, AjsModuleRecord *mod, AjsError
             env->slots[i] = (fl & AJS_SLOT_INIT_TDZ) ? AJS_VAL_TDZ : AJS_VAL_UNDEFINED;
         }
     }
-    if (bc && bc->this_slot != 0xFFFF && bc->this_slot < scnt) {
+    if (bc && bc->this_slot != AJS_NO_SLOT && bc->this_slot < scnt) {
         env->slots[bc->this_slot] = AJS_VAL_UNDEFINED;
     }
 
@@ -806,7 +806,7 @@ static bool mod_initialize_environment(AjsVm *vm, AjsModuleRecord *mod, AjsError
     /* 4. Instantiate hoisted module function declarations (`mod->hoisted_fns`) */
     AjsRealm *r = mod->realm ? mod->realm : (vm->active_realm ? vm->active_realm : vm->main_realm);
     for (uint32_t i = 0; i < mod->hoisted_fn_count; i++) {
-        uint16_t slot = mod->hoisted_fns[i].slot;
+        uint32_t slot = mod->hoisted_fns[i].slot;
         AjsBytecode *fn_bc = mod->hoisted_fns[i].fn_bc;
         if (fn_bc && slot < scnt) {
             AjsObject *fn_obj = ajs_closure_new(vm, r, fn_bc, env, mod);

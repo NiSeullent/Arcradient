@@ -261,7 +261,7 @@ AjsString *ajs_str_from_utf8(AjsVm *vm, const char *utf8, size_t byte_len, bool 
         uint16_t dummy = 0;
         return ajs_str_from_utf16(vm, &dummy, 0, intern);
     }
-    /* Fast path for pure ASCII */
+    /* Fast path for pure ASCII: zero intermediate heap allocation & single-pass copy */
     bool all_ascii = true;
     for (size_t i = 0; i < byte_len; i++) {
         if ((uint8_t)utf8[i] >= 0x80u) {
@@ -269,6 +269,54 @@ AjsString *ajs_str_from_utf8(AjsVm *vm, const char *utf8, size_t byte_len, bool 
             break;
         }
     }
+    if (all_ascii) {
+        if (byte_len > 0x3FFFFFFFu) {
+            ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "Invalid string length");
+            return NULL;
+        }
+        uint32_t len16 = (uint32_t)byte_len;
+        uint32_t h = 2166136261u;
+        for (uint32_t i = 0; i < len16; i++) {
+            h ^= (uint32_t)(uint8_t)utf8[i];
+            h *= 16777619u;
+            h *= 16777619u; /* (u >> 8) == 0 for ASCII */
+        }
+        if (h == 0) h = 1u;
+        if (intern && vm->intern_tab && vm->intern_cap > 0) {
+            uint32_t mask = vm->intern_cap - 1u;
+            uint32_t idx = h & mask;
+            for (uint32_t step = 0; step < vm->intern_cap; step++) {
+                AjsString *entry = vm->intern_tab[idx];
+                if (!entry) break;
+                if (entry != (AjsString *)(uintptr_t)1 &&
+                    entry->hash == h && entry->len16 == len16 && entry->len8 == len16 &&
+                    memcmp(entry->utf8, utf8, byte_len) == 0) {
+                    return entry;
+                }
+                idx = (idx + 1u) & mask;
+            }
+        }
+        size_t units_bytes = ((size_t)len16 + 1u) * sizeof(uint16_t);
+        size_t total_size = sizeof(AjsString) + units_bytes + byte_len + 1u;
+        AjsString *s = (AjsString *)ajs_gc_alloc(vm, total_size, AJS_GC_STRING);
+        if (!s) return NULL;
+        s->len16 = len16;
+        s->len8 = len16;
+        s->hash = h;
+        s->is_interned = false;
+        s->units = (uint16_t *)(void *)(s + 1);
+        s->utf8 = (char *)(void *)(s->units + len16 + 1u);
+        for (uint32_t i = 0; i < len16; i++) {
+            s->units[i] = (uint8_t)utf8[i];
+        }
+        s->units[len16] = 0;
+        ajs_memcpy(s->utf8, utf8, byte_len);
+        s->utf8[byte_len] = '\0';
+        ajs_classify_array_idx(s);
+        if (intern) ajs_intern_insert(vm, s);
+        return s;
+    }
+
     uint16_t stack_buf[256];
     stack_buf[0] = 0;
     uint16_t *buf = stack_buf;
@@ -280,20 +328,15 @@ AjsString *ajs_str_from_utf8(AjsVm *vm, const char *utf8, size_t byte_len, bool 
         }
     }
     size_t ulen = 0;
-    if (all_ascii) {
-        for (size_t i = 0; i < byte_len; i++) buf[i] = (uint8_t)utf8[i];
-        ulen = byte_len;
-    } else {
-        size_t pos = 0;
-        while (pos < byte_len) {
-            size_t adv = 1;
-            uint32_t cp = ajs_utf8_decode_one(utf8 + pos, byte_len - pos, &adv);
-            uint16_t pair[2];
-            size_t n = ajs_code_point_to_utf16(cp, pair);
-            buf[ulen++] = pair[0];
-            if (n == 2) buf[ulen++] = pair[1];
-            pos += adv;
-        }
+    size_t pos = 0;
+    while (pos < byte_len) {
+        size_t adv = 1;
+        uint32_t cp = ajs_utf8_decode_one(utf8 + pos, byte_len - pos, &adv);
+        uint16_t pair[2];
+        size_t n = ajs_code_point_to_utf16(cp, pair);
+        buf[ulen++] = pair[0];
+        if (n == 2) buf[ulen++] = pair[1];
+        pos += adv;
     }
     AjsString *res = ajs_str_from_utf16(vm, buf, ulen, intern);
     if (buf != stack_buf) free(buf);

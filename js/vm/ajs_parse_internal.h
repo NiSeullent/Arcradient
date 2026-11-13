@@ -282,9 +282,11 @@ typedef enum AjsAstKind {
 } AjsAstKind;
 
 typedef enum AjsVarKind {
-    AJS_VAR_VAR   = 0,
-    AJS_VAR_LET   = 1,
-    AJS_VAR_CONST = 2
+    AJS_VAR_VAR         = 0,
+    AJS_VAR_LET         = 1,
+    AJS_VAR_CONST       = 2,
+    AJS_VAR_USING       = 3,
+    AJS_VAR_AWAIT_USING = 4
 } AjsVarKind;
 
 typedef enum AjsPropKind {

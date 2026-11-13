@@ -25,8 +25,10 @@ typedef enum AjsBindKind {
 typedef struct AjsCompLocal {
     const uint16_t *u16;
     uint32_t        len;
+    uint32_t        hash;
+    int32_t         hash_next;
     AjsString      *str;
-    uint16_t        slot;
+    uint32_t        slot;
     AjsBindKind     kind;
     bool            is_priv;
     uint8_t         priv_kind; /* AjsPropKind for private members */
@@ -34,14 +36,22 @@ typedef struct AjsCompLocal {
     bool            priv_has_set;
 } AjsCompLocal;
 
+static inline bool is_const_var_kind(AjsVarKind vk) {
+    return vk == AJS_VAR_CONST || vk == AJS_VAR_USING || vk == AJS_VAR_AWAIT_USING;
+}
+
 typedef struct AjsCompScope {
     struct AjsCompScope *parent;
     bool                 is_base;       /* true = function/module/eval top frame env */
     bool                 has_runtime_env;
+    bool                 has_disp_stack;
     uint16_t             env_depth_idx; /* Runtime AjsEnv depth from frame base (0 = base_env) */
-    uint16_t             slot_count;
-    uint16_t             slot_cap;
+    uint32_t             disp_slot;
+    uint32_t             slot_count;
+    uint32_t             slot_cap;
     AjsCompLocal        *locals;
+    uint32_t             hash_cap;
+    int32_t             *hash_tab;
 } AjsCompScope;
 
 typedef struct AjsJumpPatch {
@@ -74,6 +84,8 @@ typedef struct AjsCompiler {
     struct AjsCompiler *enclosing;
     AjsBytecode     *bc;
     AjsModuleRecord *mod;
+    const char      *src_base;
+    AjsSourceBuf    *src_buf;
 
     bool             is_script_global; /* true when top-level var/let go to global_obj / global_lex_env */
     bool             strict;
@@ -82,7 +94,10 @@ typedef struct AjsCompiler {
     uint16_t         cur_env_depth;    /* Number of active PUSH_ENV / PUSH_WITH above base_env */
     uint16_t         cur_try_depth;
 
-    uint16_t         eval_ret_slot;    /* 0xFFFF unless script/eval completion value tracking */
+    uint32_t         eval_ret_slot;    /* AJS_NO_SLOT unless script/eval completion value tracking */
+
+    uint32_t         const_hash_cap;
+    int32_t         *const_hash;
 
     AjsCompScope    *scope;
     AjsCompScope     base_scope;
@@ -210,10 +225,43 @@ static void patch_jump(AjsCompiler *c, uint32_t off) {
     patch_u32(c, off, c->bc->code_len);
 }
 
+static uint32_t hash_const_val(AjsValue v) {
+    uint64_t x = (uint64_t)v;
+    x ^= x >> 33;
+    x *= UINT64_C(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    return (uint32_t)x;
+}
+
+static void rebuild_const_hash(AjsCompiler *c, uint32_t ncap) {
+    int32_t *nt = (int32_t *)malloc(ncap * sizeof(int32_t));
+    if (!nt) return;
+    for (uint32_t i = 0; i < ncap; i++) nt[i] = -1;
+    uint32_t mask = ncap - 1u;
+    for (uint32_t i = 0; i < c->bc->const_count; i++) {
+        uint32_t pos = hash_const_val(c->bc->consts[i]) & mask;
+        while (nt[pos] >= 0) pos = (pos + 1u) & mask;
+        nt[pos] = (int32_t)i;
+    }
+    free(c->const_hash);
+    c->const_hash = nt;
+    c->const_hash_cap = ncap;
+}
+
 static uint32_t add_const(AjsCompiler *c, AjsValue val) {
     AjsBytecode *bc = c->bc;
-    for (uint32_t i = 0; i < bc->const_count; i++) {
-        if (bc->consts[i] == val) return i;
+    if (c->const_hash) {
+        uint32_t mask = c->const_hash_cap - 1u;
+        uint32_t pos = hash_const_val(val) & mask;
+        while (c->const_hash[pos] >= 0) {
+            uint32_t idx = (uint32_t)c->const_hash[pos];
+            if (bc->consts[idx] == val) return idx;
+            pos = (pos + 1u) & mask;
+        }
+    } else {
+        for (uint32_t i = 0; i < bc->const_count; i++) {
+            if (bc->consts[i] == val) return i;
+        }
     }
     if (bc->const_count >= bc->const_cap) {
         uint32_t ncap = bc->const_cap ? bc->const_cap * 2u : 16u;
@@ -224,7 +272,89 @@ static uint32_t add_const(AjsCompiler *c, AjsValue val) {
     }
     uint32_t idx = bc->const_count++;
     bc->consts[idx] = val;
+    if (c->const_hash) {
+        if ((bc->const_count + 1u) * 10u >= c->const_hash_cap * 7u) {
+            rebuild_const_hash(c, c->const_hash_cap * 2u);
+        } else {
+            uint32_t mask = c->const_hash_cap - 1u;
+            uint32_t pos = hash_const_val(val) & mask;
+            while (c->const_hash[pos] >= 0) pos = (pos + 1u) & mask;
+            c->const_hash[pos] = (int32_t)idx;
+        }
+    } else if (bc->const_count >= 24u) {
+        rebuild_const_hash(c, 64u);
+    }
     return idx;
+}
+
+static void emit_get_lex(AjsCompiler *c, uint16_t depth, uint32_t slot) {
+    if (depth == 0 && slot <= 0xFFu) {
+        emit_op(c, OP_GET_LOCAL8);
+        emit_u8(c, (uint8_t)slot);
+    } else if (slot <= 0xFFFEu) {
+        emit_op(c, OP_GET_LEX);
+        emit_u16(c, depth);
+        emit_u16(c, (uint16_t)slot);
+    } else {
+        emit_op(c, OP_GET_LEX32);
+        emit_u16(c, depth);
+        emit_u32(c, slot);
+    }
+}
+
+static void emit_set_lex(AjsCompiler *c, uint16_t depth, uint32_t slot, uint8_t strict_u8) {
+    if (depth == 0 && slot <= 0xFFu) {
+        emit_op(c, OP_SET_LOCAL8);
+        emit_u8(c, (uint8_t)slot);
+        emit_u8(c, strict_u8);
+    } else if (slot <= 0xFFFEu) {
+        emit_op(c, OP_SET_LEX);
+        emit_u16(c, depth);
+        emit_u16(c, (uint16_t)slot);
+        emit_u8(c, strict_u8);
+    } else {
+        emit_op(c, OP_SET_LEX32);
+        emit_u16(c, depth);
+        emit_u32(c, slot);
+        emit_u8(c, strict_u8);
+    }
+}
+
+static void emit_init_lex(AjsCompiler *c, uint16_t depth, uint32_t slot) {
+    if (depth == 0 && slot <= 0xFFu) {
+        emit_op(c, OP_INIT_LOCAL8);
+        emit_u8(c, (uint8_t)slot);
+    } else if (slot <= 0xFFFEu) {
+        emit_op(c, OP_INIT_LEX);
+        emit_u16(c, depth);
+        emit_u16(c, (uint16_t)slot);
+    } else {
+        emit_op(c, OP_INIT_LEX32);
+        emit_u16(c, depth);
+        emit_u32(c, slot);
+    }
+}
+
+static void emit_push_env(AjsCompiler *c, uint32_t count, uint32_t ed_idx) {
+    if (count <= 0xFFFEu && (ed_idx == AJS_NO_SLOT || ed_idx < 0xFFFFu)) {
+        emit_op(c, OP_PUSH_ENV);
+        emit_u16(c, (uint16_t)count);
+        emit_u16(c, ed_idx == AJS_NO_SLOT ? 0xFFFFu : (uint16_t)ed_idx);
+    } else {
+        emit_op(c, OP_PUSH_ENV32);
+        emit_u32(c, count);
+        emit_u32(c, ed_idx);
+    }
+}
+
+static void emit_clone_env(AjsCompiler *c, uint32_t count) {
+    if (count <= 0xFFFEu) {
+        emit_op(c, OP_CLONE_ENV);
+        emit_u16(c, (uint16_t)count);
+    } else {
+        emit_op(c, OP_CLONE_ENV32);
+        emit_u32(c, count);
+    }
 }
 
 static uint32_t add_str_u16(AjsCompiler *c, const uint16_t *u16, uint32_t len) {
@@ -441,9 +571,46 @@ static void scan_fn_ast(AjsAstNode *n, bool inside_arrow, AjsFnScanInfo *info) {
  * 4. Lexical Scope & Binding Resolution
  * ============================================================================ */
 
+static void comp_scope_cleanup(AjsCompScope *sc) {
+    if (!sc) return;
+    free(sc->locals);
+    free(sc->hash_tab);
+    sc->locals = NULL;
+    sc->hash_tab = NULL;
+    sc->slot_count = 0;
+    sc->slot_cap = 0;
+    sc->hash_cap = 0;
+}
+
+static void comp_scope_rebuild_hash(AjsCompScope *sc, uint32_t ncap) {
+    int32_t *nt = (int32_t *)malloc(ncap * sizeof(int32_t));
+    if (!nt) return;
+    for (uint32_t i = 0; i < ncap; i++) nt[i] = -1;
+    uint32_t mask = ncap - 1u;
+    for (uint32_t i = 0; i < sc->slot_count; i++) {
+        if (!sc->locals[i].u16) continue;
+        uint32_t b = sc->locals[i].hash & mask;
+        sc->locals[i].hash_next = nt[b];
+        nt[b] = (int32_t)i;
+    }
+    free(sc->hash_tab);
+    sc->hash_tab = nt;
+    sc->hash_cap = ncap;
+}
+
 static int32_t comp_scope_find_own(AjsCompScope *sc, const uint16_t *u16, uint32_t len, bool is_priv) {
-    for (uint16_t i = 0; i < sc->slot_count; i++) {
-        if (sc->locals[i].is_priv == is_priv && sc->locals[i].u16 &&
+    uint32_t h = ajs_hash_utf16(u16, len);
+    if (sc->hash_tab) {
+        for (int32_t i = sc->hash_tab[h & (sc->hash_cap - 1u)]; i >= 0; i = sc->locals[i].hash_next) {
+            if (sc->locals[i].is_priv == is_priv && sc->locals[i].hash == h && sc->locals[i].u16 &&
+                c_u16_eq(sc->locals[i].u16, sc->locals[i].len, u16, len)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    for (uint32_t i = 0; i < sc->slot_count; i++) {
+        if (sc->locals[i].is_priv == is_priv && sc->locals[i].hash == h && sc->locals[i].u16 &&
             c_u16_eq(sc->locals[i].u16, sc->locals[i].len, u16, len)) {
             return (int32_t)i;
         }
@@ -451,37 +618,51 @@ static int32_t comp_scope_find_own(AjsCompScope *sc, const uint16_t *u16, uint32
     return -1;
 }
 
-static uint16_t comp_scope_add(AjsCompiler *c, AjsCompScope *sc, const uint16_t *u16, uint32_t len,
+static uint32_t comp_scope_add(AjsCompiler *c, AjsCompScope *sc, const uint16_t *u16, uint32_t len,
                                AjsBindKind kind, bool is_priv) {
     if (!is_priv && u16) {
         int32_t ex = comp_scope_find_own(sc, u16, len, false);
         if (ex >= 0) {
-            /* `var` re-declaration in same base scope reuses existing slot! */
-            if (kind == BIND_VAR) return sc->locals[ex].slot;
             return sc->locals[ex].slot;
         }
     }
     if (sc->slot_count >= sc->slot_cap) {
-        uint16_t ncap = sc->slot_cap ? (uint16_t)(sc->slot_cap * 2u) : 8u;
+        uint32_t ncap = sc->slot_cap ? (sc->slot_cap * 2u) : 8u;
         AjsCompLocal *nl = (AjsCompLocal *)realloc(sc->locals, ncap * sizeof(AjsCompLocal));
         if (!nl) { comp_error(c, 1, 1, "Out of memory"); return 0; }
         sc->locals = nl;
         sc->slot_cap = ncap;
     }
-    uint16_t slot = sc->slot_count++;
+    uint32_t slot = sc->slot_count++;
+    uint32_t h = u16 ? ajs_hash_utf16(u16, len) : 0u;
     AjsCompLocal *loc = &sc->locals[slot];
     memset(loc, 0, sizeof(*loc));
     loc->u16 = u16;
     loc->len = len;
+    loc->hash = h;
+    loc->hash_next = -1;
     loc->str = u16 ? ajs_str_from_utf16(c->vm, u16, len, true) : NULL;
     loc->slot = slot;
     loc->kind = kind;
     loc->is_priv = is_priv;
+    if (u16) {
+        if (sc->hash_tab) {
+            if (sc->slot_count > sc->hash_cap) {
+                comp_scope_rebuild_hash(sc, sc->hash_cap * 2u);
+            } else {
+                uint32_t b = h & (sc->hash_cap - 1u);
+                loc->hash_next = sc->hash_tab[b];
+                sc->hash_tab[b] = (int32_t)slot;
+            }
+        } else if (sc->slot_count >= 24u) {
+            comp_scope_rebuild_hash(sc, 64u);
+        }
+    }
     return slot;
 }
 
 static bool resolve_binding(AjsCompiler *c, const uint16_t *u16, uint32_t len, bool is_priv,
-                            uint16_t *out_depth, uint16_t *out_slot, AjsBindKind *out_kind) {
+                            uint16_t *out_depth, uint32_t *out_slot, AjsBindKind *out_kind) {
     uint16_t depth = 0;
     AjsCompiler *cur_c = c;
     while (cur_c) {
@@ -504,8 +685,8 @@ static bool resolve_binding(AjsCompiler *c, const uint16_t *u16, uint32_t len, b
 }
 
 /* Resolve non-arrow enclosing function's special lexical slots (<this>, <new.target>, <arguments>, <active_fn>) */
-static bool resolve_special_fn_slots(AjsCompiler *c, uint16_t *out_depth, uint16_t *out_this_slot,
-                                     uint16_t *out_nt_slot, uint16_t *out_args_slot, uint16_t *out_fn_slot) {
+static bool resolve_special_fn_slots(AjsCompiler *c, uint16_t *out_depth, uint32_t *out_this_slot,
+                                     uint32_t *out_nt_slot, uint32_t *out_args_slot, uint32_t *out_fn_slot) {
     uint16_t depth = c->cur_env_depth;
     AjsCompiler *cur_c = c;
     while (cur_c) {
@@ -525,26 +706,24 @@ static bool resolve_special_fn_slots(AjsCompiler *c, uint16_t *out_depth, uint16
     return false;
 }
 
-static uint16_t build_env_desc(AjsCompiler *c, AjsCompScope *sc) {
-    if (!c->has_eval_or_with) {
-        /* Still need TDZ/CONST initialization metadata if any slot is let/const/func_name! */
-    }
+static uint32_t build_env_desc(AjsCompiler *c, AjsCompScope *sc) {
+    bool need_names = c->has_eval_or_with;
     AjsBytecode *bc = c->bc;
     uint32_t idx = bc->env_desc_count++;
     bc->env_descs = (AjsEnvNamesDesc *)realloc(bc->env_descs, bc->env_desc_count * sizeof(AjsEnvNamesDesc));
     AjsEnvNamesDesc *ed = &bc->env_descs[idx];
     ed->count = sc->slot_count;
     ed->slot_flags = (uint8_t *)calloc(sc->slot_count ? sc->slot_count : 1u, 1);
-    ed->names = (AjsString **)calloc(sc->slot_count ? sc->slot_count : 1u, sizeof(AjsString *));
-    for (uint16_t i = 0; i < sc->slot_count; i++) {
+    ed->names = need_names ? (AjsString **)calloc(sc->slot_count ? sc->slot_count : 1u, sizeof(AjsString *)) : NULL;
+    for (uint32_t i = 0; i < sc->slot_count; i++) {
         uint8_t fl = 0;
         if (sc->locals[i].kind == BIND_CONST) fl |= AJS_SLOT_CONST | AJS_SLOT_INIT_TDZ;
         else if (sc->locals[i].kind == BIND_LET) fl |= AJS_SLOT_INIT_TDZ;
         else if (sc->locals[i].kind == BIND_FUNC_NAME) fl |= AJS_SLOT_FUNC_NAME;
         ed->slot_flags[i] = fl;
-        ed->names[i] = sc->locals[i].str;
+        if (need_names) ed->names[i] = sc->locals[i].str;
     }
-    return (uint16_t)idx;
+    return idx;
 }
 
 static void collect_pattern_vars(AjsCompiler *c, AjsCompScope *sc, AjsAstNode *pat, AjsBindKind kind, bool to_global) {
@@ -603,25 +782,37 @@ static void hoist_vars_in_stmt(AjsCompiler *c, AjsAstNode *n, bool to_global) {
                 }
             }
             break;
-        case AST_BLOCK:
+        case AST_BLOCK: {
             /* Annex B.3.3: sloppy block-level plain function also creates var binding if no lex conflict */
-            for (uint32_t i = 0; i < n->u.block.stmts.count; i++) {
-                AjsAstNode *st = n->u.block.stmts.items[i];
-                if (!c->strict && st && st->kind == AST_FUNC_DECL &&
-                    st->u.func.fn_kind == AJS_FN_BC_NORMAL && st->u.func.name_u16) {
-                    bool lex_conflict = false;
+            AjsCompScope blk_lex = {0};
+            bool has_sloppy_fn = false;
+            if (!c->strict) {
+                for (uint32_t i = 0; i < n->u.block.stmts.count; i++) {
+                    AjsAstNode *st = n->u.block.stmts.items[i];
+                    if (st && st->kind == AST_FUNC_DECL &&
+                        st->u.func.fn_kind == AJS_FN_BC_NORMAL && st->u.func.name_u16) {
+                        has_sloppy_fn = true;
+                        break;
+                    }
+                }
+                if (has_sloppy_fn) {
                     for (uint32_t j = 0; j < n->u.block.stmts.count; j++) {
                         AjsAstNode *s2 = n->u.block.stmts.items[j];
                         if (s2 && s2->kind == AST_VAR_DECL && s2->u.var_decl.var_kind != AJS_VAR_VAR) {
                             for (uint32_t k = 0; k < s2->u.var_decl.decls.count; k++) {
-                                AjsAstNode *id = s2->u.var_decl.decls.items[k]->u.declarator.id;
-                                if (id && id->kind == AST_IDENT &&
-                                    c_u16_eq(id->u.ident.u16, id->u.ident.len, st->u.func.name_u16, st->u.func.name_len)) {
-                                    lex_conflict = true;
-                                }
+                                collect_pattern_vars(c, &blk_lex, s2->u.var_decl.decls.items[k]->u.declarator.id, BIND_LET, false);
                             }
+                        } else if (s2 && s2->kind == AST_CLASS_DECL && s2->u.klass.name_u16) {
+                            comp_scope_add(c, &blk_lex, s2->u.klass.name_u16, s2->u.klass.name_len, BIND_LET, false);
                         }
                     }
+                }
+            }
+            for (uint32_t i = 0; i < n->u.block.stmts.count; i++) {
+                AjsAstNode *st = n->u.block.stmts.items[i];
+                if (!c->strict && st && st->kind == AST_FUNC_DECL &&
+                    st->u.func.fn_kind == AJS_FN_BC_NORMAL && st->u.func.name_u16) {
+                    bool lex_conflict = (comp_scope_find_own(&blk_lex, st->u.func.name_u16, st->u.func.name_len, false) >= 0);
                     if (!lex_conflict) {
                         if (to_global) {
                             uint32_t nidx = add_str_u16(c, st->u.func.name_u16, st->u.func.name_len);
@@ -635,7 +826,9 @@ static void hoist_vars_in_stmt(AjsCompiler *c, AjsAstNode *n, bool to_global) {
                 }
                 hoist_vars_in_stmt(c, st, to_global);
             }
+            comp_scope_cleanup(&blk_lex);
             break;
+        }
         case AST_IF_STMT:
             if (!c->strict) {
                 if (n->u.if_stmt.conseq && n->u.if_stmt.conseq->kind == AST_FUNC_DECL && n->u.if_stmt.conseq->u.func.name_u16) {
@@ -696,16 +889,21 @@ static void hoist_vars_in_stmt(AjsCompiler *c, AjsAstNode *n, bool to_global) {
     }
 }
 
-/* Scan immediate statement list for block-scoped `let`/`const`/`class`/`function` declarations */
+/* Scan immediate statement list for block-scoped `let`/`const`/`using`/`class`/`function` declarations */
 static void collect_block_lex_in_list(AjsCompiler *c, AjsCompScope *sc, const AjsNodeList *list, bool to_global) {
     for (uint32_t i = 0; i < list->count; i++) {
         AjsAstNode *st = list->items[i];
         if (!st) continue;
         if (st->kind == AST_EXPORT_NAMED_DECL && st->u.mod_decl.decl) st = st->u.mod_decl.decl;
         if (st->kind == AST_VAR_DECL && st->u.var_decl.var_kind != AJS_VAR_VAR) {
-            AjsBindKind bk = (st->u.var_decl.var_kind == AJS_VAR_CONST) ? BIND_CONST : BIND_LET;
+            AjsVarKind vk = st->u.var_decl.var_kind;
+            AjsBindKind bk = is_const_var_kind(vk) ? BIND_CONST : BIND_LET;
             for (uint32_t j = 0; j < st->u.var_decl.decls.count; j++) {
                 collect_pattern_vars(c, sc, st->u.var_decl.decls.items[j]->u.declarator.id, bk, to_global);
+            }
+            if ((vk == AJS_VAR_USING || vk == AJS_VAR_AWAIT_USING) && !sc->has_disp_stack) {
+                sc->disp_slot = comp_scope_add(c, sc, NULL, 0, BIND_VAR, false);
+                sc->has_disp_stack = true;
             }
         } else if (st->kind == AST_CLASS_DECL && st->u.klass.name_u16) {
             if (to_global) {
@@ -731,6 +929,78 @@ static void collect_block_lex_in_list(AjsCompiler *c, AjsCompScope *sc, const Aj
             }
         }
     }
+}
+
+static inline bool compiler_allows_await(const AjsCompiler *c) {
+    return c->bc->fn_kind == AJS_FN_BC_ASYNC ||
+           c->bc->fn_kind == AJS_FN_BC_ASYNC_ARROW ||
+           c->bc->fn_kind == AJS_FN_BC_ASYNC_GENERATOR;
+}
+
+static uint32_t emit_dispose_enter(AjsCompiler *c, uint16_t lex_depth, uint32_t disp_slot) {
+    emit_op(c, OP_DISPOSE_NEW);
+    emit_init_lex(c, lex_depth, disp_slot);
+    emit_op(c, OP_POP);
+    emit_op(c, OP_TRY_PUSH);
+    emit_u32(c, UINT32_MAX);
+    uint32_t fin_patch = c->bc->code_len;
+    emit_u32(c, 0);
+    c->cur_try_depth++;
+    return fin_patch;
+}
+
+static void emit_dispose_finally(AjsCompiler *c, uint16_t lex_depth, uint32_t disp_slot, uint32_t fin_patch) {
+    bool allow_await = compiler_allows_await(c);
+    c->cur_try_depth--;
+    patch_jump(c, fin_patch);
+    emit_op(c, OP_ENTER_FINALLY);
+
+    uint32_t loop_top_pc = c->bc->code_len;
+    emit_op(c, OP_TRY_PUSH);
+    uint32_t step_catch_patch = c->bc->code_len;
+    emit_u32(c, 0);
+    emit_u32(c, UINT32_MAX);
+
+    emit_get_lex(c, lex_depth, disp_slot);
+    emit_op(c, OP_DISPOSE_STEP);
+
+    emit_op(c, OP_DUP);
+    emit_op(c, OP_CONST);
+    emit_u32(c, add_const(c, ajs_val_number(0.0)));
+    emit_op(c, OP_STRICT_EQ);
+    uint32_t j_done = emit_jump(c, OP_JMP_TRUE);
+
+    if (allow_await) {
+        emit_op(c, OP_CONST);
+        emit_u32(c, add_const(c, ajs_val_number(1.0)));
+        emit_op(c, OP_STRICT_EQ);
+        uint32_t j_sync = emit_jump(c, OP_JMP_FALSE);
+        emit_op(c, OP_AWAIT);
+        patch_jump(c, j_sync);
+        emit_op(c, OP_POP);
+    } else {
+        emit_op(c, OP_POP);
+        emit_op(c, OP_POP);
+    }
+    emit_op(c, OP_TRY_POP);
+    emit_op(c, OP_JMP);
+    emit_u32(c, loop_top_pc);
+
+    patch_jump(c, step_catch_patch);
+    emit_get_lex(c, lex_depth, disp_slot);
+    emit_op(c, OP_SWAP);
+    emit_op(c, OP_DISPOSE_CATCH);
+    emit_op(c, OP_JMP);
+    emit_u32(c, loop_top_pc);
+
+    patch_jump(c, j_done);
+    emit_op(c, OP_POP);
+    emit_op(c, OP_POP);
+    emit_op(c, OP_TRY_POP);
+
+    emit_get_lex(c, lex_depth, disp_slot);
+    emit_op(c, OP_DISPOSE_FINISH);
+    emit_op(c, OP_FINALLY_END);
 }
 
 /* Instantiate hoisted function declarations in the current scope */
@@ -785,9 +1055,7 @@ static bool instantiate_hoisted_funcs(AjsCompiler *c, AjsCompScope *sc, const Aj
         } else if (st->u.func.name_u16) {
             int32_t lidx = comp_scope_find_own(sc, st->u.func.name_u16, st->u.func.name_len, false);
             if (lidx >= 0) {
-                emit_op(c, OP_INIT_LEX);
-                emit_u16(c, 0);
-                emit_u16(c, sc->locals[lidx].slot);
+                emit_init_lex(c, 0, sc->locals[lidx].slot);
             }
             emit_op(c, OP_POP);
         } else {
@@ -811,20 +1079,18 @@ static bool is_anon_fn_or_class_def(AjsAstNode *n) {
 static void emit_load_ident(AjsCompiler *c, const uint16_t *u16, uint32_t len, bool typeof_mode) {
     /* Special `arguments` identifier inside functions */
     if (c_u16_eq_ascii(u16, len, "arguments")) {
-        uint16_t depth = 0, slot = 0;
+        uint16_t depth = 0;
+        uint32_t slot = 0;
         AjsBindKind bk;
         if (resolve_binding(c, u16, len, false, &depth, &slot, &bk)) {
-            emit_op(c, OP_GET_LEX);
-            emit_u16(c, depth);
-            emit_u16(c, slot);
+            emit_get_lex(c, depth, slot);
             return;
         }
-        uint16_t sp_depth = 0, args_slot = 0xFFFF;
+        uint16_t sp_depth = 0;
+        uint32_t args_slot = AJS_NO_SLOT;
         if (resolve_special_fn_slots(c, &sp_depth, NULL, NULL, &args_slot, NULL)) {
-            if (args_slot != 0xFFFF) {
-                emit_op(c, OP_GET_LEX);
-                emit_u16(c, sp_depth);
-                emit_u16(c, args_slot);
+            if (args_slot != AJS_NO_SLOT) {
+                emit_get_lex(c, sp_depth, args_slot);
                 return;
             }
             if (sp_depth == c->cur_env_depth && c->bc->fn_kind != AJS_FN_BC_ARROW &&
@@ -843,12 +1109,11 @@ static void emit_load_ident(AjsCompiler *c, const uint16_t *u16, uint32_t len, b
         return;
     }
 
-    uint16_t depth = 0, slot = 0;
+    uint16_t depth = 0;
+    uint32_t slot = 0;
     AjsBindKind bk;
     if (resolve_binding(c, u16, len, false, &depth, &slot, &bk)) {
-        emit_op(c, OP_GET_LEX);
-        emit_u16(c, depth);
-        emit_u16(c, slot);
+        emit_get_lex(c, depth, slot);
         return;
     }
 
@@ -873,9 +1138,7 @@ static void emit_store_ident(AjsCompiler *c, const uint16_t *u16, uint32_t len, 
         int32_t own_idx = comp_scope_find_own(c->scope, u16, len, false);
         if (own_idx >= 0) {
             uint16_t init_depth = (uint16_t)(c->cur_env_depth - c->scope->env_depth_idx);
-            emit_op(c, OP_INIT_LEX);
-            emit_u16(c, init_depth);
-            emit_u16(c, c->scope->locals[own_idx].slot);
+            emit_init_lex(c, init_depth, c->scope->locals[own_idx].slot);
             return;
         }
         if (c->is_script_global && c->scope->is_base) {
@@ -886,18 +1149,14 @@ static void emit_store_ident(AjsCompiler *c, const uint16_t *u16, uint32_t len, 
         }
     }
 
-    uint16_t depth = 0, slot = 0;
+    uint16_t depth = 0;
+    uint32_t slot = 0;
     AjsBindKind bk;
     if (resolve_binding(c, u16, len, false, &depth, &slot, &bk)) {
         if (is_init && vk == AJS_VAR_VAR && (bk == BIND_VAR || bk == BIND_PARAM)) {
-            emit_op(c, OP_INIT_LEX);
-            emit_u16(c, depth);
-            emit_u16(c, slot);
+            emit_init_lex(c, depth, slot);
         } else {
-            emit_op(c, OP_SET_LEX);
-            emit_u16(c, depth);
-            emit_u16(c, slot);
-            emit_u8(c, c->strict ? 1 : 0);
+            emit_set_lex(c, depth, slot, c->strict ? 1 : 0);
         }
         return;
     }
@@ -947,10 +1206,11 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
         AjsAstNode *obj = pat->u.member.object;
         AjsAstNode *prop = pat->u.member.property;
         if (obj && obj->kind == AST_SUPER_EXPR) {
-            uint16_t sp_d = 0, this_s = 0xFFFF, fn_s = 0xFFFF;
+            uint16_t sp_d = 0;
+            uint32_t this_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
             resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, &fn_s);
-            uint16_t fn_arg = (fn_s != 0xFFFF) ? fn_s : (sp_d == c->cur_env_depth ? 0xFFFF : fn_s);
-            if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); }
+            uint32_t fn_arg = (fn_s != AJS_NO_SLOT) ? fn_s : (sp_d == c->cur_env_depth ? AJS_NO_SLOT : fn_s);
+            if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); }
             else { emit_op(c, OP_THIS); }
             /* Stack: [rhs, this] */
             if (pat->u.member.computed) {
@@ -959,7 +1219,7 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
                 emit_op(c, OP_ROT3L);
                 emit_op(c, OP_SET_SUPER_ELEM);
                 emit_u16(c, sp_d);
-                emit_u16(c, fn_arg);
+                emit_u32(c, fn_arg);
                 emit_u8(c, c->strict ? 1 : 0);
             } else {
                 /* Stack: [rhs, this] -> SWAP -> [this, rhs] */
@@ -967,7 +1227,7 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
                 uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
                 emit_op(c, OP_SET_SUPER_PROP);
                 emit_u16(c, sp_d);
-                emit_u16(c, fn_arg);
+                emit_u32(c, fn_arg);
                 emit_u32(c, nidx);
                 emit_u8(c, c->strict ? 1 : 0);
             }
@@ -985,14 +1245,15 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
             emit_u8(c, c->strict ? 1 : 0);
         } else if (prop->kind == AST_PRIV_IDENT) {
             emit_op(c, OP_SWAP); /* [obj, rhs] */
-            uint16_t d = 0, s = 0;
+            uint16_t d = 0;
+            uint32_t s = 0;
             if (!resolve_binding(c, prop->u.ident.u16, prop->u.ident.len, true, &d, &s, NULL)) {
                 comp_error(c, prop->line, prop->col, "Unresolved private identifier");
                 return false;
             }
             emit_op(c, OP_SET_PRIVATE);
             emit_u16(c, d);
-            emit_u16(c, s);
+            emit_u32(c, s);
         } else {
             emit_op(c, OP_SWAP); /* [obj, rhs] */
             uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
@@ -1010,16 +1271,14 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
         emit_op(c, OP_GET_ITER);
         emit_u8(c, 0); /* sync iterator: [iter, next_fn] */
 
-        emit_op(c, OP_PUSH_ENV);
-        emit_u16(c, 3);
-        emit_u16(c, 0xFFFF);
+        emit_push_env(c, 3, AJS_NO_SLOT);
         c->cur_env_depth++;
 
         /* Slot 1 = next_fn, Slot 0 = raw_iter, Slot 2 = active_iter (initially raw_iter) */
-        emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, 1); emit_op(c, OP_POP);
+        emit_init_lex(c, 0, 1); emit_op(c, OP_POP);
         emit_op(c, OP_DUP);
-        emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, 0); emit_op(c, OP_POP);
-        emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, 2); emit_op(c, OP_POP);
+        emit_init_lex(c, 0, 0); emit_op(c, OP_POP);
+        emit_init_lex(c, 0, 2); emit_op(c, OP_POP);
 
         emit_op(c, OP_TRY_PUSH);
         emit_u32(c, UINT32_MAX);
@@ -1031,12 +1290,12 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
             AjsAstNode *el = pat->u.array.elems.items[i];
             if (el && (el->kind == AST_REST_ELEMENT || el->kind == AST_SPREAD_ELEM)) {
                 /* Exhaust remaining iterator into rest array; mark active_iter = undefined first! */
-                emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 2);
+                emit_get_lex(c, 0, 2);
                 uint32_t j_already_done = emit_jump(c, OP_JMP_UNDEF);
                 emit_op(c, OP_UNDEF);
-                emit_op(c, OP_SET_LEX); emit_u16(c, 0); emit_u16(c, 2); emit_u8(c, 0); emit_op(c, OP_POP);
-                emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 0);
-                emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 1);
+                emit_set_lex(c, 0, 2, 0); emit_op(c, OP_POP);
+                emit_get_lex(c, 0, 0);
+                emit_get_lex(c, 0, 1);
                 emit_op(c, OP_REST_FROM_ITER);
                 uint32_t j_after_rest = emit_jump(c, OP_JMP);
                 patch_jump(c, j_already_done);
@@ -1047,14 +1306,14 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
             }
 
             /* Step iterator if not already exhausted */
-            emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 2);
+            emit_get_lex(c, 0, 2);
             uint32_t j_exhausted = emit_jump(c, OP_JMP_UNDEF);
             /* Temporarily clear active_iter while calling next() so a throw inside next() does NOT IteratorClose! */
             emit_op(c, OP_UNDEF);
-            emit_op(c, OP_SET_LEX); emit_u16(c, 0); emit_u16(c, 2); emit_u8(c, 0); emit_op(c, OP_POP);
+            emit_set_lex(c, 0, 2, 0); emit_op(c, OP_POP);
 
-            emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 0);
-            emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 1);
+            emit_get_lex(c, 0, 0);
+            emit_get_lex(c, 0, 1);
             emit_op(c, OP_ITER_NEXT);
             /* [iter, next_fn, res_obj] -> NIP twice -> [res_obj] */
             emit_op(c, OP_NIP);
@@ -1062,8 +1321,8 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
             emit_op(c, OP_ITER_UNPACK); /* [value, done_bool] */
             uint32_t j_step_done = emit_jump(c, OP_JMP_TRUE);
             /* Not done: restore active_iter = raw_iter */
-            emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 0);
-            emit_op(c, OP_SET_LEX); emit_u16(c, 0); emit_u16(c, 2); emit_u8(c, 0); emit_op(c, OP_POP);
+            emit_get_lex(c, 0, 0);
+            emit_set_lex(c, 0, 2, 0); emit_op(c, OP_POP);
             uint32_t j_have_val = emit_jump(c, OP_JMP);
 
             patch_jump(c, j_step_done);
@@ -1082,9 +1341,9 @@ static bool compile_pattern_assign(AjsCompiler *c, AjsAstNode *pat, bool is_init
         c->cur_try_depth--;
         patch_jump(c, fin_patch);
         emit_op(c, OP_ENTER_FINALLY);
-        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 2);
+        emit_get_lex(c, 0, 2);
         uint32_t j_no_close = emit_jump(c, OP_JMP_UNDEF);
-        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 2);
+        emit_get_lex(c, 0, 2);
         emit_op(c, OP_ITER_CLOSE);
         patch_jump(c, j_no_close);
         emit_op(c, OP_FINALLY_END);
@@ -1268,14 +1527,15 @@ static bool compile_opt_chain_inner(AjsCompiler *c, AjsAstNode *n, AjsOptChainCt
             if (!compile_expr(c, n->u.member.property)) return false;
             emit_op(c, OP_GET_ELEM);
         } else if (n->u.member.property->kind == AST_PRIV_IDENT) {
-            uint16_t d = 0, s = 0;
+            uint16_t d = 0;
+            uint32_t s = 0;
             if (!resolve_binding(c, n->u.member.property->u.ident.u16, n->u.member.property->u.ident.len, true, &d, &s, NULL)) {
                 comp_error(c, n->line, n->col, "Unresolved private identifier");
                 return false;
             }
             emit_op(c, OP_GET_PRIVATE);
             emit_u16(c, d);
-            emit_u16(c, s);
+            emit_u32(c, s);
         } else {
             uint32_t nidx = add_str_u16(c, n->u.member.property->u.ident.u16, n->u.member.property->u.ident.len);
             emit_op(c, OP_GET_PROP);
@@ -1290,18 +1550,19 @@ static bool compile_opt_chain_inner(AjsCompiler *c, AjsAstNode *n, AjsOptChainCt
         if (is_method) {
             if (cal->u.member.object && cal->u.member.object->kind == AST_SUPER_EXPR) {
                 /* super.m?.(...) */
-                uint16_t sp_d = 0, this_s = 0xFFFF, fn_s = 0xFFFF;
+                uint16_t sp_d = 0;
+                uint32_t this_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
                 resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, &fn_s);
-                uint16_t fn_arg = (fn_s != 0xFFFF) ? fn_s : (sp_d == c->cur_env_depth ? 0xFFFF : fn_s);
-                if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); }
+                uint32_t fn_arg = (fn_s != AJS_NO_SLOT) ? fn_s : (sp_d == c->cur_env_depth ? AJS_NO_SLOT : fn_s);
+                if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); }
                 else { emit_op(c, OP_THIS); }
                 emit_op(c, OP_DUP);
                 if (cal->u.member.computed) {
                     if (!compile_expr(c, cal->u.member.property)) return false;
-                    emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg);
+                    emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg);
                 } else {
                     uint32_t nidx = add_str_u16(c, cal->u.member.property->u.ident.u16, cal->u.member.property->u.ident.len);
-                    emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx);
+                    emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx);
                 }
             } else {
                 if (!compile_opt_chain_inner(c, cal, oc, true, false)) return false;
@@ -1456,7 +1717,8 @@ static bool compile_update_expr(AjsCompiler *c, AjsAstNode *n) {
     if (arg->kind == AST_IDENT) {
         /* Read old value -> ToNumeric -> DUP (if postfix) -> INC/DEC -> store -> (if postfix, POP new so old remains!) */
         bool use_dyn = (c->with_depth > 0 || (c->has_eval_or_with && !c->strict));
-        uint16_t depth = 0, slot = 0;
+        uint16_t depth = 0;
+        uint32_t slot = 0;
         AjsBindKind bk;
         bool is_lex = !use_dyn && resolve_binding(c, arg->u.ident.u16, arg->u.ident.len, false, &depth, &slot, &bk);
         uint32_t nidx = is_lex ? 0 : add_str_u16(c, arg->u.ident.u16, arg->u.ident.len);
@@ -1464,7 +1726,7 @@ static bool compile_update_expr(AjsCompiler *c, AjsAstNode *n) {
         if (use_dyn) {
             emit_op(c, OP_GET_DYN_NAME); emit_u32(c, nidx); emit_u8(c, 0);
         } else if (is_lex) {
-            emit_op(c, OP_GET_LEX); emit_u16(c, depth); emit_u16(c, slot);
+            emit_get_lex(c, depth, slot);
         } else {
             if (c->strict) { emit_op(c, OP_CHECK_GLOBAL_REF); emit_u32(c, nidx); }
             emit_op(c, OP_GET_GLOBAL); emit_u32(c, nidx); emit_u8(c, 0);
@@ -1475,7 +1737,7 @@ static bool compile_update_expr(AjsCompiler *c, AjsAstNode *n) {
         if (use_dyn) {
             emit_op(c, OP_SET_DYN_NAME); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
         } else if (is_lex) {
-            emit_op(c, OP_SET_LEX); emit_u16(c, depth); emit_u16(c, slot); emit_u8(c, c->strict ? 1 : 0);
+            emit_set_lex(c, depth, slot, c->strict ? 1 : 0);
         } else {
             emit_op(c, OP_SET_GLOBAL); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
         }
@@ -1487,61 +1749,43 @@ static bool compile_update_expr(AjsCompiler *c, AjsAstNode *n) {
         AjsAstNode *obj = arg->u.member.object;
         AjsAstNode *prop = arg->u.member.property;
         if (obj && obj->kind == AST_SUPER_EXPR) {
-            uint16_t sp_d = 0, this_s = 0xFFFF, fn_s = 0xFFFF;
+            uint16_t sp_d = 0;
+            uint32_t this_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
             resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, &fn_s);
-            uint16_t fn_arg = (fn_s != 0xFFFF) ? fn_s : (sp_d == c->cur_env_depth ? 0xFFFF : fn_s);
-            if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); }
+            uint32_t fn_arg = (fn_s != AJS_NO_SLOT) ? fn_s : (sp_d == c->cur_env_depth ? AJS_NO_SLOT : fn_s);
+            if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); }
             else { emit_op(c, OP_THIS); }
             if (arg->u.member.computed) {
                 if (!compile_expr(c, prop)) return false;
                 emit_op(c, OP_TO_PROP_KEY);
                 emit_op(c, OP_DUP2);
-                emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg);
+                emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg);
                 emit_op(c, OP_TO_NUMERIC);
                 if (!prefix) {
-                    /* [this, key, old] -> DUP -> [this, key, old, old] -> ROT3 on top 3? No, save old below!
-                     * [this, key, old] -> ROT3 -> [old, this, key] -> ROT3 -> [key, old, this] -> wait:
-                     * Let's do: [this, key, old]:
-                     * DUP -> [this, key, old, old] -> step_op -> [this, key, old, new]:
-                     * no, SET_SUPER_ELEM needs [this, key, new]!
-                     * Easy: BEFORE DUP2, stack is [this, key]. DUP2 -> [this, key, this, key] -> GET_SUPER_ELEM -> [this, key, old] -> TO_NUMERIC -> [this, key, old].
-                     * Now ROT3 -> [old, this, key]! Wait: we also need `old` for step_op!
-                     * Let's trace: [this, key, old] -> DUP -> [this, key, old, old] -> step_op -> [this, key, old, new]
-                     *Wait: we only have 3-item ROT3! Can we get [old, this, key, new] using 3-item ops?
-                     * Look! Start with `[this, key]`:
-                     * DUP2 -> `[this, key, this, key]` -> GET -> `[this, key, old]` -> TO_NUMERIC -> `[this, key, old]`.
-                     * ROT3 -> `[old, this, key]`!! Now how to get `old` on top? We don't need to if we duplicated `old` BEFORE!
-                     * Wait: if we have `[old, this, key]`, we lost `old` on top!
-                     * Instead, use a 1-slot mini env OR look:
-                     * `[this, key]` -> DUP2 -> `[this, key, this, key]` -> GET -> `[this, key, old]` -> TO_NUMERIC -> `[this, key, old]`.
-                     * Wait: why not evaluate `old` FIRST? No, `this` and `key` are evaluated ONCE!
-                     * With a 1-slot `PUSH_ENV(1)` (or let's check: does `PUSH_ENV(1)` take 3 instructions and work for ANY expression cleanly without 10 stack gymnastics? Wait — ONLY if no `var`/closure depth shifts inside `step_op`, and `step_op` is just 1 instruction `OP_INC_NUM` with ZERO closures/vars inside!!):
-                     * WAIT A SECOND! Between `TO_NUMERIC` and `SET_ELEM`, NO user AST is compiled — ONLY `OP_INC_NUM` and `OP_SET_ELEM`! `cur_env_depth` doesn't even affect anything because zero variable lookups happen during those 4 instructions! */
-                    emit_op(c, OP_PUSH_ENV); emit_u16(c, 1); emit_u16(c, 0xFFFF);
-                    emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, 0); /* [this, key, old] */
-                    emit_op(c, step_op);                                    /* [this, key, new] */
+                    emit_push_env(c, 1, AJS_NO_SLOT);
+                    emit_init_lex(c, 0, 0);
+                    emit_op(c, step_op);
                     emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, (uint16_t)(sp_d + 1u));
-                    emit_u16(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
+                    emit_u32(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
                     emit_op(c, OP_POP);
-                    emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 0);
+                    emit_get_lex(c, 0, 0);
                     emit_op(c, OP_POP_ENV);
                     return true;
                 }
                 emit_op(c, step_op);
-                emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
+                emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
             } else {
                 uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
                 emit_op(c, OP_DUP);
-                emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx);
+                emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx);
                 emit_op(c, OP_TO_NUMERIC);
                 if (!prefix) {
-                    /* [this, old] -> DUP -> [this, old, old] -> ROT3L -> [old, old, this] -> SWAP -> [old, this, old] */
                     emit_op(c, OP_DUP);
                     emit_op(c, OP_ROT3L);
                     emit_op(c, OP_SWAP);
                 }
                 emit_op(c, step_op);
-                emit_op(c, OP_SET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
+                emit_op(c, OP_SET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
                 if (!prefix) emit_op(c, OP_POP);
             }
             return true;
@@ -1555,12 +1799,12 @@ static bool compile_update_expr(AjsCompiler *c, AjsAstNode *n) {
             emit_op(c, OP_GET_ELEM);
             emit_op(c, OP_TO_NUMERIC);
             if (!prefix) {
-                emit_op(c, OP_PUSH_ENV); emit_u16(c, 1); emit_u16(c, 0xFFFF);
-                emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, 0);
+                emit_push_env(c, 1, AJS_NO_SLOT);
+                emit_init_lex(c, 0, 0);
                 emit_op(c, step_op);
                 emit_op(c, OP_SET_ELEM); emit_u8(c, c->strict ? 1 : 0);
                 emit_op(c, OP_POP);
-                emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 0);
+                emit_get_lex(c, 0, 0);
                 emit_op(c, OP_POP_ENV);
                 return true;
             }
@@ -1570,13 +1814,14 @@ static bool compile_update_expr(AjsCompiler *c, AjsAstNode *n) {
         }
 
         if (prop->kind == AST_PRIV_IDENT) {
-            uint16_t d = 0, s = 0;
+            uint16_t d = 0;
+            uint32_t s = 0;
             if (!resolve_binding(c, prop->u.ident.u16, prop->u.ident.len, true, &d, &s, NULL)) {
                 comp_error(c, prop->line, prop->col, "Unresolved private identifier");
                 return false;
             }
             emit_op(c, OP_DUP);
-            emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+            emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
             emit_op(c, OP_TO_NUMERIC);
             if (!prefix) {
                 emit_op(c, OP_DUP);
@@ -1584,7 +1829,7 @@ static bool compile_update_expr(AjsCompiler *c, AjsAstNode *n) {
                 emit_op(c, OP_SWAP);
             }
             emit_op(c, step_op);
-            emit_op(c, OP_SET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+            emit_op(c, OP_SET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
             if (!prefix) emit_op(c, OP_POP);
             return true;
         }
@@ -1624,17 +1869,12 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
 
         if (lhs->kind == AST_IDENT) {
             bool use_dyn = (c->with_depth > 0 || (c->has_eval_or_with && !c->strict));
-            uint16_t depth = 0, slot = 0;
+            uint16_t depth = 0;
+            uint32_t slot = 0;
             AjsBindKind bk;
             bool is_lex = !use_dyn && resolve_binding(c, lhs->u.ident.u16, lhs->u.ident.len, false, &depth, &slot, &bk);
             uint32_t nidx = is_lex ? 0 : add_str_u16(c, lhs->u.ident.u16, lhs->u.ident.len);
 
-            /* ECMA-262: ResolveBinding happens BEFORE evaluating RHS! In strict mode, assigning to an
-             * undeclared global throws ReferenceError BEFORE evaluating RHS if RHS doesn't create it;
-             * actually ECMA-262 §13.15.2 checks IsUnresolvableReference AFTER RHS evaluation in PutValue,
-             * EXCEPT TDZ check in PutValue also happens in PutValue! Wait: what if RHS deletes/creates global?
-             * In ECMA-262: `lref = ResolveBinding(lhs)` (captures env BEFORE `with` or `eval` in RHS!),
-             * `rval = Evaluation(rhs)`, `PutValue(lref, rval)`! */
             if (!compile_expr(c, rhs)) return false;
             if (is_anon_fn_or_class_def(rhs)) {
                 uint32_t fn_nidx = add_str_u16(c, lhs->u.ident.u16, lhs->u.ident.len);
@@ -1644,7 +1884,7 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
             if (use_dyn) {
                 emit_op(c, OP_SET_DYN_NAME); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
             } else if (is_lex) {
-                emit_op(c, OP_SET_LEX); emit_u16(c, depth); emit_u16(c, slot); emit_u8(c, c->strict ? 1 : 0);
+                emit_set_lex(c, depth, slot, c->strict ? 1 : 0);
             } else {
                 emit_op(c, OP_SET_GLOBAL); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
             }
@@ -1655,20 +1895,21 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
             AjsAstNode *obj = lhs->u.member.object;
             AjsAstNode *prop = lhs->u.member.property;
             if (obj && obj->kind == AST_SUPER_EXPR) {
-                uint16_t sp_d = 0, this_s = 0xFFFF, fn_s = 0xFFFF;
+                uint16_t sp_d = 0;
+                uint32_t this_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
                 resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, &fn_s);
-                uint16_t fn_arg = (fn_s != 0xFFFF) ? fn_s : (sp_d == c->cur_env_depth ? 0xFFFF : fn_s);
-                if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); }
+                uint32_t fn_arg = (fn_s != AJS_NO_SLOT) ? fn_s : (sp_d == c->cur_env_depth ? AJS_NO_SLOT : fn_s);
+                if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); }
                 else { emit_op(c, OP_THIS); }
                 if (lhs->u.member.computed) {
                     if (!compile_expr(c, prop)) return false;
                     emit_op(c, OP_TO_PROP_KEY);
                     if (!compile_expr(c, rhs)) return false;
-                    emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
+                    emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
                 } else {
                     if (!compile_expr(c, rhs)) return false;
                     uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
-                    emit_op(c, OP_SET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
+                    emit_op(c, OP_SET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
                 }
                 return true;
             }
@@ -1681,13 +1922,14 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
                 if (!compile_expr(c, rhs)) return false;
                 emit_op(c, OP_SET_ELEM); emit_u8(c, c->strict ? 1 : 0);
             } else if (prop->kind == AST_PRIV_IDENT) {
-                uint16_t d = 0, s = 0;
+                uint16_t d = 0;
+                uint32_t s = 0;
                 if (!resolve_binding(c, prop->u.ident.u16, prop->u.ident.len, true, &d, &s, NULL)) {
                     comp_error(c, prop->line, prop->col, "Unresolved private identifier");
                     return false;
                 }
                 if (!compile_expr(c, rhs)) return false;
-                emit_op(c, OP_SET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+                emit_op(c, OP_SET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
             } else {
                 emit_op(c, OP_REQ_OBJ_COERCIBLE);
                 if (!compile_expr(c, rhs)) return false;
@@ -1732,22 +1974,23 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
         AjsAstNode *prop = lhs->u.member.property;
 
         if (obj && obj->kind == AST_SUPER_EXPR) {
-            uint16_t sp_d = 0, this_s = 0xFFFF, fn_s = 0xFFFF;
+            uint16_t sp_d = 0;
+            uint32_t this_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
             resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, &fn_s);
-            uint16_t fn_arg = (fn_s != 0xFFFF) ? fn_s : (sp_d == c->cur_env_depth ? 0xFFFF : fn_s);
-            if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); }
+            uint32_t fn_arg = (fn_s != AJS_NO_SLOT) ? fn_s : (sp_d == c->cur_env_depth ? AJS_NO_SLOT : fn_s);
+            if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); }
             else { emit_op(c, OP_THIS); }
             if (lhs->u.member.computed) {
                 if (!compile_expr(c, prop)) return false;
                 emit_op(c, OP_TO_PROP_KEY);
                 emit_op(c, OP_DUP2);
-                emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg);
+                emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg);
                 if (is_logical) {
                     emit_op(c, OP_DUP);
                     uint32_t j_skip = emit_jump(c, log_jmp);
                     emit_op(c, OP_POP);
                     if (!compile_expr(c, rhs)) return false;
-                    emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
+                    emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
                     uint32_t j_end = emit_jump(c, OP_JMP);
                     patch_jump(c, j_skip);
                     emit_op(c, OP_NIP); emit_op(c, OP_NIP);
@@ -1756,18 +1999,18 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
                 }
                 if (!compile_expr(c, rhs)) return false;
                 emit_op(c, token_to_bin_op(op));
-                emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
+                emit_op(c, OP_SET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u8(c, c->strict ? 1 : 0);
                 return true;
             } else {
                 uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
                 emit_op(c, OP_DUP);
-                emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx);
+                emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx);
                 if (is_logical) {
                     emit_op(c, OP_DUP);
                     uint32_t j_skip = emit_jump(c, log_jmp);
                     emit_op(c, OP_POP);
                     if (!compile_expr(c, rhs)) return false;
-                    emit_op(c, OP_SET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
+                    emit_op(c, OP_SET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
                     uint32_t j_end = emit_jump(c, OP_JMP);
                     patch_jump(c, j_skip);
                     emit_op(c, OP_NIP);
@@ -1776,7 +2019,7 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
                 }
                 if (!compile_expr(c, rhs)) return false;
                 emit_op(c, token_to_bin_op(op));
-                emit_op(c, OP_SET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
+                emit_op(c, OP_SET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx); emit_u8(c, c->strict ? 1 : 0);
                 return true;
             }
         }
@@ -1807,19 +2050,20 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
         }
 
         if (prop->kind == AST_PRIV_IDENT) {
-            uint16_t d = 0, s = 0;
+            uint16_t d = 0;
+            uint32_t s = 0;
             if (!resolve_binding(c, prop->u.ident.u16, prop->u.ident.len, true, &d, &s, NULL)) {
                 comp_error(c, prop->line, prop->col, "Unresolved private identifier");
                 return false;
             }
             emit_op(c, OP_DUP);
-            emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+            emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
             if (is_logical) {
                 emit_op(c, OP_DUP);
                 uint32_t j_skip = emit_jump(c, log_jmp);
                 emit_op(c, OP_POP);
                 if (!compile_expr(c, rhs)) return false;
-                emit_op(c, OP_SET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+                emit_op(c, OP_SET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
                 uint32_t j_end = emit_jump(c, OP_JMP);
                 patch_jump(c, j_skip);
                 emit_op(c, OP_NIP);
@@ -1828,7 +2072,7 @@ static bool compile_assign_expr(AjsCompiler *c, AjsAstNode *n) {
             }
             if (!compile_expr(c, rhs)) return false;
             emit_op(c, token_to_bin_op(op));
-            emit_op(c, OP_SET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+            emit_op(c, OP_SET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
             return true;
         }
 
@@ -1915,22 +2159,20 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
             emit_load_ident(c, n->u.ident.u16, n->u.ident.len, false);
             return true;
         case AST_THIS_EXPR: {
-            uint16_t sp_d = 0, this_s = 0xFFFF;
-            if (resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, NULL) && this_s != 0xFFFF) {
-                emit_op(c, OP_GET_LEX);
-                emit_u16(c, sp_d);
-                emit_u16(c, this_s);
+            uint16_t sp_d = 0;
+            uint32_t this_s = AJS_NO_SLOT;
+            if (resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, NULL) && this_s != AJS_NO_SLOT) {
+                emit_get_lex(c, sp_d, this_s);
             } else {
                 emit_op(c, OP_THIS);
             }
             return true;
         }
         case AST_NEW_TARGET: {
-            uint16_t sp_d = 0, nt_s = 0xFFFF;
-            if (resolve_special_fn_slots(c, &sp_d, NULL, &nt_s, NULL, NULL) && nt_s != 0xFFFF) {
-                emit_op(c, OP_GET_LEX);
-                emit_u16(c, sp_d);
-                emit_u16(c, nt_s);
+            uint16_t sp_d = 0;
+            uint32_t nt_s = AJS_NO_SLOT;
+            if (resolve_special_fn_slots(c, &sp_d, NULL, &nt_s, NULL, NULL) && nt_s != AJS_NO_SLOT) {
+                emit_get_lex(c, sp_d, nt_s);
             } else {
                 emit_op(c, OP_NEW_TARGET);
             }
@@ -2100,18 +2342,19 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
             bool is_method = (!tag->parenthesized && tag->kind == AST_MEMBER_EXPR);
             if (is_method) {
                 if (tag->u.member.object && tag->u.member.object->kind == AST_SUPER_EXPR) {
-                    uint16_t sp_d = 0, this_s = 0xFFFF, fn_s = 0xFFFF;
+                    uint16_t sp_d = 0;
+                    uint32_t this_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
                     resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, &fn_s);
-                    uint16_t fn_arg = (fn_s != 0xFFFF) ? fn_s : (sp_d == c->cur_env_depth ? 0xFFFF : fn_s);
-                    if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); }
+                    uint32_t fn_arg = (fn_s != AJS_NO_SLOT) ? fn_s : (sp_d == c->cur_env_depth ? AJS_NO_SLOT : fn_s);
+                    if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); }
                     else { emit_op(c, OP_THIS); }
                     emit_op(c, OP_DUP);
                     if (tag->u.member.computed) {
                         if (!compile_expr(c, tag->u.member.property)) return false;
-                        emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg);
+                        emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg);
                     } else {
                         uint32_t nidx = add_str_u16(c, tag->u.member.property->u.ident.u16, tag->u.member.property->u.ident.len);
-                        emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx);
+                        emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx);
                     }
                 } else {
                     if (!compile_expr(c, tag->u.member.object)) return false;
@@ -2120,9 +2363,10 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
                         if (!compile_expr(c, tag->u.member.property)) return false;
                         emit_op(c, OP_GET_ELEM);
                     } else if (tag->u.member.property->kind == AST_PRIV_IDENT) {
-                        uint16_t d = 0, s = 0;
+                        uint16_t d = 0;
+                        uint32_t s = 0;
                         resolve_binding(c, tag->u.member.property->u.ident.u16, tag->u.member.property->u.ident.len, true, &d, &s, NULL);
-                        emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+                        emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
                     } else {
                         uint32_t nidx = add_str_u16(c, tag->u.member.property->u.ident.u16, tag->u.member.property->u.ident.len);
                         emit_op(c, OP_GET_PROP); emit_u32(c, nidx);
@@ -2155,17 +2399,18 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
             AjsAstNode *obj = n->u.member.object;
             AjsAstNode *prop = n->u.member.property;
             if (obj && obj->kind == AST_SUPER_EXPR) {
-                uint16_t sp_d = 0, this_s = 0xFFFF, fn_s = 0xFFFF;
+                uint16_t sp_d = 0;
+                uint32_t this_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
                 resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, &fn_s);
-                uint16_t fn_arg = (fn_s != 0xFFFF) ? fn_s : (sp_d == c->cur_env_depth ? 0xFFFF : fn_s);
-                if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); }
+                uint32_t fn_arg = (fn_s != AJS_NO_SLOT) ? fn_s : (sp_d == c->cur_env_depth ? AJS_NO_SLOT : fn_s);
+                if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); }
                 else { emit_op(c, OP_THIS); }
                 if (n->u.member.computed) {
                     if (!compile_expr(c, prop)) return false;
-                    emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg);
+                    emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg);
                 } else {
                     uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
-                    emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx);
+                    emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx);
                 }
                 return true;
             }
@@ -2174,12 +2419,13 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
                 if (!compile_expr(c, prop)) return false;
                 emit_op(c, OP_GET_ELEM);
             } else if (prop->kind == AST_PRIV_IDENT) {
-                uint16_t d = 0, s = 0;
+                uint16_t d = 0;
+                uint32_t s = 0;
                 if (!resolve_binding(c, prop->u.ident.u16, prop->u.ident.len, true, &d, &s, NULL)) {
                     comp_error(c, prop->line, prop->col, "Unresolved private identifier");
                     return false;
                 }
-                emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+                emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
             } else {
                 uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
                 emit_op(c, OP_GET_PROP); emit_u32(c, nidx);
@@ -2191,7 +2437,8 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
             AjsAstNode *cal = n->u.call.callee;
             /* Super constructor call: `super(...args)` */
             if (cal && cal->kind == AST_SUPER_EXPR) {
-                uint16_t sp_d = 0, this_s = 0xFFFF, nt_s = 0xFFFF, fn_s = 0xFFFF;
+                uint16_t sp_d = 0;
+                uint32_t this_s = AJS_NO_SLOT, nt_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
                 resolve_special_fn_slots(c, &sp_d, &this_s, &nt_s, NULL, &fn_s);
                 emit_op(c, OP_NEW_ARRAY);
                 emit_u32(c, n->u.call.args.count);
@@ -2207,9 +2454,9 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
                 }
                 emit_op(c, OP_SUPER_CALL);
                 emit_u16(c, sp_d);
-                emit_u16(c, this_s);
-                emit_u16(c, nt_s);
-                emit_u16(c, fn_s);
+                emit_u32(c, this_s);
+                emit_u32(c, nt_s);
+                emit_u32(c, fn_s);
                 return true;
             }
 
@@ -2237,18 +2484,19 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
                 AjsAstNode *obj = cal->u.member.object;
                 AjsAstNode *prop = cal->u.member.property;
                 if (obj && obj->kind == AST_SUPER_EXPR) {
-                    uint16_t sp_d = 0, this_s = 0xFFFF, fn_s = 0xFFFF;
+                    uint16_t sp_d = 0;
+                    uint32_t this_s = AJS_NO_SLOT, fn_s = AJS_NO_SLOT;
                     resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, &fn_s);
-                    uint16_t fn_arg = (fn_s != 0xFFFF) ? fn_s : (sp_d == c->cur_env_depth ? 0xFFFF : fn_s);
-                    if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); }
+                    uint32_t fn_arg = (fn_s != AJS_NO_SLOT) ? fn_s : (sp_d == c->cur_env_depth ? AJS_NO_SLOT : fn_s);
+                    if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); }
                     else { emit_op(c, OP_THIS); }
                     emit_op(c, OP_DUP);
                     if (cal->u.member.computed) {
                         if (!compile_expr(c, prop)) return false;
-                        emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u16(c, fn_arg);
+                        emit_op(c, OP_GET_SUPER_ELEM); emit_u16(c, sp_d); emit_u32(c, fn_arg);
                     } else {
                         uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
-                        emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u16(c, fn_arg); emit_u32(c, nidx);
+                        emit_op(c, OP_GET_SUPER_PROP); emit_u16(c, sp_d); emit_u32(c, fn_arg); emit_u32(c, nidx);
                     }
                 } else {
                     if (!compile_expr(c, obj)) return false;
@@ -2257,12 +2505,13 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
                         if (!compile_expr(c, prop)) return false;
                         emit_op(c, OP_GET_ELEM);
                     } else if (prop->kind == AST_PRIV_IDENT) {
-                        uint16_t d = 0, s = 0;
+                        uint16_t d = 0;
+                        uint32_t s = 0;
                         if (!resolve_binding(c, prop->u.ident.u16, prop->u.ident.len, true, &d, &s, NULL)) {
                             comp_error(c, prop->line, prop->col, "Unresolved private identifier");
                             return false;
                         }
-                        emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u16(c, s);
+                        emit_op(c, OP_GET_PRIVATE); emit_u16(c, d); emit_u32(c, s);
                     } else {
                         uint32_t nidx = add_str_u16(c, prop->u.ident.u16, prop->u.ident.len);
                         emit_op(c, OP_GET_PROP); emit_u32(c, nidx);
@@ -2339,9 +2588,10 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
                     if (!arg->parenthesized && arg->kind == AST_MEMBER_EXPR) {
                         if (arg->u.member.object && arg->u.member.object->kind == AST_SUPER_EXPR) {
                             /* ECMA-262 §13.5.1.2: `delete super.prop` ALWAYS throws ReferenceError (after evaluating key if computed)! */
-                            uint16_t sp_d = 0, this_s = 0xFFFF;
+                            uint16_t sp_d = 0;
+                            uint32_t this_s = AJS_NO_SLOT;
                             resolve_special_fn_slots(c, &sp_d, &this_s, NULL, NULL, NULL);
-                            if (this_s != 0xFFFF) { emit_op(c, OP_GET_LEX); emit_u16(c, sp_d); emit_u16(c, this_s); emit_op(c, OP_POP); }
+                            if (this_s != AJS_NO_SLOT) { emit_get_lex(c, sp_d, this_s); emit_op(c, OP_POP); }
                             if (arg->u.member.computed) {
                                 if (!compile_expr(c, arg->u.member.property)) return false;
                                 emit_op(c, OP_TO_PROP_KEY);
@@ -2366,7 +2616,8 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
                         return true;
                     }
                     if (!arg->parenthesized && arg->kind == AST_IDENT) {
-                        uint16_t d = 0, s = 0;
+                        uint16_t d = 0;
+                        uint32_t s = 0;
                         if (c->with_depth == 0 && !c->has_eval_or_with &&
                             resolve_binding(c, arg->u.ident.u16, arg->u.ident.len, false, &d, &s, NULL)) {
                             emit_op(c, OP_FALSE);
@@ -2415,14 +2666,15 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
             if (n->u.binary.op == KW_IN && n->u.binary.left && n->u.binary.left->kind == AST_PRIV_IDENT) {
                 /* Ergonomic brand check: `#priv in expr` */
                 if (!compile_expr(c, n->u.binary.right)) return false;
-                uint16_t d = 0, s = 0;
+                uint16_t d = 0;
+                uint32_t s = 0;
                 if (!resolve_binding(c, n->u.binary.left->u.ident.u16, n->u.binary.left->u.ident.len, true, &d, &s, NULL)) {
                     comp_error(c, n->line, n->col, "Unresolved private identifier");
                     return false;
                 }
                 emit_op(c, OP_IN_PRIVATE);
                 emit_u16(c, d);
-                emit_u16(c, s);
+                emit_u32(c, s);
                 return true;
             }
             if (!compile_expr(c, n->u.binary.left)) return false;
@@ -2495,14 +2747,30 @@ static bool compile_expr(AjsCompiler *c, AjsAstNode *n) {
  * 7. Function & Class Compilation
  * ============================================================================ */
 
+static void attach_lazy_source(AjsCompiler *c, AjsBytecode *bc, const char *slice_utf8, size_t slice_len) {
+    if (!slice_utf8 || slice_len == 0) return;
+    if (c->src_buf && c->src_base && slice_utf8 >= c->src_base) {
+        size_t off = (size_t)(slice_utf8 - c->src_base);
+        if (off + slice_len <= c->src_buf->len && off <= UINT32_MAX && slice_len <= UINT32_MAX) {
+            bc->source_buf = ajs_source_buf_retain(c->src_buf);
+            bc->src_offset = (uint32_t)off;
+            bc->src_len = (uint32_t)slice_len;
+            return;
+        }
+    }
+    bc->source_text = ajs_str_from_utf8(c->vm, slice_utf8, slice_len, false);
+}
+
 static void init_compiler(AjsCompiler *c, AjsVm *vm, AjsRealm *realm, AjsCompiler *enclosing,
                           AjsFuncKind fn_kind, bool strict, const char *url_cstr) {
     memset(c, 0, sizeof(*c));
     c->vm = vm;
     c->realm = realm;
     c->enclosing = enclosing;
+    c->src_base = enclosing ? enclosing->src_base : NULL;
+    c->src_buf = enclosing ? enclosing->src_buf : NULL;
     c->strict = strict;
-    c->eval_ret_slot = 0xFFFF;
+    c->eval_ret_slot = AJS_NO_SLOT;
     c->scope = &c->base_scope;
     c->base_scope.is_base = true;
     c->base_scope.has_runtime_env = true;
@@ -2514,21 +2782,31 @@ static void init_compiler(AjsCompiler *c, AjsVm *vm, AjsRealm *realm, AjsCompile
 
     bc->fn_kind = fn_kind;
     bc->strict = strict;
-    bc->this_slot = 0xFFFF;
-    bc->new_target_slot = 0xFFFF;
-    bc->arguments_slot = 0xFFFF;
-    bc->active_fn_slot = 0xFFFF;
-    bc->source_url = ajs_str_from_cstr(vm, url_cstr ? url_cstr : "<script>", true);
+    bc->this_slot = AJS_NO_SLOT;
+    bc->new_target_slot = AJS_NO_SLOT;
+    bc->arguments_slot = AJS_NO_SLOT;
+    bc->active_fn_slot = AJS_NO_SLOT;
+    bc->source_url = (enclosing && enclosing->bc && enclosing->bc->source_url)
+                         ? enclosing->bc->source_url
+                         : ajs_str_from_cstr(vm, url_cstr ? url_cstr : "<script>", true);
+}
+
+static void cleanup_compiler(AjsCompiler *c) {
+    comp_scope_cleanup(&c->base_scope);
+    free(c->const_hash);
+    c->const_hash = NULL;
+    c->const_hash_cap = 0;
 }
 
 static void finalize_base_scope_metadata(AjsCompiler *c) {
     AjsBytecode *bc = c->bc;
-    uint16_t cnt = c->base_scope.slot_count;
+    uint32_t cnt = c->base_scope.slot_count;
     bc->env_slot_count = cnt;
     if (cnt > 0) {
+        bool need_names = c->has_eval_or_with || bc->is_module || bc->is_eval;
         bc->env_slot_flags = (uint8_t *)calloc(cnt, sizeof(uint8_t));
-        bc->env_slot_names = (AjsString **)calloc(cnt, sizeof(AjsString *));
-        for (uint16_t i = 0; i < cnt; i++) {
+        bc->env_slot_names = need_names ? (AjsString **)calloc(cnt, sizeof(AjsString *)) : NULL;
+        for (uint32_t i = 0; i < cnt; i++) {
             AjsCompLocal *loc = &c->base_scope.locals[i];
             uint8_t fl = 0;
             if (loc->kind == BIND_CONST || loc->kind == BIND_IMPORT) {
@@ -2539,11 +2817,22 @@ static void finalize_base_scope_metadata(AjsCompiler *c) {
                 fl |= AJS_SLOT_FUNC_NAME;
             }
             bc->env_slot_flags[i] = fl;
-            bc->env_slot_names[i] = loc->str;
+            if (need_names) bc->env_slot_names[i] = loc->str;
         }
     }
-    free(c->base_scope.locals);
-    c->base_scope.locals = NULL;
+    if (bc->code_len > 0 && bc->code_cap > bc->code_len + 32u) {
+        uint8_t *nc = (uint8_t *)realloc(bc->code, bc->code_len);
+        if (nc) { bc->code = nc; bc->code_cap = bc->code_len; }
+    }
+    if (bc->const_count > 0 && bc->const_cap > bc->const_count + 8u) {
+        AjsValue *nk = (AjsValue *)realloc(bc->consts, (size_t)bc->const_count * sizeof(AjsValue));
+        if (nk) { bc->consts = nk; bc->const_cap = bc->const_count; }
+    }
+    if (bc->line_count > 0 && bc->line_cap > bc->line_count + 8u) {
+        AjsLineSpan *nl = (AjsLineSpan *)realloc(bc->lines, (size_t)bc->line_count * sizeof(AjsLineSpan));
+        if (nl) { bc->lines = nl; bc->line_cap = bc->line_count; }
+    }
+    cleanup_compiler(c);
 }
 
 static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
@@ -2570,7 +2859,7 @@ static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
         bc->name = vm->str_empty;
     }
     if (fn_node->u.func.src_utf8 && fn_node->u.func.src_len > 0) {
-        bc->source_text = ajs_str_from_utf8(vm, fn_node->u.func.src_utf8, fn_node->u.func.src_len, false);
+        attach_lazy_source(&fc, bc, fn_node->u.func.src_utf8, fn_node->u.func.src_len);
     }
 
     /* Scan function AST for nested arrows, `super`, `eval`/`with`, and `arguments` */
@@ -2586,10 +2875,10 @@ static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
     bc->needs_arguments = !is_arrow && scan.uses_arguments;
 
     /* Compute Function.length (arity up to first default or rest parameter) */
-    uint16_t arity = 0;
+    uint32_t arity = 0;
     bool seen_opt_or_rest = false;
-    uint16_t raw_param_count = (uint16_t)fn_node->u.func.params.count;
-    for (uint16_t i = 0; i < raw_param_count; i++) {
+    uint32_t raw_param_count = fn_node->u.func.params.count;
+    for (uint32_t i = 0; i < raw_param_count; i++) {
         AjsAstNode *p = fn_node->u.func.params.items[i];
         if (!p) continue;
         if (p->kind == AST_REST_ELEMENT) {
@@ -2604,7 +2893,6 @@ static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
     bc->arity = arity;
     bc->param_count = raw_param_count;
 
-    /* Allocate hidden lexical slots when non-arrow function needs lexical capture for arrows/super/derived ctor */
     if (!is_arrow && (is_derived_ctor || scan.has_arrow_or_super)) {
         bc->this_slot = comp_scope_add(&fc, &fc.base_scope, NULL, 0, is_derived_ctor ? BIND_LET : BIND_VAR, false);
         bc->new_target_slot = comp_scope_add(&fc, &fc.base_scope, NULL, 0, BIND_VAR, false);
@@ -2614,15 +2902,12 @@ static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
         }
     }
 
-    /* Named FunctionExpression inner self-binding (lower priority than params/vars/lexicals) */
     if (fn_node->kind == AST_FUNC_EXPR && fn_node->u.func.name_u16) {
         comp_scope_add(&fc, &fc.base_scope, fn_node->u.func.name_u16, fn_node->u.func.name_len, BIND_FUNC_NAME, false);
     }
 
-    /* Register parameter bindings in base_scope */
-    for (uint16_t i = 0; i < raw_param_count; i++) {
+    for (uint32_t i = 0; i < raw_param_count; i++) {
         AjsAstNode *p = fn_node->u.func.params.items[i];
-        /* Note: in sloppy mode duplicate simple params `function(a, a)`, reuse same slot */
         if (p && p->kind == AST_IDENT) {
             int32_t ex = comp_scope_find_own(&fc.base_scope, p->u.ident.u16, p->u.ident.len, false);
             if (ex >= 0 && fc.base_scope.locals[ex].kind != BIND_FUNC_NAME) {
@@ -2638,16 +2923,14 @@ static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
         }
     }
 
-    /* Sloppy mapped `arguments` slot mapping (when !strict && has_simple_params && needs_arguments) */
     if (!strict && bc->has_simple_params && bc->needs_arguments && raw_param_count > 0) {
-        bc->mapped_param_slots = (uint16_t *)malloc(raw_param_count * sizeof(uint16_t));
-        for (uint16_t i = 0; i < raw_param_count; i++) {
-            bc->mapped_param_slots[i] = UINT16_MAX;
+        bc->mapped_param_slots = (uint32_t *)malloc((size_t)raw_param_count * sizeof(uint32_t));
+        for (uint32_t i = 0; i < raw_param_count; i++) {
+            bc->mapped_param_slots[i] = AJS_NO_SLOT;
             AjsAstNode *p = fn_node->u.func.params.items[i];
             if (p && p->kind == AST_IDENT) {
-                /* Only the LAST occurrence of a duplicate parameter name is mapped! */
                 bool dup_later = false;
-                for (uint16_t j = (uint16_t)(i + 1u); j < raw_param_count; j++) {
+                for (uint32_t j = i + 1u; j < raw_param_count; j++) {
                     AjsAstNode *p2 = fn_node->u.func.params.items[j];
                     if (p2 && p2->kind == AST_IDENT &&
                         c_u16_eq(p->u.ident.u16, p->u.ident.len, p2->u.ident.u16, p2->u.ident.len)) {
@@ -2663,7 +2946,6 @@ static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
         }
     }
 
-    /* Hoist body `var` and top-level lexical declarations */
     if (!fn_node->u.func.expr_body && fn_node->u.func.body && fn_node->u.func.body->kind == AST_BLOCK) {
         AjsNodeList *bstmts = &fn_node->u.func.body->u.block.stmts;
         for (uint32_t i = 0; i < bstmts->count; i++) {
@@ -2672,22 +2954,7 @@ static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
         collect_block_lex_in_list(&fc, &fc.base_scope, bstmts, false);
     }
 
-    /* Note: `ajs_frame_new` places incoming positional arguments + rest array onto `frame->stack[0..raw_param_count-1]`
-     * in reverse or forward order? Even simpler! Let `ajs_frame_new` push `arg[raw_param_count - 1] ... arg[0]` onto
-     * `frame->stack` (with `arg[0]` at the TOP of stack, and for `AST_REST_ELEMENT` at `raw_param_count - 1`, `ajs_frame_new`
-     * packs trailing arguments into a fresh `Array`!).
-     * Let's verify that!!
-     * If `ajs_frame_new` pushes incoming arguments in reverse order onto `frame->stack` so `arg[0]` is on TOP of stack
-     * (and if the last param is `AST_REST_ELEMENT`, `bc->has_rest_param` or we just read `arguments`? Wait: in arrow functions
-     * `(...args) => args`, `arguments` doesn't exist in JS, so having `ajs_frame_new` pack trailing args or having an
-     * instruction? Let's check: if `p->kind == AST_REST_ELEMENT` at index `k`, can `ajs_frame_new` know?
-     * Wait: we didn't put `has_rest_param` in `AjsBytecode` yet, OR even simpler: `ajs_frame_new` pushes `arg[0..raw_param_count-1]`
-     * EXCEPT for rest param! Wait: let's check `ajs_internal.h` — adding `bool has_rest_param;` to `struct AjsBytecode` is 1 line,
-     * and then `ajs_frame_new` handles BOTH simple params, default params, destructured params, AND `...rest` in arrow/normal/method/ctor
-     * functions in 10 lines of C!). */
-
-    /* Emit parameter initialization from stack top (`arg[0]` at top, down to `arg[raw_param_count - 1]`) */
-    for (uint16_t i = 0; i < raw_param_count; i++) {
+    for (uint32_t i = 0; i < raw_param_count; i++) {
         AjsAstNode *p = fn_node->u.func.params.items[i];
         if (p && p->kind == AST_REST_ELEMENT) {
             if (!compile_pattern_assign(&fc, p->u.expr_stmt.expr, true, AJS_VAR_LET)) goto fail;
@@ -2696,32 +2963,36 @@ static AjsBytecode *compile_func_node(AjsCompiler *parent, AjsAstNode *fn_node,
         }
     }
 
-    /* Base class constructor: run `<instance_init>` (instance fields & private methods) right at entry! */
     if (fk == AJS_FN_BC_CLASS_CTOR && !is_derived_ctor) {
         emit_op(&fc, OP_RUN_INST_INIT);
     }
 
-    /* Generator / AsyncGenerator: suspend at `AJS_GEN_SUSPENDED_START` AFTER parameter defaults run! */
     if (fk == AJS_FN_BC_GENERATOR || fk == AJS_FN_BC_ASYNC_GENERATOR) {
         emit_op(&fc, OP_UNDEF);
         emit_op(&fc, OP_YIELD);
         emit_op(&fc, OP_POP);
     }
 
-    /* Compile function body */
     if (fn_node->u.func.expr_body) {
         if (!compile_expr(&fc, fn_node->u.func.body)) goto fail;
         emit_op(&fc, OP_RETURN);
     } else if (fn_node->u.func.body && fn_node->u.func.body->kind == AST_BLOCK) {
         AjsNodeList *bstmts = &fn_node->u.func.body->u.block.stmts;
         if (!instantiate_hoisted_funcs(&fc, &fc.base_scope, bstmts, false)) goto fail;
+        uint32_t fn_disp_fin = UINT32_MAX;
+        if (fc.base_scope.has_disp_stack) {
+            fn_disp_fin = emit_dispose_enter(&fc, 0, fc.base_scope.disp_slot);
+        }
         for (uint32_t i = 0; i < bstmts->count; i++) {
             if (!compile_stmt(&fc, bstmts->items[i])) goto fail;
+        }
+        if (fc.base_scope.has_disp_stack) {
+            emit_dispose_finally(&fc, 0, fc.base_scope.disp_slot, fn_disp_fin);
         }
         emit_op(&fc, OP_UNDEF);
         if (is_derived_ctor) {
             emit_op(&fc, OP_RETURN_DERIVED);
-            emit_u16(&fc, bc->this_slot);
+            emit_u32(&fc, bc->this_slot);
         } else {
             emit_op(&fc, OP_RETURN);
         }
@@ -2738,13 +3009,13 @@ fail:
         parent->err_line = fc.err_line;
         parent->err_col = fc.err_col;
     }
-    free(fc.base_scope.locals);
+    cleanup_compiler(&fc);
     ajs_temp_root_restore(vm, root_save);
     return NULL;
 }
 
 /* Synthesize `<instance_init>` bytecode for class instance private methods/accessors + instance fields */
-static AjsBytecode *compile_class_instance_init(AjsCompiler *c, AjsAstNode *kl, const uint16_t *comp_key_slots) {
+static AjsBytecode *compile_class_instance_init(AjsCompiler *c, AjsAstNode *kl, const uint32_t *comp_key_slots) {
     bool needed = false;
     for (uint32_t i = 0; i < kl->u.klass.elements.count; i++) {
         AjsAstNode *el = kl->u.klass.elements.items[i];
@@ -2786,7 +3057,8 @@ static AjsBytecode *compile_class_instance_init(AjsCompiler *c, AjsAstNode *kl, 
         if (el->u.prop.computed) comp_idx++;
         if (el->u.prop.is_static || !el->u.prop.is_private || el->u.prop.kind == AJS_PROP_FIELD) continue;
 
-        uint16_t d = 0, s = 0;
+        uint16_t d = 0;
+        uint32_t s = 0;
         resolve_binding(&ic, el->u.prop.key->u.ident.u16, el->u.prop.key->u.ident.len, true, &d, &s, NULL);
 
         AjsBytecode *mbc = compile_func_node(&ic, el->u.prop.value, el->u.prop.key->u.ident.utf8, false);
@@ -2794,17 +3066,13 @@ static AjsBytecode *compile_class_instance_init(AjsCompiler *c, AjsAstNode *kl, 
         uint32_t bc_idx = add_const(&ic, ajs_val_from_gc(mbc));
 
         emit_op(&ic, OP_THIS);
-        /* Set [[HomeObject]] of instance private method to constructor's home_object (`proto`):
-         * In `<instance_init>`, `<instance_init>` itself has `home_object = proto`!
-         * Better yet, `OP_CLOSURE` + `OP_DEF_PRIVATE`! And for `super.prop` inside private method,
-         * `OP_DEF_PRIVATE` can copy `frame->func_obj->u.fn.home_object` onto `fn` if `home_object == undefined`! */
         emit_op(&ic, OP_CLOSURE);
         emit_u32(&ic, bc_idx);
         uint8_t pk = (el->u.prop.kind == AJS_PROP_METHOD) ? 2 :
                      ((el->u.prop.kind == AJS_PROP_GET) ? 3 : 4); /* 2=method, 3=getter, 4=setter */
         emit_op(&ic, OP_DEF_PRIVATE);
         emit_u16(&ic, d);
-        emit_u16(&ic, s);
+        emit_u32(&ic, s);
         emit_u8(&ic, pk);
         emit_op(&ic, OP_POP);
     }
@@ -2814,12 +3082,13 @@ static AjsBytecode *compile_class_instance_init(AjsCompiler *c, AjsAstNode *kl, 
     for (uint32_t i = 0; i < kl->u.klass.elements.count; i++) {
         AjsAstNode *el = kl->u.klass.elements.items[i];
         if (!el) continue;
-        uint16_t ck_slot = el->u.prop.computed ? comp_key_slots[comp_idx++] : 0xFFFF;
+        uint32_t ck_slot = el->u.prop.computed ? comp_key_slots[comp_idx++] : AJS_NO_SLOT;
         if (el->u.prop.is_static || el->u.prop.kind != AJS_PROP_FIELD) continue;
 
         emit_op(&ic, OP_THIS);
         if (el->u.prop.is_private) {
-            uint16_t d = 0, s = 0;
+            uint16_t d = 0;
+            uint32_t s = 0;
             resolve_binding(&ic, el->u.prop.key->u.ident.u16, el->u.prop.key->u.ident.len, true, &d, &s, NULL);
             if (el->u.prop.value) {
                 if (!compile_expr(&ic, el->u.prop.value)) goto fail;
@@ -2833,14 +3102,12 @@ static AjsBytecode *compile_class_instance_init(AjsCompiler *c, AjsAstNode *kl, 
             }
             emit_op(&ic, OP_DEF_PRIVATE);
             emit_u16(&ic, d);
-            emit_u16(&ic, s);
+            emit_u32(&ic, s);
             emit_u8(&ic, 1); /* 1 = private field */
             emit_op(&ic, OP_POP);
         } else if (el->u.prop.computed) {
             /* Read pre-evaluated computed key from enclosing class scope (depth = 1)! */
-            emit_op(&ic, OP_GET_LEX);
-            emit_u16(&ic, 1);
-            emit_u16(&ic, ck_slot);
+            emit_get_lex(&ic, 1, ck_slot);
             if (el->u.prop.value) {
                 if (!compile_expr(&ic, el->u.prop.value)) goto fail;
                 if (is_anon_fn_or_class_def(el->u.prop.value)) {
@@ -2854,7 +3121,7 @@ static AjsBytecode *compile_class_instance_init(AjsCompiler *c, AjsAstNode *kl, 
                 emit_op(&ic, OP_UNDEF);
             }
             emit_op(&ic, OP_DEFINE_ELEM);
-            emit_u8(&ic, 0); /* 0 = writable, enumerable, configurable own data property (`[[DefineOwnProperty]]`!) */
+            emit_u8(&ic, 0);
             emit_op(&ic, OP_POP);
         } else {
             uint32_t kidx = 0;
@@ -2895,7 +3162,7 @@ fail:
         c->err_line = ic.err_line;
         c->err_col = ic.err_col;
     }
-    free(ic.base_scope.locals);
+    cleanup_compiler(&ic);
     ajs_temp_root_restore(vm, rs);
     return NULL;
 }
@@ -2911,7 +3178,7 @@ static AjsBytecode *compile_default_class_ctor(AjsCompiler *c, AjsAstNode *kl, c
     cc.bc->has_simple_params = true;
     cc.bc->name = ajs_str_from_cstr(vm, cls_name ? cls_name : "", true);
     if (kl->u.klass.src_utf8 && kl->u.klass.src_len > 0) {
-        cc.bc->source_text = ajs_str_from_utf8(vm, kl->u.klass.src_utf8, kl->u.klass.src_len, false);
+        attach_lazy_source(&cc, cc.bc, kl->u.klass.src_utf8, kl->u.klass.src_len);
     }
 
     if (has_super) {
@@ -2924,17 +3191,15 @@ static AjsBytecode *compile_default_class_ctor(AjsCompiler *c, AjsAstNode *kl, c
 
         emit_op(&cc, OP_NEW_ARRAY);
         emit_u32(&cc, 0);
-        emit_op(&cc, OP_GET_LEX);
-        emit_u16(&cc, 0);
-        emit_u16(&cc, cc.bc->arguments_slot);
+        emit_get_lex(&cc, 0, cc.bc->arguments_slot);
         emit_op(&cc, OP_ARRAY_SPREAD);
         emit_op(&cc, OP_SUPER_CALL);
         emit_u16(&cc, 0);
-        emit_u16(&cc, cc.bc->this_slot);
-        emit_u16(&cc, cc.bc->new_target_slot);
-        emit_u16(&cc, cc.bc->active_fn_slot);
+        emit_u32(&cc, cc.bc->this_slot);
+        emit_u32(&cc, cc.bc->new_target_slot);
+        emit_u32(&cc, cc.bc->active_fn_slot);
         emit_op(&cc, OP_RETURN_DERIVED);
-        emit_u16(&cc, cc.bc->this_slot);
+        emit_u32(&cc, cc.bc->this_slot);
     } else {
         emit_op(&cc, OP_RUN_INST_INIT);
         emit_op(&cc, OP_UNDEF);
@@ -2959,7 +3224,7 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
     cls_sc.parent = c->scope;
     cls_sc.has_runtime_env = true;
 
-    uint16_t self_name_slot = 0xFFFF;
+    uint32_t self_name_slot = AJS_NO_SLOT;
     AjsString *cls_name_str = NULL;
     if (kl->u.klass.name_u16) {
         cls_name_str = ajs_str_from_utf16(c->vm, kl->u.klass.name_u16, kl->u.klass.name_len, true);
@@ -2970,7 +3235,6 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
         cls_name_str = c->vm->str_empty;
     }
 
-    /* Collect unique private names and count computed property keys */
     uint32_t comp_count = 0;
     for (uint32_t i = 0; i < kl->u.klass.elements.count; i++) {
         AjsAstNode *el = kl->u.klass.elements.items[i];
@@ -2984,36 +3248,30 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
         }
     }
 
-    uint16_t *comp_key_slots = comp_count ? (uint16_t *)malloc(comp_count * sizeof(uint16_t)) : NULL;
+    uint32_t *comp_key_slots = comp_count ? (uint32_t *)malloc(comp_count * sizeof(uint32_t)) : NULL;
     for (uint32_t i = 0; i < comp_count; i++) {
         comp_key_slots[i] = comp_scope_add(c, &cls_sc, NULL, 0, BIND_VAR, false);
     }
-    uint16_t ctor_tmp_slot = comp_scope_add(c, &cls_sc, NULL, 0, BIND_VAR, false);
-    uint16_t proto_tmp_slot = comp_scope_add(c, &cls_sc, NULL, 0, BIND_VAR, false);
+    uint32_t ctor_tmp_slot = comp_scope_add(c, &cls_sc, NULL, 0, BIND_VAR, false);
+    uint32_t proto_tmp_slot = comp_scope_add(c, &cls_sc, NULL, 0, BIND_VAR, false);
 
     c->cur_env_depth++;
     cls_sc.env_depth_idx = c->cur_env_depth;
     c->scope = &cls_sc;
 
-    uint16_t ed_idx = build_env_desc(c, &cls_sc);
-    emit_op(c, OP_PUSH_ENV);
-    emit_u16(c, cls_sc.slot_count);
-    emit_u16(c, ed_idx);
+    uint32_t ed_idx = build_env_desc(c, &cls_sc);
+    emit_push_env(c, cls_sc.slot_count, ed_idx);
 
-    /* Instantiate fresh private brand symbols for this class evaluation */
-    for (uint16_t i = 0; i < cls_sc.slot_count; i++) {
+    for (uint32_t i = 0; i < cls_sc.slot_count; i++) {
         if (cls_sc.locals[i].is_priv) {
             uint32_t d_idx = add_const(c, ajs_val_from_gc(cls_sc.locals[i].str));
             emit_op(c, OP_NEW_PRIV_SYM);
             emit_u32(c, d_idx);
-            emit_op(c, OP_INIT_LEX);
-            emit_u16(c, 0);
-            emit_u16(c, cls_sc.locals[i].slot);
+            emit_init_lex(c, 0, cls_sc.locals[i].slot);
             emit_op(c, OP_POP);
         }
     }
 
-    /* Evaluate `extends` expression if present */
     bool has_super = (kl->u.klass.super_expr != NULL);
     if (has_super) {
         if (!compile_expr(c, kl->u.klass.super_expr)) goto fail;
@@ -3021,21 +3279,17 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
         emit_op(c, OP_UNDEF);
     }
 
-    /* Evaluate computed property keys in source order BEFORE constructing methods/fields! */
     uint32_t c_idx = 0;
     for (uint32_t i = 0; i < kl->u.klass.elements.count; i++) {
         AjsAstNode *el = kl->u.klass.elements.items[i];
         if (el && el->u.prop.computed) {
             if (!compile_expr(c, el->u.prop.key)) goto fail;
             emit_op(c, OP_TO_PROP_KEY);
-            emit_op(c, OP_INIT_LEX);
-            emit_u16(c, 0);
-            emit_u16(c, comp_key_slots[c_idx++]);
+            emit_init_lex(c, 0, comp_key_slots[c_idx++]);
             emit_op(c, OP_POP);
         }
     }
 
-    /* Compile constructor (explicit or default) + `<instance_init>` */
     AjsAstNode *ctor_elem = NULL;
     for (uint32_t i = 0; i < kl->u.klass.elements.count; i++) {
         AjsAstNode *el = kl->u.klass.elements.items[i];
@@ -3050,7 +3304,10 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
     if (ctor_elem) {
         ctor_bc = compile_func_node(c, ctor_elem->u.prop.value, cls_name_str->utf8, has_super);
         if (ctor_bc && kl->u.klass.src_utf8 && kl->u.klass.src_len > 0) {
-            ctor_bc->source_text = ajs_str_from_utf8(c->vm, kl->u.klass.src_utf8, kl->u.klass.src_len, false);
+            ctor_bc->source_text = NULL;
+            ajs_source_buf_release(ctor_bc->source_buf);
+            ctor_bc->source_buf = NULL;
+            attach_lazy_source(c, ctor_bc, kl->u.klass.src_utf8, kl->u.klass.src_len);
         }
     } else {
         ctor_bc = compile_default_class_ctor(c, kl, cls_name_str->utf8, has_super);
@@ -3069,55 +3326,52 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
         emit_op(c, OP_UNDEF);
     }
 
-    /* Stack: [super_or_undef, ctor_fn, inst_init_or_undef] -> OP_BUILD_CLASS -> [ctor, proto] */
     emit_op(c, OP_BUILD_CLASS);
     emit_u32(c, add_const(c, ajs_val_from_gc(cls_name_str)));
     emit_u8(c, has_super ? 1 : 0);
 
-    emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, proto_tmp_slot); emit_op(c, OP_POP);
-    if (self_name_slot != 0xFFFF) {
-        emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, self_name_slot);
+    emit_init_lex(c, 0, proto_tmp_slot); emit_op(c, OP_POP);
+    if (self_name_slot != AJS_NO_SLOT) {
+        emit_init_lex(c, 0, self_name_slot);
     }
-    emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, ctor_tmp_slot); emit_op(c, OP_POP);
+    emit_init_lex(c, 0, ctor_tmp_slot); emit_op(c, OP_POP);
 
-    /* Define non-constructor public methods/accessors & static private methods/accessors */
     c_idx = 0;
     for (uint32_t i = 0; i < kl->u.klass.elements.count; i++) {
         AjsAstNode *el = kl->u.klass.elements.items[i];
         if (!el) continue;
-        uint16_t ck_slot = el->u.prop.computed ? comp_key_slots[c_idx++] : 0xFFFF;
+        uint32_t ck_slot = el->u.prop.computed ? comp_key_slots[c_idx++] : AJS_NO_SLOT;
         if (el == ctor_elem || el->u.prop.kind == AJS_PROP_FIELD || el->u.prop.kind == AJS_PROP_STATIC_BLOCK) continue;
-        if (!el->u.prop.is_static && el->u.prop.is_private) continue; /* Handled in <instance_init> */
+        if (!el->u.prop.is_static && el->u.prop.is_private) continue;
 
-        uint16_t target_slot = el->u.prop.is_static ? ctor_tmp_slot : proto_tmp_slot;
-        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, target_slot);
+        uint32_t target_slot = el->u.prop.is_static ? ctor_tmp_slot : proto_tmp_slot;
+        emit_get_lex(c, 0, target_slot);
 
         AjsBytecode *mbc = compile_func_node(c, el->u.prop.value, NULL, false);
         if (!mbc || c->had_error) goto fail;
 
         if (el->u.prop.is_private) {
-            /* Static private method / getter / setter on `ctor` */
-            uint16_t d = 0, s = 0;
+            uint16_t d = 0;
+            uint32_t s = 0;
             resolve_binding(c, el->u.prop.key->u.ident.u16, el->u.prop.key->u.ident.len, true, &d, &s, NULL);
             mbc->name = cls_sc.locals[s].str;
             emit_op(c, OP_CLOSURE); emit_u32(c, add_const(c, ajs_val_from_gc(mbc)));
             emit_op(c, OP_SET_HOME_OBJ);
             uint8_t pk = (el->u.prop.kind == AJS_PROP_METHOD) ? 2 :
                          ((el->u.prop.kind == AJS_PROP_GET) ? 3 : 4);
-            emit_op(c, OP_DEF_PRIVATE); emit_u16(c, d); emit_u16(c, s); emit_u8(c, pk);
+            emit_op(c, OP_DEF_PRIVATE); emit_u16(c, d); emit_u32(c, s); emit_u8(c, pk);
             emit_op(c, OP_POP);
             continue;
         }
 
-        /* Public prototype or static method/getter/setter (non-enumerable on classes: flag bit 0x10!) */
-        uint8_t def_kind = 0x10u; /* non-enumerable class member mask */
+        uint8_t def_kind = 0x10u;
         uint8_t fn_prefix = 0;
         if (el->u.prop.kind == AJS_PROP_GET) { def_kind |= 1u; fn_prefix = 1; }
         else if (el->u.prop.kind == AJS_PROP_SET) { def_kind |= 2u; fn_prefix = 2; }
         else { def_kind |= 3u; }
 
         if (el->u.prop.computed) {
-            emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, ck_slot);
+            emit_get_lex(c, 0, ck_slot);
             emit_op(c, OP_CLOSURE); emit_u32(c, add_const(c, ajs_val_from_gc(mbc)));
             emit_op(c, OP_SWAP); emit_op(c, OP_DUP); emit_op(c, OP_ROT3);
             emit_op(c, OP_SET_FN_NAME); emit_u8(c, fn_prefix);
@@ -3145,16 +3399,14 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
         }
     }
 
-    /* Evaluate static fields and `static { ... }` blocks in exact source order! */
     c_idx = 0;
     for (uint32_t i = 0; i < kl->u.klass.elements.count; i++) {
         AjsAstNode *el = kl->u.klass.elements.items[i];
         if (!el) continue;
-        uint16_t ck_slot = el->u.prop.computed ? comp_key_slots[c_idx++] : 0xFFFF;
+        uint32_t ck_slot = el->u.prop.computed ? comp_key_slots[c_idx++] : AJS_NO_SLOT;
         if (!el->u.prop.is_static) continue;
 
         if (el->u.prop.kind == AJS_PROP_STATIC_BLOCK) {
-            /* Wrap static block in a method closure with `[[HomeObject]] = ctor` and call with `this = ctor`! */
             AjsAstNode synth_fn;
             memset(&synth_fn, 0, sizeof(synth_fn));
             synth_fn.kind = AST_FUNC_EXPR;
@@ -3167,13 +3419,12 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
 
             AjsBytecode *sbbc = compile_func_node(c, &synth_fn, "<static_initializer>", false);
             if (!sbbc || c->had_error) goto fail;
-            emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, ctor_tmp_slot);
+            emit_get_lex(c, 0, ctor_tmp_slot);
             emit_op(c, OP_CLOSURE); emit_u32(c, add_const(c, ajs_val_from_gc(sbbc)));
             emit_op(c, OP_SET_HOME_OBJ);
             emit_op(c, OP_CALL_METHOD); emit_u16(c, 0);
             emit_op(c, OP_POP);
         } else if (el->u.prop.kind == AJS_PROP_FIELD) {
-            /* Static field initializer runs with `this = ctor` and `[[HomeObject]] = ctor` */
             AjsBytecode *sfbc = NULL;
             if (el->u.prop.value) {
                 AjsAstNode synth_fn;
@@ -3190,12 +3441,13 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
                 if (!sfbc || c->had_error) goto fail;
             }
 
-            emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, ctor_tmp_slot);
+            emit_get_lex(c, 0, ctor_tmp_slot);
             if (el->u.prop.is_private) {
-                uint16_t d = 0, s = 0;
+                uint16_t d = 0;
+                uint32_t s = 0;
                 resolve_binding(c, el->u.prop.key->u.ident.u16, el->u.prop.key->u.ident.len, true, &d, &s, NULL);
                 if (sfbc) {
-                    emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, ctor_tmp_slot);
+                    emit_get_lex(c, 0, ctor_tmp_slot);
                     emit_op(c, OP_CLOSURE); emit_u32(c, add_const(c, ajs_val_from_gc(sfbc)));
                     emit_op(c, OP_SET_HOME_OBJ);
                     emit_op(c, OP_CALL_METHOD); emit_u16(c, 0);
@@ -3207,12 +3459,12 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
                 } else {
                     emit_op(c, OP_UNDEF);
                 }
-                emit_op(c, OP_DEF_PRIVATE); emit_u16(c, d); emit_u16(c, s); emit_u8(c, 1);
+                emit_op(c, OP_DEF_PRIVATE); emit_u16(c, d); emit_u32(c, s); emit_u8(c, 1);
                 emit_op(c, OP_POP);
             } else if (el->u.prop.computed) {
-                emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, ck_slot);
+                emit_get_lex(c, 0, ck_slot);
                 if (sfbc) {
-                    emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, ctor_tmp_slot);
+                    emit_get_lex(c, 0, ctor_tmp_slot);
                     emit_op(c, OP_CLOSURE); emit_u32(c, add_const(c, ajs_val_from_gc(sfbc)));
                     emit_op(c, OP_SET_HOME_OBJ);
                     emit_op(c, OP_CALL_METHOD); emit_u16(c, 0);
@@ -3236,7 +3488,7 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
                     kidx = add_const(c, ajs_val_from_gc(ns));
                 }
                 if (sfbc) {
-                    emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, ctor_tmp_slot);
+                    emit_get_lex(c, 0, ctor_tmp_slot);
                     emit_op(c, OP_CLOSURE); emit_u32(c, add_const(c, ajs_val_from_gc(sfbc)));
                     emit_op(c, OP_SET_HOME_OBJ);
                     emit_op(c, OP_CALL_METHOD); emit_u16(c, 0);
@@ -3254,7 +3506,7 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
     }
 
     if (push_ctor) {
-        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, ctor_tmp_slot);
+        emit_get_lex(c, 0, ctor_tmp_slot);
     }
 
     emit_op(c, OP_POP_ENV);
@@ -3262,7 +3514,7 @@ static bool compile_class_node(AjsCompiler *c, AjsAstNode *kl, AjsString *inferr
     c->cur_env_depth--;
     c->strict = saved_strict;
     free(comp_key_slots);
-    free(cls_sc.locals);
+    comp_scope_cleanup(&cls_sc);
     return true;
 
 fail:
@@ -3270,7 +3522,7 @@ fail:
     c->cur_env_depth--;
     c->strict = saved_strict;
     free(comp_key_slots);
-    free(cls_sc.locals);
+    comp_scope_cleanup(&cls_sc);
     return false;
 }
 
@@ -3288,12 +3540,9 @@ static void loop_push_patch(uint32_t **arr, uint32_t *cnt, uint32_t *cap, uint32
 }
 
 static void emit_reset_eval_ret(AjsCompiler *c) {
-    if (c->eval_ret_slot != 0xFFFF) {
+    if (c->eval_ret_slot != AJS_NO_SLOT) {
         emit_op(c, OP_UNDEF);
-        emit_op(c, OP_SET_LEX);
-        emit_u16(c, c->cur_env_depth);
-        emit_u16(c, c->eval_ret_slot);
-        emit_u8(c, 0);
+        emit_set_lex(c, c->cur_env_depth, c->eval_ret_slot, 0);
         emit_op(c, OP_POP);
     }
 }
@@ -3312,12 +3561,24 @@ static bool compile_var_decl_stmt(AjsCompiler *c, AjsAstNode *vd) {
             }
             continue;
         }
-        /* Sloppy `with` / `eval`: if `var x = rhs` and `id` is simple ident, handle via emit_store_ident */
         if (!compile_expr(c, init)) return false;
         if (id->kind == AST_IDENT && is_anon_fn_or_class_def(init)) {
             uint32_t fn_nidx = add_str_u16(c, id->u.ident.u16, id->u.ident.len);
             emit_op(c, OP_CONST); emit_u32(c, fn_nidx);
             emit_op(c, OP_SET_FN_NAME); emit_u8(c, 0);
+        }
+        if (vk == AJS_VAR_USING || vk == AJS_VAR_AWAIT_USING) {
+            AjsCompScope *dsc = c->scope;
+            while (dsc && !dsc->has_disp_stack) dsc = dsc->parent;
+            if (!dsc) {
+                comp_error(c, d->line, d->col, "Internal error: missing disposal scope for 'using'");
+                return false;
+            }
+            uint16_t disp_depth = (uint16_t)(c->cur_env_depth - dsc->env_depth_idx);
+            emit_get_lex(c, disp_depth, dsc->disp_slot);
+            emit_op(c, OP_SWAP);
+            emit_op(c, OP_DISPOSE_ADD);
+            emit_u8(c, vk == AJS_VAR_AWAIT_USING ? 1 : 0);
         }
         if (!compile_pattern_assign(c, id, (vk != AJS_VAR_VAR), vk)) return false;
     }
@@ -3328,23 +3589,31 @@ static bool compile_for_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t *lbl_
     emit_reset_eval_ret(c);
     AjsAstNode *init = n->u.for_stmt.init;
     bool has_lex_init = (init && init->kind == AST_VAR_DECL && init->u.var_decl.var_kind != AJS_VAR_VAR);
+    bool is_using_init = (has_lex_init && (init->u.var_decl.var_kind == AJS_VAR_USING ||
+                                           init->u.var_decl.var_kind == AJS_VAR_AWAIT_USING));
+    uint32_t for_disp_fin = UINT32_MAX;
 
     AjsCompScope loop_sc;
     memset(&loop_sc, 0, sizeof(loop_sc));
     if (has_lex_init) {
         loop_sc.parent = c->scope;
         loop_sc.has_runtime_env = true;
-        AjsBindKind bk = (init->u.var_decl.var_kind == AJS_VAR_CONST) ? BIND_CONST : BIND_LET;
+        AjsBindKind bk = is_const_var_kind(init->u.var_decl.var_kind) ? BIND_CONST : BIND_LET;
         for (uint32_t i = 0; i < init->u.var_decl.decls.count; i++) {
             collect_pattern_vars(c, &loop_sc, init->u.var_decl.decls.items[i]->u.declarator.id, bk, false);
+        }
+        if (is_using_init) {
+            loop_sc.disp_slot = comp_scope_add(c, &loop_sc, NULL, 0, BIND_VAR, false);
+            loop_sc.has_disp_stack = true;
         }
         c->cur_env_depth++;
         loop_sc.env_depth_idx = c->cur_env_depth;
         c->scope = &loop_sc;
-        uint16_t ed_idx = build_env_desc(c, &loop_sc);
-        emit_op(c, OP_PUSH_ENV);
-        emit_u16(c, loop_sc.slot_count);
-        emit_u16(c, ed_idx);
+        uint32_t ed_idx = build_env_desc(c, &loop_sc);
+        emit_push_env(c, loop_sc.slot_count, ed_idx);
+        if (is_using_init) {
+            for_disp_fin = emit_dispose_enter(c, 0, loop_sc.disp_slot);
+        }
     }
 
     if (init) {
@@ -3356,10 +3625,8 @@ static bool compile_for_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t *lbl_
         }
     }
 
-    /* Per-iteration lexical environment clone prior to first iteration test */
     if (has_lex_init && loop_sc.slot_count > 0) {
-        emit_op(c, OP_CLONE_ENV);
-        emit_u16(c, loop_sc.slot_count);
+        emit_clone_env(c, loop_sc.slot_count);
     }
 
     AjsLoopCtx lctx;
@@ -3389,8 +3656,7 @@ static bool compile_for_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t *lbl_
     }
 
     if (has_lex_init && loop_sc.slot_count > 0) {
-        emit_op(c, OP_CLONE_ENV);
-        emit_u16(c, loop_sc.slot_count);
+        emit_clone_env(c, loop_sc.slot_count);
     }
 
     if (n->u.for_stmt.update) {
@@ -3412,10 +3678,13 @@ static bool compile_for_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t *lbl_
     free(lctx.cont_patches);
 
     if (has_lex_init) {
+        if (is_using_init) {
+            emit_dispose_finally(c, 0, loop_sc.disp_slot, for_disp_fin);
+        }
         emit_op(c, OP_POP_ENV);
         c->scope = loop_sc.parent;
         c->cur_env_depth--;
-        free(loop_sc.locals);
+        comp_scope_cleanup(&loop_sc);
     }
     return true;
 
@@ -3425,9 +3694,10 @@ fail_loop:
     free(lctx.cont_patches);
 fail:
     if (has_lex_init) {
+        if (is_using_init) c->cur_try_depth--;
         c->scope = loop_sc.parent;
         c->cur_env_depth--;
-        free(loop_sc.locals);
+        comp_scope_cleanup(&loop_sc);
     }
     return false;
 }
@@ -3438,22 +3708,21 @@ static bool compile_for_in_of_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t
     bool is_await = n->u.for_in_of.is_await;
     AjsAstNode *left = n->u.for_in_of.left;
     bool has_lex_left = (left && left->kind == AST_VAR_DECL && left->u.var_decl.var_kind != AJS_VAR_VAR);
+    bool is_using_left = (has_lex_left && (left->u.var_decl.var_kind == AJS_VAR_USING ||
+                                           left->u.var_decl.var_kind == AJS_VAR_AWAIT_USING));
 
-    /* Outer TDZ scope for `for (let x of expr)` — ECMA-262 §14.7.5.6 puts `x` in TDZ while evaluating `expr`! */
     AjsCompScope tdz_sc;
     memset(&tdz_sc, 0, sizeof(tdz_sc));
     if (has_lex_left) {
         tdz_sc.parent = c->scope;
         tdz_sc.has_runtime_env = true;
-        AjsBindKind bk = (left->u.var_decl.var_kind == AJS_VAR_CONST) ? BIND_CONST : BIND_LET;
+        AjsBindKind bk = is_const_var_kind(left->u.var_decl.var_kind) ? BIND_CONST : BIND_LET;
         collect_pattern_vars(c, &tdz_sc, left->u.var_decl.decls.items[0]->u.declarator.id, bk, false);
         c->cur_env_depth++;
         tdz_sc.env_depth_idx = c->cur_env_depth;
         c->scope = &tdz_sc;
-        uint16_t ed_idx = build_env_desc(c, &tdz_sc);
-        emit_op(c, OP_PUSH_ENV);
-        emit_u16(c, tdz_sc.slot_count);
-        emit_u16(c, ed_idx);
+        uint32_t ed_idx = build_env_desc(c, &tdz_sc);
+        emit_push_env(c, tdz_sc.slot_count, ed_idx);
     }
 
     if (!compile_expr(c, n->u.for_in_of.right)) goto fail_tdz;
@@ -3462,39 +3731,35 @@ static bool compile_for_in_of_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t
         emit_op(c, OP_POP_ENV);
         c->scope = tdz_sc.parent;
         c->cur_env_depth--;
-        free(tdz_sc.locals);
+        comp_scope_cleanup(&tdz_sc);
         memset(&tdz_sc, 0, sizeof(tdz_sc));
     }
 
     uint32_t j_nullish_for_in = UINT32_MAX;
     if (!is_of) {
-        /* `for..in`: if right is null or undefined, do nothing! */
         emit_op(c, OP_DUP);
         j_nullish_for_in = emit_jump(c, OP_JMP_NULLISH);
-        emit_op(c, OP_FOR_IN_INIT); /* [iter, next_fn] */
+        emit_op(c, OP_FOR_IN_INIT);
     } else {
         emit_op(c, OP_GET_ITER);
-        emit_u8(c, is_await ? 1 : 0); /* [iter, next_fn] */
+        emit_u8(c, is_await ? 1 : 0);
     }
 
-    /* Push 3-slot iterator control env: [0]=raw_iter, [1]=next_fn, [2]=active_iter */
     AjsCompScope iter_sc;
     memset(&iter_sc, 0, sizeof(iter_sc));
     iter_sc.parent = c->scope;
     iter_sc.has_runtime_env = true;
-    uint16_t raw_iter_slot = comp_scope_add(c, &iter_sc, NULL, 0, BIND_VAR, false);
-    uint16_t next_fn_slot = comp_scope_add(c, &iter_sc, NULL, 0, BIND_VAR, false);
-    uint16_t act_iter_slot = comp_scope_add(c, &iter_sc, NULL, 0, BIND_VAR, false);
+    uint32_t raw_iter_slot = comp_scope_add(c, &iter_sc, NULL, 0, BIND_VAR, false);
+    uint32_t next_fn_slot = comp_scope_add(c, &iter_sc, NULL, 0, BIND_VAR, false);
+    uint32_t act_iter_slot = comp_scope_add(c, &iter_sc, NULL, 0, BIND_VAR, false);
 
     c->cur_env_depth++;
     iter_sc.env_depth_idx = c->cur_env_depth;
     c->scope = &iter_sc;
-    emit_op(c, OP_PUSH_ENV);
-    emit_u16(c, 3);
-    emit_u16(c, 0xFFFF);
+    emit_push_env(c, 3, AJS_NO_SLOT);
 
-    emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, next_fn_slot); emit_op(c, OP_POP);
-    emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, raw_iter_slot); emit_op(c, OP_POP);
+    emit_init_lex(c, 0, next_fn_slot); emit_op(c, OP_POP);
+    emit_init_lex(c, 0, raw_iter_slot); emit_op(c, OP_POP);
 
     uint32_t fin_patch = UINT32_MAX;
     if (is_of) {
@@ -3510,8 +3775,6 @@ static bool compile_for_in_of_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t
     lctx.prev = c->loop_top;
     lctx.label_u16 = lbl_u16;
     lctx.label_len = lbl_len;
-    /* Break jumps OUT of the try block (triggering IteratorClose in finally!),
-     * while Continue stays INSIDE the try block (`cont_try_depth = c->cur_try_depth`)! */
     lctx.try_depth = is_of ? (uint16_t)(c->cur_try_depth - 1u) : c->cur_try_depth;
     lctx.env_depth = c->cur_env_depth;
     lctx.cont_try_depth = c->cur_try_depth;
@@ -3520,63 +3783,87 @@ static bool compile_for_in_of_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t
     lctx.cont_pc = step_pc;
     c->loop_top = &lctx;
 
-    /* Clear `active_iter` before calling `.next()` so errors inside `.next()` do NOT call IteratorClose */
     if (is_of) {
         emit_op(c, OP_UNDEF);
-        emit_op(c, OP_SET_LEX); emit_u16(c, 0); emit_u16(c, act_iter_slot); emit_u8(c, 0);
+        emit_set_lex(c, 0, act_iter_slot, 0);
         emit_op(c, OP_POP);
     }
 
-    emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, raw_iter_slot);
-    emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, next_fn_slot);
+    emit_get_lex(c, 0, raw_iter_slot);
+    emit_get_lex(c, 0, next_fn_slot);
     emit_op(c, OP_ITER_NEXT);
     emit_op(c, OP_NIP);
     emit_op(c, OP_NIP);
     if (is_await) {
         emit_op(c, OP_AWAIT);
     }
-    emit_op(c, OP_ITER_UNPACK); /* [value, done_bool] */
+    emit_op(c, OP_ITER_UNPACK);
     uint32_t j_done = emit_jump(c, OP_JMP_TRUE);
 
-    /* Iteration active: set `active_iter = raw_iter` */
     if (is_of) {
-        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, raw_iter_slot);
-        emit_op(c, OP_SET_LEX); emit_u16(c, 0); emit_u16(c, act_iter_slot); emit_u8(c, 0);
+        emit_get_lex(c, 0, raw_iter_slot);
+        emit_set_lex(c, 0, act_iter_slot, 0);
         emit_op(c, OP_POP);
     }
 
-    /* Fresh per-iteration lexical environment if `for (let/const ... of/in ...)` */
     AjsCompScope body_lex_sc;
     memset(&body_lex_sc, 0, sizeof(body_lex_sc));
     if (has_lex_left) {
         body_lex_sc.parent = c->scope;
         body_lex_sc.has_runtime_env = true;
-        AjsBindKind bk = (left->u.var_decl.var_kind == AJS_VAR_CONST) ? BIND_CONST : BIND_LET;
+        AjsBindKind bk = is_const_var_kind(left->u.var_decl.var_kind) ? BIND_CONST : BIND_LET;
         collect_pattern_vars(c, &body_lex_sc, left->u.var_decl.decls.items[0]->u.declarator.id, bk, false);
+        if (is_using_left) {
+            body_lex_sc.disp_slot = comp_scope_add(c, &body_lex_sc, NULL, 0, BIND_VAR, false);
+            body_lex_sc.has_disp_stack = true;
+        }
         c->cur_env_depth++;
         body_lex_sc.env_depth_idx = c->cur_env_depth;
         c->scope = &body_lex_sc;
-        uint16_t ed_idx = build_env_desc(c, &body_lex_sc);
-        emit_op(c, OP_PUSH_ENV);
-        emit_u16(c, body_lex_sc.slot_count);
-        emit_u16(c, ed_idx);
+        uint32_t ed_idx = build_env_desc(c, &body_lex_sc);
+        emit_push_env(c, body_lex_sc.slot_count, ed_idx);
     }
 
     if (left->kind == AST_VAR_DECL) {
         AjsVarKind vk = left->u.var_decl.var_kind;
         AjsAstNode *pat = left->u.var_decl.decls.items[0]->u.declarator.id;
+        if (is_using_left) {
+            emit_op(c, OP_DISPOSE_NEW);
+            emit_init_lex(c, 0, body_lex_sc.disp_slot);
+            emit_op(c, OP_POP);
+            emit_get_lex(c, 0, body_lex_sc.disp_slot);
+            emit_op(c, OP_SWAP);
+            emit_op(c, OP_DISPOSE_ADD);
+            emit_u8(c, vk == AJS_VAR_AWAIT_USING ? 1 : 0);
+        }
         if (!compile_pattern_assign(c, pat, (vk != AJS_VAR_VAR), vk)) goto fail_body;
     } else {
         if (!compile_pattern_assign(c, left, false, AJS_VAR_LET)) goto fail_body;
     }
 
-    if (!compile_stmt(c, n->u.for_in_of.body)) goto fail_body;
+    uint32_t body_disp_fin = UINT32_MAX;
+    if (is_using_left) {
+        emit_op(c, OP_TRY_PUSH);
+        emit_u32(c, UINT32_MAX);
+        body_disp_fin = c->bc->code_len;
+        emit_u32(c, 0);
+        c->cur_try_depth++;
+    }
+
+    if (!compile_stmt(c, n->u.for_in_of.body)) {
+        if (is_using_left) c->cur_try_depth--;
+        goto fail_body;
+    }
+
+    if (is_using_left) {
+        emit_dispose_finally(c, 0, body_lex_sc.disp_slot, body_disp_fin);
+    }
 
     if (has_lex_left) {
         emit_op(c, OP_POP_ENV);
         c->scope = body_lex_sc.parent;
         c->cur_env_depth--;
-        free(body_lex_sc.locals);
+        comp_scope_cleanup(&body_lex_sc);
         memset(&body_lex_sc, 0, sizeof(body_lex_sc));
     }
 
@@ -3584,25 +3871,21 @@ static bool compile_for_in_of_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t
     emit_u32(c, step_pc);
 
     patch_jump(c, j_done);
-    emit_op(c, OP_POP); /* discard value on done:true */
+    emit_op(c, OP_POP);
 
     if (is_of) {
         c->cur_try_depth--;
         patch_jump(c, fin_patch);
         emit_op(c, OP_ENTER_FINALLY);
-        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, act_iter_slot);
+        emit_get_lex(c, 0, act_iter_slot);
         uint32_t j_skip_close = emit_jump(c, OP_JMP_UNDEF);
-        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, act_iter_slot);
+        emit_get_lex(c, 0, act_iter_slot);
         if (is_await) {
-            /* AsyncIteratorClose: if `iter.return` exists, await `iter.return()`!
-             * Handled cleanly inside OP_ITER_CLOSE or by getting `return` method + OP_AWAIT!
-             * Let's emit async-aware close right here in bytecode so OP_AWAIT suspends naturally! */
             uint32_t ret_nidx = add_str_cstr(c, "return");
             emit_op(c, OP_DUP);
             emit_op(c, OP_GET_PROP); emit_u32(c, ret_nidx);
             emit_op(c, OP_DUP);
             uint32_t j_no_ret_fn = emit_jump(c, OP_JMP_NULLISH);
-            /* Stack: [iter, ret_fn] -> CALL_METHOD 0 -> AWAIT -> POP */
             emit_op(c, OP_CALL_METHOD); emit_u16(c, 0);
             emit_op(c, OP_AWAIT);
             emit_op(c, OP_POP);
@@ -3632,7 +3915,7 @@ static bool compile_for_in_of_stmt(AjsCompiler *c, AjsAstNode *n, const uint16_t
     emit_op(c, OP_POP_ENV);
     c->scope = iter_sc.parent;
     c->cur_env_depth--;
-    free(iter_sc.locals);
+    comp_scope_cleanup(&iter_sc);
 
     if (j_nullish_for_in != UINT32_MAX) {
         uint32_t j_past_null = emit_jump(c, OP_JMP);
@@ -3646,21 +3929,21 @@ fail_body:
     if (has_lex_left) {
         c->scope = body_lex_sc.parent;
         c->cur_env_depth--;
-        free(body_lex_sc.locals);
+        comp_scope_cleanup(&body_lex_sc);
     }
     c->loop_top = lctx.prev;
     free(lctx.break_patches);
     free(lctx.cont_patches);
     c->scope = iter_sc.parent;
     c->cur_env_depth--;
-    free(iter_sc.locals);
+    comp_scope_cleanup(&iter_sc);
     return false;
 
 fail_tdz:
     if (has_lex_left) {
         c->scope = tdz_sc.parent;
         c->cur_env_depth--;
-        free(tdz_sc.locals);
+        comp_scope_cleanup(&tdz_sc);
     }
     return false;
 }
@@ -3678,11 +3961,8 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
 
         case AST_EXPR_STMT:
             if (!compile_expr(c, n->u.expr_stmt.expr)) return false;
-            if (c->eval_ret_slot != 0xFFFF) {
-                emit_op(c, OP_SET_LEX);
-                emit_u16(c, c->cur_env_depth);
-                emit_u16(c, c->eval_ret_slot);
-                emit_u8(c, 0);
+            if (c->eval_ret_slot != AJS_NO_SLOT) {
+                emit_set_lex(c, c->cur_env_depth, c->eval_ret_slot, 0);
             }
             emit_op(c, OP_POP);
             return true;
@@ -3693,37 +3973,43 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
             bsc.parent = c->scope;
             collect_block_lex_in_list(c, &bsc, &n->u.block.stmts, false);
             bool pushed = (bsc.slot_count > 0);
+            uint32_t blk_disp_fin = UINT32_MAX;
             if (pushed) {
                 bsc.has_runtime_env = true;
                 c->cur_env_depth++;
                 bsc.env_depth_idx = c->cur_env_depth;
                 c->scope = &bsc;
-                uint16_t ed_idx = build_env_desc(c, &bsc);
-                emit_op(c, OP_PUSH_ENV);
-                emit_u16(c, bsc.slot_count);
-                emit_u16(c, ed_idx);
+                uint32_t ed_idx = build_env_desc(c, &bsc);
+                emit_push_env(c, bsc.slot_count, ed_idx);
                 if (!instantiate_hoisted_funcs(c, &bsc, &n->u.block.stmts, false)) {
                     c->scope = bsc.parent;
                     c->cur_env_depth--;
-                    free(bsc.locals);
+                    comp_scope_cleanup(&bsc);
                     return false;
+                }
+                if (bsc.has_disp_stack) {
+                    blk_disp_fin = emit_dispose_enter(c, 0, bsc.disp_slot);
                 }
             }
             for (uint32_t i = 0; i < n->u.block.stmts.count; i++) {
                 if (!compile_stmt(c, n->u.block.stmts.items[i])) {
                     if (pushed) {
+                        if (bsc.has_disp_stack) c->cur_try_depth--;
                         c->scope = bsc.parent;
                         c->cur_env_depth--;
-                        free(bsc.locals);
+                        comp_scope_cleanup(&bsc);
                     }
                     return false;
                 }
             }
             if (pushed) {
+                if (bsc.has_disp_stack) {
+                    emit_dispose_finally(c, 0, bsc.disp_slot, blk_disp_fin);
+                }
                 emit_op(c, OP_POP_ENV);
                 c->scope = bsc.parent;
                 c->cur_env_depth--;
-                free(bsc.locals);
+                comp_scope_cleanup(&bsc);
             }
             return true;
         }
@@ -3732,26 +4018,22 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
             return compile_var_decl_stmt(c, n);
 
         case AST_FUNC_DECL:
-            /* Annex B.3.3: in sloppy mode inside a block, reaching the function declaration line
-             * copies the block-scoped binding to the outer `var` binding! */
             if (!c->strict && !c->scope->is_base && n->u.func.fn_kind == AJS_FN_BC_NORMAL && n->u.func.name_u16) {
                 int32_t blk_idx = comp_scope_find_own(c->scope, n->u.func.name_u16, n->u.func.name_len, false);
                 if (blk_idx >= 0) {
                     int32_t base_idx = comp_scope_find_own(&c->base_scope, n->u.func.name_u16, n->u.func.name_len, false);
                     if (base_idx >= 0) {
-                        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, c->scope->locals[blk_idx].slot);
-                        emit_op(c, OP_SET_LEX); emit_u16(c, c->cur_env_depth);
-                        emit_u16(c, c->base_scope.locals[base_idx].slot); emit_u8(c, 0);
+                        emit_get_lex(c, 0, c->scope->locals[blk_idx].slot);
+                        emit_set_lex(c, c->cur_env_depth, c->base_scope.locals[base_idx].slot, 0);
                         emit_op(c, OP_POP);
                     } else if (c->is_script_global) {
-                        emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, c->scope->locals[blk_idx].slot);
+                        emit_get_lex(c, 0, c->scope->locals[blk_idx].slot);
                         uint32_t nidx = add_str_u16(c, n->u.func.name_u16, n->u.func.name_len);
                         emit_op(c, OP_SET_GLOBAL); emit_u32(c, nidx); emit_u8(c, 0);
                         emit_op(c, OP_POP);
                     }
                 }
             }
-            /* Single-statement sloppy `if (cond) function f() {}` */
             if (!c->strict && n->u.func.name_u16 && comp_scope_find_own(c->scope, n->u.func.name_u16, n->u.func.name_len, false) < 0) {
                 AjsBytecode *fn_bc = compile_func_node(c, n, NULL, false);
                 if (!fn_bc || c->had_error) return false;
@@ -3862,12 +4144,11 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
             emit_reset_eval_ret(c);
             if (!compile_expr(c, n->u.switch_stmt.discriminant)) return false;
 
-            /* Switch block lexical environment + hidden slot holding discriminant */
             AjsCompScope sw_sc;
             memset(&sw_sc, 0, sizeof(sw_sc));
             sw_sc.parent = c->scope;
             sw_sc.has_runtime_env = true;
-            uint16_t disc_slot = comp_scope_add(c, &sw_sc, NULL, 0, BIND_VAR, false);
+            uint32_t disc_slot = comp_scope_add(c, &sw_sc, NULL, 0, BIND_VAR, false);
             for (uint32_t i = 0; i < n->u.switch_stmt.cases.count; i++) {
                 AjsAstNode *sc = n->u.switch_stmt.cases.items[i];
                 collect_block_lex_in_list(c, &sw_sc, &sc->u.switch_case.conseq, false);
@@ -3876,19 +4157,22 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
             c->cur_env_depth++;
             sw_sc.env_depth_idx = c->cur_env_depth;
             c->scope = &sw_sc;
-            uint16_t ed_idx = build_env_desc(c, &sw_sc);
-            emit_op(c, OP_PUSH_ENV);
-            emit_u16(c, sw_sc.slot_count);
-            emit_u16(c, ed_idx);
+            uint32_t ed_idx = build_env_desc(c, &sw_sc);
+            emit_push_env(c, sw_sc.slot_count, ed_idx);
 
-            emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, disc_slot); emit_op(c, OP_POP);
+            emit_init_lex(c, 0, disc_slot); emit_op(c, OP_POP);
 
             for (uint32_t i = 0; i < n->u.switch_stmt.cases.count; i++) {
                 AjsAstNode *sc = n->u.switch_stmt.cases.items[i];
                 if (!instantiate_hoisted_funcs(c, &sw_sc, &sc->u.switch_case.conseq, false)) {
-                    c->scope = sw_sc.parent; c->cur_env_depth--; free(sw_sc.locals);
+                    c->scope = sw_sc.parent; c->cur_env_depth--; comp_scope_cleanup(&sw_sc);
                     return false;
                 }
+            }
+
+            uint32_t sw_disp_fin = UINT32_MAX;
+            if (sw_sc.has_disp_stack) {
+                sw_disp_fin = emit_dispose_enter(c, 0, sw_sc.disp_slot);
             }
 
             AjsLoopCtx lctx;
@@ -3910,7 +4194,7 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
                     case_jumps[i] = UINT32_MAX;
                     continue;
                 }
-                emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, disc_slot);
+                emit_get_lex(c, 0, disc_slot);
                 if (!compile_expr(c, sc->u.switch_case.test)) goto fail_sw;
                 emit_op(c, OP_STRICT_EQ);
                 case_jumps[i] = emit_jump(c, OP_JMP_TRUE);
@@ -3934,10 +4218,13 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
             free(case_jumps);
             free(lctx.break_patches);
 
+            if (sw_sc.has_disp_stack) {
+                emit_dispose_finally(c, 0, sw_sc.disp_slot, sw_disp_fin);
+            }
             emit_op(c, OP_POP_ENV);
             c->scope = sw_sc.parent;
             c->cur_env_depth--;
-            free(sw_sc.locals);
+            comp_scope_cleanup(&sw_sc);
             return true;
 
         fail_sw:
@@ -3946,7 +4233,7 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
             free(lctx.break_patches);
             c->scope = sw_sc.parent;
             c->cur_env_depth--;
-            free(sw_sc.locals);
+            comp_scope_cleanup(&sw_sc);
             return false;
         }
 
@@ -4038,7 +4325,6 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
             } else {
                 emit_op(c, OP_UNDEF);
             }
-            /* AsyncGenerator `return expr` awaits `expr` BEFORE unwinding finally blocks per ECMA-262 §27.5.3.2! */
             if (c->bc->fn_kind == AJS_FN_BC_ASYNC_GENERATOR && n->u.expr_stmt.expr) {
                 emit_op(c, OP_AWAIT);
             }
@@ -4046,7 +4332,7 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
                 emit_op(c, OP_UNWIND_RETURN);
             } else if (c->bc->is_derived_ctor) {
                 emit_op(c, OP_RETURN_DERIVED);
-                emit_u16(c, c->bc->this_slot);
+                emit_u32(c, c->bc->this_slot);
             } else {
                 emit_op(c, OP_RETURN);
             }
@@ -4086,8 +4372,6 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
 
             if (has_catch) {
                 patch_jump(c, catch_patch);
-                /* At catch_pc, interpreter has pushed `[caught_exception]` onto stack (and if `!has_finally`,
-                 * interpreter already popped `try_stack`; if `has_finally`, `try_stack` remains active with `catch_pc = UINT32_MAX`!). */
                 AjsCompScope csc;
                 memset(&csc, 0, sizeof(csc));
                 csc.parent = c->scope;
@@ -4100,14 +4384,12 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
                 csc.has_runtime_env = true;
                 csc.env_depth_idx = c->cur_env_depth;
                 c->scope = &csc;
-                uint16_t ed_idx = build_env_desc(c, &csc);
-                emit_op(c, OP_PUSH_ENV);
-                emit_u16(c, csc.slot_count);
-                emit_u16(c, ed_idx);
+                uint32_t ed_idx = build_env_desc(c, &csc);
+                emit_push_env(c, csc.slot_count, ed_idx);
 
                 if (n->u.try_stmt.catch_param) {
                     if (!compile_pattern_assign(c, n->u.try_stmt.catch_param, true, AJS_VAR_LET)) {
-                        c->scope = csc.parent; c->cur_env_depth--; free(csc.locals);
+                        c->scope = csc.parent; c->cur_env_depth--; comp_scope_cleanup(&csc);
                         if (has_finally) c->cur_try_depth--;
                         return false;
                     }
@@ -4116,44 +4398,51 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
                 }
 
                 if (!instantiate_hoisted_funcs(c, &csc, &n->u.try_stmt.catch_body->u.block.stmts, false)) {
-                    c->scope = csc.parent; c->cur_env_depth--; free(csc.locals);
+                    c->scope = csc.parent; c->cur_env_depth--; comp_scope_cleanup(&csc);
                     if (has_finally) c->cur_try_depth--;
                     return false;
                 }
+                uint32_t catch_disp_fin = UINT32_MAX;
+                if (csc.has_disp_stack) {
+                    catch_disp_fin = emit_dispose_enter(c, 0, csc.disp_slot);
+                }
                 for (uint32_t i = 0; i < n->u.try_stmt.catch_body->u.block.stmts.count; i++) {
                     if (!compile_stmt(c, n->u.try_stmt.catch_body->u.block.stmts.items[i])) {
-                        c->scope = csc.parent; c->cur_env_depth--; free(csc.locals);
+                        c->scope = csc.parent; c->cur_env_depth--; comp_scope_cleanup(&csc);
+                        if (csc.has_disp_stack) c->cur_try_depth--;
                         if (has_finally) c->cur_try_depth--;
                         return false;
                     }
                 }
+                if (csc.has_disp_stack) {
+                    emit_dispose_finally(c, 0, csc.disp_slot, catch_disp_fin);
+                }
                 emit_op(c, OP_POP_ENV);
                 c->scope = csc.parent;
                 c->cur_env_depth--;
-                free(csc.locals);
+                comp_scope_cleanup(&csc);
             }
 
             if (has_finally) {
-                /* Save `<eval_ret>` across finally so normal finally execution preserves try/catch completion value! */
-                uint16_t saved_eval_slot = 0xFFFF;
+                uint32_t saved_eval_slot = AJS_NO_SLOT;
                 if (j_after_try != UINT32_MAX) patch_jump(c, j_after_try);
                 c->cur_try_depth--;
                 patch_jump(c, fin_patch);
                 emit_op(c, OP_ENTER_FINALLY);
-                if (c->eval_ret_slot != 0xFFFF) {
+                if (c->eval_ret_slot != AJS_NO_SLOT) {
                     saved_eval_slot = c->eval_ret_slot;
-                    emit_op(c, OP_PUSH_ENV); emit_u16(c, 1); emit_u16(c, 0xFFFF);
+                    emit_push_env(c, 1, AJS_NO_SLOT);
                     c->cur_env_depth++;
-                    emit_op(c, OP_GET_LEX); emit_u16(c, c->cur_env_depth); emit_u16(c, saved_eval_slot);
-                    emit_op(c, OP_INIT_LEX); emit_u16(c, 0); emit_u16(c, 0); emit_op(c, OP_POP);
+                    emit_get_lex(c, c->cur_env_depth, saved_eval_slot);
+                    emit_init_lex(c, 0, 0); emit_op(c, OP_POP);
                 }
                 if (!compile_stmt(c, n->u.try_stmt.finally_body)) {
-                    if (saved_eval_slot != 0xFFFF) c->cur_env_depth--;
+                    if (saved_eval_slot != AJS_NO_SLOT) c->cur_env_depth--;
                     return false;
                 }
-                if (saved_eval_slot != 0xFFFF) {
-                    emit_op(c, OP_GET_LEX); emit_u16(c, 0); emit_u16(c, 0);
-                    emit_op(c, OP_SET_LEX); emit_u16(c, c->cur_env_depth); emit_u16(c, saved_eval_slot); emit_u8(c, 0);
+                if (saved_eval_slot != AJS_NO_SLOT) {
+                    emit_get_lex(c, 0, 0);
+                    emit_set_lex(c, c->cur_env_depth, saved_eval_slot, 0);
                     emit_op(c, OP_POP);
                     emit_op(c, OP_POP_ENV);
                     c->cur_env_depth--;
@@ -4189,7 +4478,6 @@ static bool compile_stmt_with_label(AjsCompiler *c, AjsAstNode *n, const uint16_
             AjsAstNode *decl = n->u.mod_decl.decl;
             if (!decl) return true;
             if (decl->kind == AST_FUNC_DECL) {
-                /* Already hoisted into mod->hoisted_fns! */
                 return true;
             }
             static const uint16_t u_def_star[9] = {'*','d','e','f','a','u','l','t','*'};
@@ -4282,16 +4570,14 @@ AjsBytecode *ajs_compile_script(AjsVm *vm, AjsRealm *realm, const char *utf8_cod
     size_t rs = ajs_temp_root_save(vm);
     bool strict = prog->u.program.strict;
     bool to_global = (!is_eval) || (!strict && eval_lex_env == NULL);
-    /* Note: for sloppy direct eval inside a function (`eval_lex_env != NULL`), `let`/`const` stay in
-     * `eval`'s private lexical env (`to_global = false`), while `var` inside sloppy direct eval inside
-     * global scope goes to global, and inside a function goes to dynamic env (`has_eval_or_with = true`)! */
     if (is_eval && !strict && eval_lex_env != NULL) {
-        /* Check if caller is global or inside a function */
         to_global = (eval_lex_env == realm->global_lex_env);
     }
 
     AjsCompiler c;
     init_compiler(&c, vm, realm, NULL, AJS_FN_BC_NORMAL, strict, source_url);
+    c.src_base = utf8_code;
+    c.src_buf = ajs_source_buf_new(utf8_code, code_len);
     c.bc->is_eval = is_eval;
     c.bc->name = ajs_str_from_cstr(vm, is_eval ? "<eval>" : "<script>", true);
     c.is_script_global = to_global;
@@ -4304,36 +4590,45 @@ AjsBytecode *ajs_compile_script(AjsVm *vm, AjsRealm *realm, const char *utf8_cod
     scan_fn_ast(prog, false, &scan);
     if (scan.has_eval_or_with) c.has_eval_or_with = true;
 
-    /* Hidden slot `<eval_ret>` for Script / Eval completion value */
     c.eval_ret_slot = comp_scope_add(&c, &c.base_scope, NULL, 0, BIND_VAR, false);
 
-    /* Hoist `var` and top-level `let`/`const`/`class`/`function` */
     for (uint32_t i = 0; i < prog->u.program.body.count; i++) {
         hoist_vars_in_stmt(&c, prog->u.program.body.items[i], to_global);
     }
-    /* For sloppy eval, `let`/`const` ALWAYS live in eval's own lexical scope (`to_global` only applies to `var`!) */
     collect_block_lex_in_list(&c, &c.base_scope, &prog->u.program.body, !is_eval);
 
     if (!instantiate_hoisted_funcs(&c, &c.base_scope, &prog->u.program.body, to_global)) goto fail;
 
-    for (uint32_t i = 0; i < prog->u.program.body.count; i++) {
-        if (!compile_stmt(&c, prog->u.program.body.items[i])) goto fail;
+    {
+        uint32_t scr_disp_fin = UINT32_MAX;
+        if (c.base_scope.has_disp_stack) {
+            scr_disp_fin = emit_dispose_enter(&c, 0, c.base_scope.disp_slot);
+        }
+        for (uint32_t i = 0; i < prog->u.program.body.count; i++) {
+            if (!compile_stmt(&c, prog->u.program.body.items[i])) goto fail;
+        }
+        if (c.base_scope.has_disp_stack) {
+            emit_dispose_finally(&c, 0, c.base_scope.disp_slot, scr_disp_fin);
+        }
     }
 
-    emit_op(&c, OP_GET_LEX);
-    emit_u16(&c, 0);
-    emit_u16(&c, c.eval_ret_slot);
+    emit_get_lex(&c, 0, c.eval_ret_slot);
     emit_op(&c, OP_RETURN);
 
+    ajs_source_buf_release(c.src_buf);
     finalize_base_scope_metadata(&c);
     ajs_arena_free(&arena);
-    ajs_temp_root_restore(vm, rs);
     vm->gc_suppress--;
+    if (vm->gc_suppress == 0 && vm->gc_bytes > vm->gc_threshold) {
+        ajs_gc_collect(vm);
+    }
+    ajs_temp_root_restore(vm, rs);
     return c.bc;
 
 fail:
     fill_comp_err(&c, source_url, out_err);
-    free(c.base_scope.locals);
+    ajs_source_buf_release(c.src_buf);
+    cleanup_compiler(&c);
     ajs_arena_free(&arena);
     ajs_temp_root_restore(vm, rs);
     vm->gc_suppress--;
@@ -4343,7 +4638,6 @@ fail:
 AjsBytecode *ajs_compile_function_dynamic(AjsVm *vm, AjsRealm *realm, const char *params_utf8,
                                           size_t params_len, const char *body_utf8, size_t body_len,
                                           AjsFuncKind fn_kind) {
-    /* Step 1 (ECMA-262 CreateDynamicFunction): Validate `params_utf8` cannot close `)` early or inject body! */
     {
         size_t pchk_len = params_len + 32u;
         char *pchk = (char *)malloc(pchk_len);
@@ -4410,7 +4704,6 @@ AjsBytecode *ajs_compile_function_dynamic(AjsVm *vm, AjsRealm *realm, const char
     }
 
     AjsAstNode *fn_node = es->u.expr_stmt.expr;
-    /* Note: `anonymous` is the `name` property of dynamic functions, NOT an inner lexical binding! */
     fn_node->u.func.name_u16 = NULL;
     fn_node->u.func.name_len = 0;
 
@@ -4418,8 +4711,11 @@ AjsBytecode *ajs_compile_function_dynamic(AjsVm *vm, AjsRealm *realm, const char
     vm->gc_suppress++;
     AjsCompiler dummy_parent;
     init_compiler(&dummy_parent, vm, realm, NULL, AJS_FN_BC_NORMAL, false, "<anonymous>");
+    dummy_parent.src_base = full;
+    dummy_parent.src_buf = ajs_source_buf_new(full, pos);
     AjsBytecode *fn_bc = compile_func_node(&dummy_parent, fn_node, "anonymous", false);
-    free(dummy_parent.base_scope.locals);
+    ajs_source_buf_release(dummy_parent.src_buf);
+    cleanup_compiler(&dummy_parent);
     free(full);
     ajs_arena_free(&arena);
     ajs_temp_root_restore(vm, rs);
@@ -4442,7 +4738,7 @@ static void mod_add_requested_spec(AjsModuleRecord *mod, AjsString *spec) {
 }
 
 static void mod_add_import_entry(AjsModuleRecord *mod, AjsString *spec, AjsString *imp_name,
-                                 AjsString *loc_name, uint16_t slot, uint32_t line, uint32_t col) {
+                                 AjsString *loc_name, uint32_t slot, uint32_t line, uint32_t col) {
     mod->imports = (AjsImportEntry *)realloc(mod->imports, (mod->import_count + 1u) * sizeof(AjsImportEntry));
     AjsImportEntry *ie = &mod->imports[mod->import_count++];
     ie->module_specifier = spec;
@@ -4454,7 +4750,7 @@ static void mod_add_import_entry(AjsModuleRecord *mod, AjsString *spec, AjsStrin
 }
 
 static void mod_add_export_entry(AjsModuleRecord *mod, AjsString *exp_name, AjsString *spec,
-                                 AjsString *imp_name, AjsString *loc_name, uint16_t slot,
+                                 AjsString *imp_name, AjsString *loc_name, uint32_t slot,
                                  uint32_t line, uint32_t col) {
     mod->exports = (AjsExportEntry *)realloc(mod->exports, (mod->export_count + 1u) * sizeof(AjsExportEntry));
     AjsExportEntry *ee = &mod->exports[mod->export_count++];
@@ -4473,7 +4769,7 @@ static void mod_export_pattern_bindings(AjsVm *vm, AjsCompiler *c, AjsModuleReco
         case AST_IDENT: {
             AjsString *nm = ajs_str_from_utf16(vm, pat->u.ident.u16, pat->u.ident.len, true);
             int32_t idx = comp_scope_find_own(&c->base_scope, pat->u.ident.u16, pat->u.ident.len, false);
-            uint16_t slot = idx >= 0 ? c->base_scope.locals[idx].slot : 0xFFFF;
+            uint32_t slot = idx >= 0 ? c->base_scope.locals[idx].slot : AJS_NO_SLOT;
             mod_add_export_entry(mod, nm, NULL, NULL, nm, slot, pat->line, pat->col);
             break;
         }
@@ -4517,6 +4813,8 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
     size_t rs = ajs_temp_root_save(vm);
     AjsCompiler c;
     init_compiler(&c, vm, realm, NULL, prog->u.program.has_tla ? AJS_FN_BC_ASYNC : AJS_FN_BC_NORMAL, true, mod->url);
+    c.src_base = utf8_code;
+    c.src_buf = ajs_source_buf_new(utf8_code, code_len);
     c.mod = mod;
     c.bc->is_module = true;
     c.bc->name = ajs_str_from_cstr(vm, mod->url ? mod->url : "<module>", true);
@@ -4527,14 +4825,12 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
     memset(&scan, 0, sizeof(scan));
     scan_fn_ast(prog, false, &scan);
     if (scan.has_arrow_or_super) {
-        /* Module top-level `this` is `undefined`! Arrows at module top-level read `<this>` = undefined */
         c.bc->this_slot = comp_scope_add(&c, &c.base_scope, NULL, 0, BIND_VAR, false);
     }
 
     AjsString *str_star = ajs_str_from_cstr(vm, "*", true);
     static const uint16_t u_def_star[9] = {'*','d','e','f','a','u','l','t','*'};
 
-    /* 1. Register `import` bindings in `base_scope` first */
     for (uint32_t i = 0; i < prog->u.program.body.count; i++) {
         AjsAstNode *st = prog->u.program.body.items[i];
         if (!st || st->kind != AST_IMPORT_DECL) continue;
@@ -4542,7 +4838,7 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
         mod_add_requested_spec(mod, spec);
         for (uint32_t j = 0; j < st->u.mod_decl.specifiers.count; j++) {
             AjsAstNode *sp = st->u.mod_decl.specifiers.items[j];
-            uint16_t slot = comp_scope_add(&c, &c.base_scope, sp->u.spec.local_u16, sp->u.spec.local_len, BIND_IMPORT, false);
+            uint32_t slot = comp_scope_add(&c, &c.base_scope, sp->u.spec.local_u16, sp->u.spec.local_len, BIND_IMPORT, false);
             AjsString *loc_str = ajs_str_from_utf16(vm, sp->u.spec.local_u16, sp->u.spec.local_len, true);
             AjsString *imp_str = sp->u.spec.is_namespace ? str_star :
                                  ajs_str_from_utf16(vm, sp->u.spec.imported_u16, sp->u.spec.imported_len, true);
@@ -4550,7 +4846,6 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
         }
     }
 
-    /* 2. Hoist module `var` & top-level `let`/`const`/`class`/`function` + synthetic `*default*` */
     for (uint32_t i = 0; i < prog->u.program.body.count; i++) {
         AjsAstNode *st = prog->u.program.body.items[i];
         if (!st) continue;
@@ -4572,7 +4867,6 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
     }
     collect_block_lex_in_list(&c, &c.base_scope, &prog->u.program.body, false);
 
-    /* 3. Build `AjsExportEntry` table (preserving exact source order of requested_specifiers!) */
     for (uint32_t i = 0; i < prog->u.program.body.count; i++) {
         AjsAstNode *st = prog->u.program.body.items[i];
         if (!st) continue;
@@ -4580,13 +4874,11 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
             AjsString *spec = ajs_str_from_utf16(vm, st->u.mod_decl.source_u16, st->u.mod_decl.source_len, true);
             mod_add_requested_spec(mod, spec);
             if (st->u.mod_decl.specifiers.count > 0) {
-                /* `export * as ns from "mod"` */
                 AjsAstNode *sp = st->u.mod_decl.specifiers.items[0];
                 AjsString *exp_str = ajs_str_from_utf16(vm, sp->u.spec.exported_u16, sp->u.spec.exported_len, true);
-                mod_add_export_entry(mod, exp_str, spec, str_star, NULL, 0xFFFF, sp->line, sp->col);
+                mod_add_export_entry(mod, exp_str, spec, str_star, NULL, AJS_NO_SLOT, sp->line, sp->col);
             } else {
-                /* `export * from "mod"` */
-                mod_add_export_entry(mod, NULL, spec, str_star, NULL, 0xFFFF, st->line, st->col);
+                mod_add_export_entry(mod, NULL, spec, str_star, NULL, AJS_NO_SLOT, st->line, st->col);
             }
         } else if (st->kind == AST_EXPORT_DEFAULT_DECL) {
             AjsAstNode *d = st->u.mod_decl.decl;
@@ -4598,19 +4890,18 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
                 lu = d->u.klass.name_u16; ll = d->u.klass.name_len;
             }
             int32_t idx = comp_scope_find_own(&c.base_scope, lu, ll, false);
-            uint16_t slot = idx >= 0 ? c.base_scope.locals[idx].slot : 0xFFFF;
+            uint32_t slot = idx >= 0 ? c.base_scope.locals[idx].slot : AJS_NO_SLOT;
             AjsString *loc_str = ajs_str_from_utf16(vm, lu, ll, true);
             mod_add_export_entry(mod, vm->str_default, NULL, NULL, loc_str, slot, st->line, st->col);
         } else if (st->kind == AST_EXPORT_NAMED_DECL) {
             if (st->u.mod_decl.source_u16) {
-                /* Re-export: `export { a as b } from "mod"` */
                 AjsString *spec = ajs_str_from_utf16(vm, st->u.mod_decl.source_u16, st->u.mod_decl.source_len, true);
                 mod_add_requested_spec(mod, spec);
                 for (uint32_t j = 0; j < st->u.mod_decl.specifiers.count; j++) {
                     AjsAstNode *sp = st->u.mod_decl.specifiers.items[j];
                     AjsString *imp_str = ajs_str_from_utf16(vm, sp->u.spec.imported_u16, sp->u.spec.imported_len, true);
                     AjsString *exp_str = ajs_str_from_utf16(vm, sp->u.spec.exported_u16, sp->u.spec.exported_len, true);
-                    mod_add_export_entry(mod, exp_str, spec, imp_str, NULL, 0xFFFF, sp->line, sp->col);
+                    mod_add_export_entry(mod, exp_str, spec, imp_str, NULL, AJS_NO_SLOT, sp->line, sp->col);
                 }
             } else if (st->u.mod_decl.decl) {
                 AjsAstNode *d = st->u.mod_decl.decl;
@@ -4621,27 +4912,25 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
                 } else if (d->kind == AST_FUNC_DECL && d->u.func.name_u16) {
                     AjsString *nm = ajs_str_from_utf16(vm, d->u.func.name_u16, d->u.func.name_len, true);
                     int32_t idx = comp_scope_find_own(&c.base_scope, d->u.func.name_u16, d->u.func.name_len, false);
-                    mod_add_export_entry(mod, nm, NULL, NULL, nm, idx >= 0 ? c.base_scope.locals[idx].slot : 0xFFFF, d->line, d->col);
+                    mod_add_export_entry(mod, nm, NULL, NULL, nm, idx >= 0 ? c.base_scope.locals[idx].slot : AJS_NO_SLOT, d->line, d->col);
                 } else if (d->kind == AST_CLASS_DECL && d->u.klass.name_u16) {
                     AjsString *nm = ajs_str_from_utf16(vm, d->u.klass.name_u16, d->u.klass.name_len, true);
                     int32_t idx = comp_scope_find_own(&c.base_scope, d->u.klass.name_u16, d->u.klass.name_len, false);
-                    mod_add_export_entry(mod, nm, NULL, NULL, nm, idx >= 0 ? c.base_scope.locals[idx].slot : 0xFFFF, d->line, d->col);
+                    mod_add_export_entry(mod, nm, NULL, NULL, nm, idx >= 0 ? c.base_scope.locals[idx].slot : AJS_NO_SLOT, d->line, d->col);
                 }
             } else {
-                /* Local export list: `export { x as y }` (note: if `x` was imported, ECMA-262 §16.2.1.6.1
-                 * converts indirect re-export of an imported binding to an indirect export entry!) */
                 for (uint32_t j = 0; j < st->u.mod_decl.specifiers.count; j++) {
                     AjsAstNode *sp = st->u.mod_decl.specifiers.items[j];
                     AjsString *loc_str = ajs_str_from_utf16(vm, sp->u.spec.local_u16, sp->u.spec.local_len, true);
                     AjsString *exp_str = ajs_str_from_utf16(vm, sp->u.spec.exported_u16, sp->u.spec.exported_len, true);
                     int32_t idx = comp_scope_find_own(&c.base_scope, sp->u.spec.local_u16, sp->u.spec.local_len, false);
-                    uint16_t slot = idx >= 0 ? c.base_scope.locals[idx].slot : 0xFFFF;
+                    uint32_t slot = idx >= 0 ? c.base_scope.locals[idx].slot : AJS_NO_SLOT;
                     bool was_import = false;
                     for (uint32_t k = 0; k < mod->import_count; k++) {
                         if (ajs_str_eq(mod->imports[k].local_name, loc_str) &&
                             !ajs_str_eq_cstr(mod->imports[k].import_name, "*")) {
                             mod_add_export_entry(mod, exp_str, mod->imports[k].module_specifier,
-                                                 mod->imports[k].import_name, NULL, 0xFFFF, sp->line, sp->col);
+                                                 mod->imports[k].import_name, NULL, AJS_NO_SLOT, sp->line, sp->col);
                             was_import = true;
                             break;
                         }
@@ -4656,22 +4945,36 @@ bool ajs_parse_and_compile_module(AjsVm *vm, AjsRealm *realm, AjsModuleRecord *m
 
     if (!instantiate_hoisted_funcs(&c, &c.base_scope, &prog->u.program.body, false)) goto fail;
 
-    for (uint32_t i = 0; i < prog->u.program.body.count; i++) {
-        if (!compile_stmt(&c, prog->u.program.body.items[i])) goto fail;
+    {
+        uint32_t mod_disp_fin = UINT32_MAX;
+        if (c.base_scope.has_disp_stack) {
+            mod_disp_fin = emit_dispose_enter(&c, 0, c.base_scope.disp_slot);
+        }
+        for (uint32_t i = 0; i < prog->u.program.body.count; i++) {
+            if (!compile_stmt(&c, prog->u.program.body.items[i])) goto fail;
+        }
+        if (c.base_scope.has_disp_stack) {
+            emit_dispose_finally(&c, 0, c.base_scope.disp_slot, mod_disp_fin);
+        }
     }
 
     emit_op(&c, OP_UNDEF);
     emit_op(&c, OP_RETURN);
 
+    ajs_source_buf_release(c.src_buf);
     finalize_base_scope_metadata(&c);
     ajs_arena_free(&arena);
-    ajs_temp_root_restore(vm, rs);
     vm->gc_suppress--;
+    if (vm->gc_suppress == 0 && vm->gc_bytes > vm->gc_threshold) {
+        ajs_gc_collect(vm);
+    }
+    ajs_temp_root_restore(vm, rs);
     return true;
 
 fail:
     fill_comp_err(&c, mod->url, out_err);
-    free(c.base_scope.locals);
+    ajs_source_buf_release(c.src_buf);
+    cleanup_compiler(&c);
     ajs_arena_free(&arena);
     ajs_temp_root_restore(vm, rs);
     vm->gc_suppress--;

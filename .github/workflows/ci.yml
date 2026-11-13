@@ -60,10 +60,10 @@ jobs:
       - name: Build & Verify Linux Installers (.deb + Self-Extracting .run + Uninstaller)
         run: |
           mkdir -p dist-linux
-          bash installer/linux/build_deb.sh ./build dist-linux/waterscape_2.0.0_amd64.deb
-          bash installer/linux/build_run_installer.sh ./build dist-linux/Waterscape-2.0.0-linux-x86_64.run
-          ./dist-linux/Waterscape-2.0.0-linux-x86_64.run --check
-          ./dist-linux/Waterscape-2.0.0-linux-x86_64.run --prefix /tmp/ws-ci-inst --no-xdg --yes
+          bash installer/linux/build_deb.sh ./build dist-linux/waterscape_2.1.0_amd64.deb
+          bash installer/linux/build_run_installer.sh ./build dist-linux/Waterscape-2.1.0-linux-x86_64.run
+          ./dist-linux/Waterscape-2.1.0-linux-x86_64.run --check
+          ./dist-linux/Waterscape-2.1.0-linux-x86_64.run --prefix /tmp/ws-ci-inst --no-xdg --yes
           /tmp/ws-ci-inst/bin/waterscape --headless
           /tmp/ws-ci-inst/uninstall.sh
           test ! -e /tmp/ws-ci-inst/bin/waterscape
@@ -115,7 +115,7 @@ jobs:
           ! i686-w64-mingw32-objdump -p build-win2k/waterscape.exe build-win2k/arcr_js.exe build-win2k/win32_ui_verify.exe build-win2k/WaterscapeSetup.exe build-win2k/uninstall.exe build-win2k/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread|vcruntime|api-ms-win|dwmapi|uxtheme|shcore|uiautomationcore|d3d11|dxgi|mfplat)"
           ! i686-w64-mingw32-objdump -x build-win2k/arcr_js_portable.dll | grep -iE "JS_NewRuntime|JS_NewContext"
           mkdir -p dist-win2k/addons
-          cp build-win2k/WaterscapeSetup.exe dist-win2k/WaterscapeSetup-2.0.0-win2000-x86.exe
+          cp build-win2k/WaterscapeSetup.exe dist-win2k/WaterscapeSetup-2.1.0-win2000-x86.exe
           cp build-win2k/*.exe build-win2k/*.dll dist-win2k/
           cp build-win2k/addons/*.wsx dist-win2k/addons/
           ls -lh dist-win2k/ dist-win2k/addons/
@@ -152,7 +152,7 @@ jobs:
           ! x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe build-win64/arcr_js.exe build-win64/win32_ui_verify.exe build-win64/WaterscapeSetup.exe build-win64/uninstall.exe build-win64/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread)"
           ! x86_64-w64-mingw32-objdump -x build-win64/arcr_js_portable.dll | grep -iE "JS_NewRuntime|JS_NewContext"
           mkdir -p dist-win64/addons
-          cp build-win64/WaterscapeSetup.exe dist-win64/WaterscapeSetup-2.0.0-x64.exe
+          cp build-win64/WaterscapeSetup.exe dist-win64/WaterscapeSetup-2.1.0-x64.exe
           cp build-win64/*.exe build-win64/*.dll dist-win64/
           cp build-win64/addons/*.wsx dist-win64/addons/
           ls -lh dist-win64/ dist-win64/addons/
@@ -191,10 +191,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path ui_snaps_x86 | Out-Null
           ./win32_ui_verify.exe --exe waterscape.exe --module-dir . --theme classic --extra-arg "--classic-frame" --url waterscape://addons --out-dir ui_snaps_x86 --report win32_ui_report_x86.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./WaterscapeSetup-2.0.0-win2000-x86.exe --verify-stub
+          ./WaterscapeSetup-2.1.0-win2000-x86.exe --verify-stub
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $inst32 = Join-Path $env:RUNNER_TEMP "ws_inst_x86"
-          ./WaterscapeSetup-2.0.0-win2000-x86.exe --silent --dir "$inst32" --no-shortcuts --no-registry
+          ./WaterscapeSetup-2.1.0-win2000-x86.exe --silent --dir "$inst32" --no-shortcuts --no-registry
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$inst32\waterscape.exe" --module-dir "$inst32" --headless | Out-Host
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -215,10 +215,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./arcradient.exe --module-dir . --benchmark
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./WaterscapeSetup-2.0.0-x64.exe --verify-stub
+          ./WaterscapeSetup-2.1.0-x64.exe --verify-stub
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $inst64 = Join-Path $env:RUNNER_TEMP "ws_inst_x64"
-          ./WaterscapeSetup-2.0.0-x64.exe --silent --dir "$inst64" --no-shortcuts --no-registry
+          ./WaterscapeSetup-2.1.0-x64.exe --silent --dir "$inst64" --no-shortcuts --no-registry
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & "$inst64\waterscape.exe" --module-dir "$inst64" --headless | Out-Host
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -275,21 +275,21 @@ jobs:
           sha256sum WaterscapeSetup-*-x64.exe WaterscapeSetup-*-win2000-x86.exe waterscape_*_amd64.deb Waterscape-*-linux-x86_64.run > SHA256SUMS.txt
           cat SHA256SUMS.txt
           cat <<'EOF' > ../RELEASE_NOTES.md
-          # Waterscape Browser 2.0.0 (`Arcradient` / `MSHTML-Next` Pure C11 Modern Web Engine)
+          # Waterscape Browser 2.1.0 (`Arcradient` / `MSHTML-Next` Pure C11 2026 Modern Web Engine)
 
-          **Waterscape 2.0**은 **Windows 2000 SP4 (`PE 5.0` · Pentium III `SSE1`)** 구형 PC부터 최신 **멀티코어 64비트 Windows 10/11 및 Linux X11** 데스크톱까지 단일 **순수 C11 (Zero-Chromium)** 아키텍처로 구동되는 초경량·초고속 2026년 모던 웹 브라우저입니다.
+          **Waterscape 2.1.0**은 **Windows 2000 SP4 (`PE 5.0` · Pentium III `SSE1`)** 구형 PC부터 최신 **멀티코어 64비트 Windows 10/11 및 Linux X11** 데스크톱까지 단일 **순수 C11 (Zero-Chromium · Zero-External-JS-Engine)** 아키텍처로 구동되는 초경량·초고속 2026년 모던 웹 브라우저입니다.
 
           ## 공식 설치 프로그램 (Official Verified Installers)
-          - **`WaterscapeSetup-2.0.0-x64.exe`**: Windows 64-bit 단일 파일 GUI 설치 마법사 & 무인 인스톨러 (`SSE3` 기준선 + 런타임 `AVX2` & `D3D11`/`Vulkan`/`D3D9` 하드웨어 가속 + `uninstall.exe` 내장)
-          - **`WaterscapeSetup-2.0.0-win2000-x86.exe`**: Windows 2000 SP4 ~ Windows 11 호환 32-bit 단일 파일 설치 마법사 (`PE 5.0` · `SSE1` 기준선 · 외부 런타임 DLL 의존성 `0`개)
-          - **`waterscape_2.0.0_amd64.deb`**: Debian / Ubuntu Linux `amd64` 패키지 (`X11 MIT-SHM` + `Vulkan` + `OpenSSL` + `FreeType`)
-          - **`Waterscape-2.0.0-linux-x86_64.run`**: 모든 Linux `x86_64` 배포판용 SHA-256 무결성 검증 자가 설치 인스톨러 (`uninstall.sh` 자동 생성)
+          - **`WaterscapeSetup-2.1.0-x64.exe`**: Windows 64-bit 단일 파일 GUI 설치 마법사 & 무인 인스톨러 (`SSE3` 기준선 + 런타임 `AVX2` & `D3D11`/`Vulkan`/`D3D9` 하드웨어 가속 + `uninstall.exe` 내장)
+          - **`WaterscapeSetup-2.1.0-win2000-x86.exe`**: Windows 2000 SP4 ~ Windows 11 호환 32-bit 단일 파일 설치 마법사 (`PE 5.0` · `SSE1` 기준선 · 외부 런타임 DLL 의존성 `0`개)
+          - **`waterscape_2.1.0_amd64.deb`**: Debian / Ubuntu Linux `amd64` 패키지 (`X11 MIT-SHM` + `Vulkan` + `OpenSSL` + `FreeType`)
+          - **`Waterscape-2.1.0-linux-x86_64.run`**: 모든 Linux `x86_64` 배포판용 SHA-256 무결성 검증 자가 설치 인스톨러 (`uninstall.sh` 자동 생성)
           - **`SHA256SUMS.txt`**: 전 플랫폼 설치 파일 SHA-256 체크섬 목록
 
-          ## Waterscape 2.0 핵심 업그레이드
-          1. **단일 창 프레임 소유권 & 무지연 멀티코어 UI**: Win32 DWM 확장 타이틀바 + Per-Monitor V2 DPI + UI Automation + 탭별 전용 프레임버퍼 캐시, 비동기 서브리소스 배칭 및 `64×64` SIMD 타일 래스터라이저
-          2. **선명한 sRGB 감마 보정 폰트 안티에일리어싱**: 256단계 스템 다크닝 & 감마 보정 안티에일리어싱(`ClearType`/`FreeType Light`)으로 한글·영문·코드 가독성 극대화
-          3. **자체 클린룸 Pure C11 `ArcradientJS` ES2026 엔진 & 분리형 Web IDL 호스트**: 외부 JS 엔진 의존성 `0`개의 자체 `ArcradientJS` 바이트코드 VM/GC/ESM + 모던 Web API(`fetch`/Streams, `CustomElements`/`ShadowRoot`, `History` `pushState`, `IndexedDB`, `WebCrypto`, `Canvas 2D`), `Brotli(br)` / `WebP` / `SVG`, CSS 2026(`@layer`, `revert-layer`, `@container`, `@scope`, `oklch()`, Grid/Flex) 지원
+          ## Waterscape 2.1.0 핵심 업그레이드
+          1. **클린룸 Pure C11 `ArcradientJS` ES2026 풀 엔진 & 메가번들 VM**: 외부 JS 엔진 심볼 `0`개! `using` / `await using` / `DisposableStack` / `AsyncDisposableStack` / `SuppressedError`, `Math.sumPrecise` (2400-bit 고정밀 누적기), `Map`/`WeakMap.prototype.getOrInsert*` (Symbol 약한 키 포함), `Intl.DurationFormat`, `RegExp.escape`, `Uint8Array` Base64/Hex, `Iterator` 헬퍼, `Set` 연산자 및 >32K 상수/로컬 10MB+ 모던 번들 확장 바이트코드 VM 탑재
+          2. **단일 창 프레임 소유권 (Single-Frame Ownership) & 네이티브 Win32 UIA/DPI 검증 (`20/20`)**: Win32 DWM 확장 타이틀바 + Win2000 클래식 폴백, Per-Monitor V2 실시간 DPI 리스케일링(`96/120/144/192`), 순수 C11 UI Automation Provider(`IRawElementProviderSimple`/`Fragment`/`FragmentRoot`), 내장 DevTools(`F12`: Elements/Console/Network/Runtime)
+          3. **2026 모던 웹 표준 & 실전 사이트 호환성 강화**: CSS `@layer` / `revert-layer` / `@container` / `@scope` / `oklch()` / `:has()` / CSS Nesting, WHATWG `fetch`/Streams/`CustomElements`/`ShadowRoot`/`Constructable CSSStyleSheet`/`HTMLScriptElement`/`document.currentScript`/`IndexedDB`/`WebCrypto`, 256MB x64 JS 힙 확장 및 수학 기호 폰트 폴백 지원
           EOF
           sed -i 's/^          //' ../RELEASE_NOTES.md
           if gh release view "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
@@ -297,7 +297,7 @@ jobs:
               WaterscapeSetup-*-x64.exe WaterscapeSetup-*-win2000-x86.exe waterscape_*_amd64.deb Waterscape-*-linux-x86_64.run SHA256SUMS.txt
           else
             gh release create "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" \
-              --title "Waterscape Browser ${GITHUB_REF_NAME#v} (Arcradient Pure C11 Modern Engine)" \
+              --title "Waterscape Browser ${GITHUB_REF_NAME#v} (Arcradient Pure C11 ES2026 Engine)" \
               --notes-file ../RELEASE_NOTES.md \
               WaterscapeSetup-*-x64.exe WaterscapeSetup-*-win2000-x86.exe waterscape_*_amd64.deb Waterscape-*-linux-x86_64.run SHA256SUMS.txt
           fi

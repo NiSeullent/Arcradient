@@ -7,6 +7,8 @@
 typedef struct AjsDeclEntry {
     const uint16_t *u16;
     uint32_t        len;
+    uint32_t        hash;
+    int32_t         hash_next;
     bool            is_lex;     /* let / const / class / strict-block-fn */
     bool            is_param;
     bool            is_catch_simple;
@@ -19,6 +21,8 @@ typedef struct AjsParseScope {
     uint32_t              count;
     uint32_t              cap;
     AjsDeclEntry         *entries;
+    uint32_t              hash_cap;
+    int32_t              *hash_tab;
 } AjsParseScope;
 
 typedef struct AjsLabelEntry {
@@ -206,6 +210,55 @@ static void scope_pop(AjsParser *p) {
     if (p->scope) p->scope = p->scope->parent;
 }
 
+static void scope_rebuild_hash(AjsParser *p, AjsParseScope *sc, uint32_t ncap) {
+    int32_t *nt = (int32_t *)ajs_arena_alloc(p->arena, ncap * sizeof(int32_t));
+    for (uint32_t i = 0; i < ncap; i++) nt[i] = -1;
+    uint32_t mask = ncap - 1u;
+    for (uint32_t i = 0; i < sc->count; i++) {
+        uint32_t b = sc->entries[i].hash & mask;
+        sc->entries[i].hash_next = nt[b];
+        nt[b] = (int32_t)i;
+    }
+    sc->hash_tab = nt;
+    sc->hash_cap = ncap;
+}
+
+static int32_t scope_find_entry(const AjsParseScope *sc, const uint16_t *u16, uint32_t len, uint32_t h) {
+    if (sc->hash_tab) {
+        for (int32_t i = sc->hash_tab[h & (sc->hash_cap - 1u)]; i >= 0; i = sc->entries[i].hash_next) {
+            if (sc->entries[i].hash == h && u16_eq(sc->entries[i].u16, sc->entries[i].len, u16, len)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    for (uint32_t i = 0; i < sc->count; i++) {
+        if (sc->entries[i].hash == h && u16_eq(sc->entries[i].u16, sc->entries[i].len, u16, len)) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static int32_t scope_find_lex_entry(const AjsParseScope *sc, const uint16_t *u16, uint32_t len, uint32_t h, bool ignore_catch_simple) {
+    if (sc->hash_tab) {
+        for (int32_t i = sc->hash_tab[h & (sc->hash_cap - 1u)]; i >= 0; i = sc->entries[i].hash_next) {
+            if (sc->entries[i].is_lex && (!ignore_catch_simple || !sc->entries[i].is_catch_simple) &&
+                sc->entries[i].hash == h && u16_eq(sc->entries[i].u16, sc->entries[i].len, u16, len)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+    for (uint32_t i = 0; i < sc->count; i++) {
+        if (sc->entries[i].is_lex && (!ignore_catch_simple || !sc->entries[i].is_catch_simple) &&
+            sc->entries[i].hash == h && u16_eq(sc->entries[i].u16, sc->entries[i].len, u16, len)) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
 static void scope_add_raw(AjsParser *p, AjsParseScope *sc, const uint16_t *u16, uint32_t len,
                           bool is_lex, bool is_param, bool is_catch_simple) {
     if (sc->count >= sc->cap) {
@@ -215,12 +268,27 @@ static void scope_add_raw(AjsParser *p, AjsParseScope *sc, const uint16_t *u16, 
         sc->entries = ne;
         sc->cap = ncap;
     }
-    AjsDeclEntry *e = &sc->entries[sc->count++];
+    uint32_t idx = sc->count++;
+    uint32_t h = ajs_hash_utf16(u16, len);
+    AjsDeclEntry *e = &sc->entries[idx];
     e->u16 = u16;
     e->len = len;
+    e->hash = h;
+    e->hash_next = -1;
     e->is_lex = is_lex;
     e->is_param = is_param;
     e->is_catch_simple = is_catch_simple;
+    if (sc->hash_tab) {
+        if (sc->count > sc->hash_cap) {
+            scope_rebuild_hash(p, sc, sc->hash_cap * 2u);
+        } else {
+            uint32_t b = h & (sc->hash_cap - 1u);
+            e->hash_next = sc->hash_tab[b];
+            sc->hash_tab[b] = (int32_t)idx;
+        }
+    } else if (sc->count >= 24u) {
+        scope_rebuild_hash(p, sc, 64u);
+    }
 }
 
 static void scope_declare_lex(AjsParser *p, const uint16_t *u16, uint32_t len, uint32_t line, uint32_t col) {
@@ -229,28 +297,26 @@ static void scope_declare_lex(AjsParser *p, const uint16_t *u16, uint32_t len, u
         return;
     }
     AjsParseScope *sc = p->scope;
-    for (uint32_t i = 0; i < sc->count; i++) {
-        if (u16_eq(sc->entries[i].u16, sc->entries[i].len, u16, len)) {
-            parse_error_at(p, line, col, "Identifier has already been declared");
-            return;
-        }
+    uint32_t h = ajs_hash_utf16(u16, len);
+    if (scope_find_entry(sc, u16, len, h) >= 0) {
+        parse_error_at(p, line, col, "Identifier has already been declared");
+        return;
     }
     scope_add_raw(p, sc, u16, len, true, false, false);
 }
 
 static void scope_declare_var(AjsParser *p, const uint16_t *u16, uint32_t len, uint32_t line, uint32_t col) {
     AjsParseScope *cur = p->scope;
+    uint32_t h = ajs_hash_utf16(u16, len);
     while (cur) {
-        for (uint32_t i = 0; i < cur->count; i++) {
-            if (u16_eq(cur->entries[i].u16, cur->entries[i].len, u16, len)) {
-                if (cur->entries[i].is_lex && !cur->entries[i].is_catch_simple) {
-                    parse_error_at(p, line, col, "Identifier has already been lexically declared");
-                    return;
-                }
-            }
+        if (scope_find_lex_entry(cur, u16, len, h, true) >= 0) {
+            parse_error_at(p, line, col, "Identifier has already been lexically declared");
+            return;
         }
         if (cur->is_func_root) {
-            scope_add_raw(p, cur, u16, len, false, false, false);
+            if (scope_find_entry(cur, u16, len, h) < 0) {
+                scope_add_raw(p, cur, u16, len, false, false, false);
+            }
             return;
         }
         cur = cur->parent;
@@ -1937,12 +2003,9 @@ static AjsAstNode *parse_func_ex(AjsParser *p, bool is_decl, bool allow_anon_dec
                 scope_declare_lex(p, name_tok.u16_data, name_tok.u16_len, name_tok.line, name_tok.col);
             } else {
                 /* Sloppy block Annex B.3.3: cannot collide with lexical binding in same block */
-                for (uint32_t i = 0; i < p->scope->count; i++) {
-                    if (u16_eq(p->scope->entries[i].u16, p->scope->entries[i].len, name_tok.u16_data, name_tok.u16_len) &&
-                        p->scope->entries[i].is_lex) {
-                        parse_error_tok(p, name_tok, "Identifier has already been lexically declared");
-                        break;
-                    }
+                uint32_t nh = ajs_hash_utf16(name_tok.u16_data, name_tok.u16_len);
+                if (scope_find_lex_entry(p->scope, name_tok.u16_data, name_tok.u16_len, nh, false) >= 0) {
+                    parse_error_tok(p, name_tok, "Identifier has already been lexically declared");
                 }
                 scope_add_raw(p, p->scope, name_tok.u16_data, name_tok.u16_len, false, false, false);
             }
@@ -2032,14 +2095,12 @@ static AjsAstNode *parse_func_ex(AjsParser *p, bool is_decl, bool allow_anon_dec
         declare_pattern_names(p, fn->u.func.params.items[i], false, forbid_dup_params, &seen);
     }
     /* Check body lexical declarations do not collide with parameter names */
-    for (uint32_t i = 0; i < p->scope->count && !p->had_error; i++) {
-        if (!p->scope->entries[i].is_lex) continue;
-        for (uint32_t j = 0; j < seen.count; j++) {
-            AjsAstNode *pn = seen.items[j];
-            if (u16_eq(p->scope->entries[i].u16, p->scope->entries[i].len, pn->u.ident.u16, pn->u.ident.len)) {
-                parse_error_at(p, pn->line, pn->col, "Identifier has already been declared as parameter");
-                break;
-            }
+    for (uint32_t j = 0; j < seen.count && !p->had_error; j++) {
+        AjsAstNode *pn = seen.items[j];
+        uint32_t ph = ajs_hash_utf16(pn->u.ident.u16, pn->u.ident.len);
+        if (scope_find_lex_entry(p->scope, pn->u.ident.u16, pn->u.ident.len, ph, false) >= 0) {
+            parse_error_at(p, pn->line, pn->col, "Identifier has already been declared as parameter");
+            break;
         }
     }
 
@@ -2378,13 +2439,25 @@ static AjsAstNode *parse_class(AjsParser *p, bool is_decl) {
  * ============================================================================ */
 
 static AjsAstNode *parse_var_decl_list(AjsParser *p, AjsVarKind vkind, bool in_for_head) {
-    AjsToken start = p_advance(p); /* KW_VAR / KW_LET / KW_CONST */
+    AjsToken start = p_advance(p); /* KW_VAR / KW_LET / KW_CONST / using / KW_AWAIT */
+    if (vkind == AJS_VAR_AWAIT_USING) {
+        if (p->in_static_block) {
+            parse_error_tok(p, start, "'await using' is not allowed in class static block");
+        }
+        if (!p->in_function && p->is_module) {
+            p->saw_top_await = true;
+        }
+        p_advance(p); /* contextual 'using' */
+    }
     AjsAstNode *vd = ast_new(p, AST_VAR_DECL, start.line, start.col);
     vd->u.var_decl.var_kind = vkind;
 
     while (!p->had_error) {
         AjsAstNode *pat = parse_binding_pattern_or_ident(p);
         if (!pat || p->had_error) break;
+        if ((vkind == AJS_VAR_USING || vkind == AJS_VAR_AWAIT_USING) && pat->kind != AST_IDENT) {
+            parse_error_at(p, pat->line, pat->col, "Destructuring pattern is not allowed in 'using' declaration");
+        }
         declare_pattern_names(p, pat, vkind != AJS_VAR_VAR, false, NULL);
 
         AjsAstNode *decl = ast_new(p, AST_VAR_DECLARATOR, pat->line, pat->col);
@@ -2395,8 +2468,8 @@ static AjsAstNode *parse_var_decl_list(AjsParser *p, AjsVarKind vkind, bool in_f
         } else if (!in_for_head || (p->lex.cur.kind != KW_IN &&
                    !(p->lex.cur.kind == TOK_IDENT && !p->lex.cur.has_escape &&
                      u16_eq_ascii(p->lex.cur.u16_data, p->lex.cur.u16_len, "of")))) {
-            if (vkind == AJS_VAR_CONST) {
-                parse_error_at(p, pat->line, pat->col, "Missing initializer in const declaration");
+            if (vkind == AJS_VAR_CONST || vkind == AJS_VAR_USING || vkind == AJS_VAR_AWAIT_USING) {
+                parse_error_at(p, pat->line, pat->col, "Missing initializer in const/using declaration");
             } else if (pat->kind != AST_IDENT) {
                 parse_error_at(p, pat->line, pat->col, "Missing initializer in destructuring declaration");
             }
@@ -2417,6 +2490,45 @@ static bool is_let_lexical_decl_start(AjsParser *p) {
         return true;
     }
     return false;
+}
+
+static bool is_using_decl_start(AjsParser *p, bool in_for_head) {
+    AjsToken cur = p->lex.cur;
+    if (cur.kind != TOK_IDENT || cur.has_escape || !u16_eq_ascii(cur.u16_data, cur.u16_len, "using")) {
+        return false;
+    }
+    AjsLexer saved = p->lex;
+    AjsToken t1 = ajs_lexer_next(&p->lex);
+    bool ok = false;
+    if (!t1.had_newline && t1.kind != KW_LET &&
+        (is_ident_reference_tok(p, t1) || t1.kind == TOK_LBRACE)) {
+        if (!in_for_head) {
+            ok = true;
+        } else if (t1.kind == TOK_LBRACE) {
+            ok = true;
+        } else {
+            AjsToken t2 = ajs_lexer_next(&p->lex);
+            if (t2.kind == TOK_ASSIGN || t2.kind == TOK_COMMA || t2.kind == TOK_SEMI || t2.kind == KW_IN ||
+                (t2.kind == TOK_IDENT && !t2.has_escape && u16_eq_ascii(t2.u16_data, t2.u16_len, "of"))) {
+                ok = true;
+            }
+        }
+    }
+    p->lex = saved;
+    return ok;
+}
+
+static bool is_await_using_decl_start(AjsParser *p, bool in_for_head) {
+    if (p->lex.cur.kind != KW_AWAIT || p->lex.cur.has_escape) return false;
+    if (!p->in_async && !(p->is_module && !p->in_function)) return false;
+    AjsLexer saved = p->lex;
+    AjsToken t1 = ajs_lexer_next(&p->lex);
+    bool ok = false;
+    if (!t1.had_newline) {
+        ok = is_using_decl_start(p, in_for_head);
+    }
+    p->lex = saved;
+    return ok;
 }
 
 static AjsAstNode *parse_for_stmt(AjsParser *p) {
@@ -2447,6 +2559,12 @@ static AjsAstNode *parse_for_stmt(AjsParser *p) {
     } else if (p->lex.cur.kind == KW_CONST) {
         init = parse_var_decl_list(p, AJS_VAR_CONST, true);
         init_is_decl = true;
+    } else if (is_await_using_decl_start(p, true)) {
+        init = parse_var_decl_list(p, AJS_VAR_AWAIT_USING, true);
+        init_is_decl = true;
+    } else if (is_using_decl_start(p, true)) {
+        init = parse_var_decl_list(p, AJS_VAR_USING, true);
+        init_is_decl = true;
     } else if (is_let_lexical_decl_start(p)) {
         init = parse_var_decl_list(p, AJS_VAR_LET, true);
         init_is_decl = true;
@@ -2476,6 +2594,10 @@ static AjsAstNode *parse_for_stmt(AjsParser *p) {
         if (!init) {
             parse_error_tok(p, ftok, "Invalid left-hand side in for-in/of loop");
         } else if (init_is_decl) {
+            if (is_in && (init->u.var_decl.var_kind == AJS_VAR_USING ||
+                          init->u.var_decl.var_kind == AJS_VAR_AWAIT_USING)) {
+                parse_error_at(p, init->line, init->col, "'using' declaration is not allowed in for-in statement");
+            }
             if (init->u.var_decl.decls.count != 1) {
                 parse_error_at(p, init->line, init->col, "Only a single variable declaration is allowed in for-in/of");
             } else {
@@ -3250,6 +3372,26 @@ static AjsAstNode *parse_stmt(AjsParser *p, bool allow_decl) {
             break;
     }
 
+    /* Check `await using` / `using` lexical declarations */
+    if (is_await_using_decl_start(p, false)) {
+        if (!allow_decl) {
+            parse_error_tok(p, cur, "'await using' declaration cannot appear in a single-statement context");
+            return NULL;
+        }
+        AjsAstNode *vd = parse_var_decl_list(p, AJS_VAR_AWAIT_USING, false);
+        p_consume_semicolon(p);
+        return vd;
+    }
+    if (is_using_decl_start(p, false)) {
+        if (!allow_decl) {
+            parse_error_tok(p, cur, "'using' declaration cannot appear in a single-statement context");
+            return NULL;
+        }
+        AjsAstNode *vd = parse_var_decl_list(p, AJS_VAR_USING, false);
+        p_consume_semicolon(p);
+        return vd;
+    }
+
     /* Check `async function` declaration */
     if (cur.kind == TOK_IDENT && !cur.has_escape && u16_eq_ascii(cur.u16_data, cur.u16_len, "async")) {
         AjsToken pk = ajs_lexer_peek(&p->lex);
@@ -3380,14 +3522,8 @@ AjsAstNode *ajs_parse_program(AjsVm *vm, AjsAstArena *arena, const char *src, si
                 st->u.mod_decl.source_u16 == NULL) {
                 for (uint32_t j = 0; j < st->u.mod_decl.specifiers.count; j++) {
                     AjsAstNode *sp = st->u.mod_decl.specifiers.items[j];
-                    bool declared = false;
-                    for (uint32_t k = 0; k < p.scope->count; k++) {
-                        if (u16_eq(p.scope->entries[k].u16, p.scope->entries[k].len,
-                                   sp->u.spec.local_u16, sp->u.spec.local_len)) {
-                            declared = true;
-                            break;
-                        }
-                    }
+                    uint32_t sh = ajs_hash_utf16(sp->u.spec.local_u16, sp->u.spec.local_len);
+                    bool declared = (scope_find_entry(p.scope, sp->u.spec.local_u16, sp->u.spec.local_len, sh) >= 0);
                     if (!declared) {
                         parse_error_at(&p, sp->line, sp->col, "Exported binding is not defined in module");
                         break;

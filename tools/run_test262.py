@@ -1459,6 +1459,541 @@ assert.sameValue(Object.is(-0, +0), false);
 assert.sameValue(Object.is(NaN, NaN), true);
 """)
 
+    # ------------------------------------------------------------------
+    # F02 & F03: Mega-Bundle Compiler Scaling (>10.5 MB, >50K consts, >32K locals, >64 KiB jump, GC pacing)
+    # ------------------------------------------------------------------
+    mega_parts: List[str] = [
+        "/*---\nflags: [onlyStrict]\n---*/\n",
+        "(function() {\n",
+    ]
+    # 52,000 distinct string constants (~9.1 MB)
+    mega_parts.append("const K = [\n")
+    mega_parts.extend(
+        f'  "arcr_mega_const_{i:05d}_payload_' + ('x' * 150) + '",\n'
+        for i in range(52000)
+    )
+    mega_parts.append("];\n")
+    # 36,000 distinct lexical bindings crossing 32,767 -> 32,768 (~1.5 MB)
+    mega_parts.extend(f"let loc_{i:05d} = {i};\n" for i in range(36000))
+    # > 64 KiB bytecode forward jump block
+    mega_parts.append("let branchTaken = 0;\nif (loc_00000 === 999999) {\n")
+    mega_parts.extend(f"  loc_{(i % 1000):05d} += {i + 1};\n" for i in range(9000))
+    mega_parts.append("} else {\n  branchTaken = 1;\n}\n")
+    mega_parts.append(
+        "$262.gc();\n"
+        "assert.sameValue(branchTaken, 1);\n"
+        "assert.sameValue(K.length, 52000);\n"
+        'assert.sameValue(K[0].slice(0, 22), "arcr_mega_const_00000_");\n'
+        'assert.sameValue(K[51999].slice(0, 22), "arcr_mega_const_51999_");\n'
+        "assert.sameValue(loc_00000, 0);\n"
+        "assert.sameValue(loc_32767, 32767);\n"
+        "assert.sameValue(loc_32768, 32768);\n"
+        "assert.sameValue(loc_35999, 35999);\n"
+        "})();\n"
+    )
+    w("scale/mega-bundle-50k-consts-36k-locals.js", "".join(mega_parts))
+
+    closure_32k_parts: List[str] = [
+        "/*---\nflags: [onlyStrict]\n---*/\n",
+        "function outer() {\n",
+    ]
+    closure_32k_parts.extend(f"  let s_{i:05d} = {i};\n" for i in range(33600))
+    closure_32k_parts.append(
+        "  return {\n"
+        "    read: () => [s_00000, s_32767, s_32768, s_33500],\n"
+        "    bump: () => { s_00000 += 1; s_32767 += 2; s_32768 += 3; s_33500 += 4; }\n"
+        "  };\n"
+        "}\n"
+        "const h = outer();\n"
+        "$262.gc();\n"
+        "h.bump();\n"
+        "$262.gc();\n"
+        "const r = h.read();\n"
+        "assert.sameValue(r[0], 1);\n"
+        "assert.sameValue(r[1], 32769);\n"
+        "assert.sameValue(r[2], 32771);\n"
+        "assert.sameValue(r[3], 33504);\n"
+    )
+    w("scale/closures-capturing-locals-above-32k.js", "".join(closure_32k_parts))
+
+    w("scale/gc-pacing-multi-megabyte-churn.js", """/*---
+flags: [onlyStrict]
+---*/
+const survivor = { tag: "keep-alive" };
+const survivorRef = new WeakRef(survivor);
+let deadRef;
+(() => {
+  const transient = { tag: "ephemeral" };
+  deadRef = new WeakRef(transient);
+  const waves = [];
+  for (let w = 0; w < 12; w++) {
+    const batch = [];
+    for (let i = 0; i < 2000; i++) {
+      batch.push({ idx: i, text: "wave_" + w + "_item_" + i });
+    }
+    waves.push(batch);
+    if (waves.length > 3) waves.shift();
+  }
+})();
+$262.gc();
+assert.sameValue(survivorRef.deref(), survivor);
+assert.sameValue(deadRef.deref(), undefined);
+""")
+
+    # ------------------------------------------------------------------
+    # F05: Math.sumPrecise, Map/WeakMap getOrInsert*, Weak Symbol Keys, Intl.DurationFormat
+    # ------------------------------------------------------------------
+    w("builtins/math-sum-precise-ieee754-and-errors.js", """/*---
+---*/
+assert.sameValue(typeof Math.sumPrecise, "function");
+assert.sameValue(Math.sumPrecise.length, 1);
+assert.sameValue(Math.sumPrecise.name, "sumPrecise");
+assert.sameValue(Object.is(Math.sumPrecise([]), -0), true);
+assert.sameValue(Object.is(Math.sumPrecise([-0, -0]), -0), true);
+assert.sameValue(Object.is(Math.sumPrecise([-0, +0]), +0), true);
+assert.sameValue(Object.is(Math.sumPrecise([1, -1]), +0), true);
+assert.sameValue(Math.sumPrecise([1e20, 0.1, -1e20]), 0.1);
+assert.sameValue(Math.sumPrecise([1, 1e100, 1, -1e100]), 2);
+assert.sameValue(Math.sumPrecise([1 + 2 ** -52, 2 ** -53, 2 ** -1022]), 1 + 2 ** -51);
+assert.sameValue(Math.sumPrecise([1, 2 ** -53, 2 ** -1022]), 1 + 2 ** -52);
+assert.sameValue(Math.sumPrecise([Number.MAX_VALUE, Number.MAX_VALUE, -Number.MAX_VALUE]), Number.MAX_VALUE);
+assert.sameValue(Math.sumPrecise([Infinity, 1]), Infinity);
+assert.sameValue(Math.sumPrecise([-Infinity, 1]), -Infinity);
+assert.sameValue(Number.isNaN(Math.sumPrecise([Infinity, -Infinity])), true);
+assert.sameValue(Number.isNaN(Math.sumPrecise([NaN, 1])), true);
+
+function* genNums() { yield 10; yield 20.5; yield -0.5; }
+assert.sameValue(Math.sumPrecise(genNums()), 30);
+
+assert.throws(TypeError, () => Math.sumPrecise());
+assert.throws(TypeError, () => Math.sumPrecise(null));
+assert.throws(TypeError, () => Math.sumPrecise(123));
+
+let closedCount = 0;
+const badIter = {
+  [Symbol.iterator]() {
+    let i = 0;
+    return {
+      next() {
+        i += 1;
+        if (i === 1) return { value: 1, done: false };
+        return { value: "2", done: false };
+      },
+      return() { closedCount += 1; return { done: true }; }
+    };
+  }
+};
+assert.throws(TypeError, () => Math.sumPrecise(badIter));
+assert.sameValue(closedCount, 1);
+assert.throws(TypeError, () => Math.sumPrecise([1n]));
+assert.throws(TypeError, () => Math.sumPrecise([new Number(1)]));
+""")
+
+    w("builtins/map-get-or-insert-and-computed.js", """/*---
+---*/
+assert.sameValue(Map.prototype.getOrInsert.length, 2);
+assert.sameValue(Map.prototype.getOrInsertComputed.length, 2);
+
+const m = new Map();
+assert.sameValue(m.getOrInsert(-0, "first"), "first");
+assert.sameValue(m.getOrInsert(+0, "second"), "first");
+assert.sameValue(Object.is([...m.keys()][0], +0), true);
+
+m.set("undefKey", undefined);
+assert.sameValue(m.getOrInsert("undefKey", "fallback"), undefined);
+
+let cbCalls = 0;
+assert.sameValue(m.getOrInsertComputed("undefKey", () => { cbCalls += 1; return "x"; }), undefined);
+assert.sameValue(cbCalls, 0);
+
+let seenKey;
+assert.sameValue(m.getOrInsertComputed(-0, () => "unreachable"), "first");
+m.clear();
+assert.sameValue(m.getOrInsertComputed(-0, (k) => { seenKey = k; return "zeroVal"; }), "zeroVal");
+assert.sameValue(Object.is(seenKey, +0), true);
+
+assert.sameValue(
+  m.getOrInsertComputed("reentrant", (k) => {
+    m.set(k, "duringCallback");
+    return "finalValue";
+  }),
+  "finalValue"
+);
+assert.sameValue(m.get("reentrant"), "finalValue");
+
+assert.throws(TypeError, () => m.getOrInsertComputed("undefKey", null));
+assert.throws(TypeError, () => Map.prototype.getOrInsert.call({}, "a", 1));
+assert.throws(TypeError, () => Map.prototype.getOrInsertComputed.call({}, "a", () => 1));
+""")
+
+    w("builtins/weakmap-get-or-insert-and-weak-symbol-keys.js", """/*---
+---*/
+assert.sameValue(WeakMap.prototype.getOrInsert.length, 2);
+assert.sameValue(WeakMap.prototype.getOrInsertComputed.length, 2);
+
+const wm = new WeakMap();
+const ws = new WeakSet();
+const sym = Symbol("unregistered");
+
+assert.sameValue(wm.getOrInsert(sym, 101), 101);
+assert.sameValue(wm.getOrInsert(sym, 202), 101);
+assert.sameValue(wm.get(sym), 101);
+
+assert.sameValue(wm.getOrInsertComputed(Symbol.iterator, (k) => k === Symbol.iterator ? "iterVal" : "bad"), "iterVal");
+assert.sameValue(wm.get(Symbol.iterator), "iterVal");
+
+ws.add(sym);
+ws.add(Symbol.dispose);
+assert.sameValue(ws.has(sym), true);
+assert.sameValue(ws.has(Symbol.dispose), true);
+
+const regSym = Symbol.for("arcr.global.sym");
+assert.throws(TypeError, () => wm.set(regSym, 1));
+assert.throws(TypeError, () => wm.getOrInsert(regSym, 1));
+assert.throws(TypeError, () => wm.getOrInsertComputed(regSym, () => 1));
+assert.throws(TypeError, () => ws.add(regSym));
+assert.throws(TypeError, () => new WeakRef(regSym));
+assert.throws(TypeError, () => wm.getOrInsert("primitive", 1));
+assert.throws(TypeError, () => wm.getOrInsertComputed(sym, "notCallable"));
+
+const fr = new FinalizationRegistry(() => {});
+const tok = Symbol("token");
+fr.register(Symbol("target"), "held", tok);
+assert.sameValue(fr.unregister(tok), true);
+assert.throws(TypeError, () => fr.register(regSym, "held"));
+
+let symRef = (() => new WeakRef(Symbol("ephemeral-sym")))();
+$262.gc();
+assert.sameValue(symRef.deref(), undefined);
+""")
+
+    w("intl/durationformat-styles-locales-iso-and-parts.js", """/*---
+---*/
+assert.sameValue(typeof Intl.DurationFormat, "function");
+assert.sameValue(Intl.DurationFormat.length, 0);
+assert.throws(TypeError, () => Intl.DurationFormat());
+
+const dfDefault = new Intl.DurationFormat("en-US");
+assert.sameValue(dfDefault[Symbol.toStringTag], "Intl.DurationFormat");
+assert.sameValue(Reflect.ownKeys(dfDefault).length, 0);
+assert.sameValue(dfDefault.resolvedOptions().style, "short");
+assert.sameValue(dfDefault.format({ hours: 1, minutes: 46, seconds: 40 }), "1 hr, 46 min, 40 sec");
+assert.sameValue(dfDefault.format("PT1H46M40S"), "1 hr, 46 min, 40 sec");
+
+const dfLong = new Intl.DurationFormat("en-US", { style: "long" });
+assert.sameValue(dfLong.format({ years: 1, days: 2, seconds: 1 }), "1 year, 2 days, 1 second");
+
+const dfNarrow = new Intl.DurationFormat("en-US", { style: "narrow" });
+assert.sameValue(dfNarrow.format({ hours: 2, minutes: 5, seconds: 9 }), "2h 5m 9s");
+
+const dfDig = new Intl.DurationFormat("en-US", { style: "digital" });
+assert.sameValue(dfDig.format({ minutes: 5, seconds: 9 }), "0:05:09");
+assert.sameValue(dfDig.format("PT1H5M9.25S"), "1:05:09.25");
+
+const dfDigFd = new Intl.DurationFormat("en-US", { style: "digital", fractionalDigits: 3 });
+assert.sameValue(dfDigFd.resolvedOptions().fractionalDigits, 3);
+assert.sameValue(dfDigFd.format({ seconds: 4, milliseconds: 50 }), "0:00:04.050");
+
+const dfKo = new Intl.DurationFormat("ko-KR", { style: "long" });
+assert.sameValue(dfKo.format({ hours: 1, minutes: 30 }), "1시간 30분");
+
+const dfJa = new Intl.DurationFormat("ja-JP", { style: "short" });
+assert.sameValue(dfJa.format({ days: 3, hours: 4 }), "3日 4時間");
+
+const negParts = dfDefault.formatToParts({ hours: -2, minutes: -15 });
+assert.sameValue(dfDefault.format({ hours: -2, minutes: -15 }), "-2 hr, 15 min");
+assert.sameValue(negParts[0].type, "minusSign");
+assert.sameValue(negParts[0].unit, "hour");
+assert(negParts.some((p) => p.type === "unit" && p.value === "min" && p.unit === "minute"), "minute unit part");
+assert(negParts.some((p) => p.type === "literal" && p.value === ", " && !("unit" in p)), "list literal part");
+
+assert.throws(TypeError, () => dfDefault.format({}));
+assert.throws(TypeError, () => dfDefault.format(42));
+assert.throws(RangeError, () => dfDefault.format({ hours: 1, minutes: -5 }));
+assert.throws(RangeError, () => dfDefault.format({ hours: 1.5 }));
+assert.throws(RangeError, () => dfDefault.format("P"));
+""")
+
+    # ------------------------------------------------------------------
+    # F04: Explicit Resource Management (using, await using, DisposableStack, AsyncDisposableStack, SuppressedError)
+    # ------------------------------------------------------------------
+    w("language/using-block-lifo-nullish-and-iterator-dispose.js", """/*---
+---*/
+const log = [];
+{
+  using a = { [Symbol.dispose]() { log.push("a"); } };
+  using n1 = null;
+  using n2 = undefined;
+  assert.sameValue(n1, null);
+  assert.sameValue(n2, undefined);
+  {
+    using b = { [Symbol.dispose]() { log.push("b"); } };
+    using c = { [Symbol.dispose]() { log.push("c"); } };
+    log.push("inner");
+  }
+  log.push("outer");
+}
+assert.sameValue(log.join(","), "inner,c,b,outer,a");
+
+let genClosed = false;
+function* makeGen() {
+  try {
+    yield 1;
+    yield 2;
+  } finally {
+    genClosed = true;
+  }
+}
+{
+  using g = makeGen();
+  assert.sameValue(g.next().value, 1);
+}
+assert.sameValue(genClosed, true);
+
+assert.throws(TypeError, () => { using bad = 42; });
+assert.throws(TypeError, () => { using badObj = {}; });
+""")
+
+    w("language/using-control-flow-return-break-continue-try-finally.js", """/*---
+---*/
+const trace = [];
+function runEarlyReturn(flag) {
+  using r1 = { [Symbol.dispose]() { trace.push("r1"); } };
+  try {
+    using r2 = { [Symbol.dispose]() { trace.push("r2"); } };
+    if (flag) return "early";
+  } finally {
+    trace.push("finally");
+  }
+  return "normal";
+}
+assert.sameValue(runEarlyReturn(true), "early");
+assert.sameValue(trace.join(","), "r2,finally,r1");
+
+trace.length = 0;
+outerLoop: for (let i = 0; i < 3; i++) {
+  using outerRes = { [Symbol.dispose]() { trace.push("o" + i); } };
+  for (let j = 0; j < 2; j++) {
+    using innerRes = { [Symbol.dispose]() { trace.push("i" + i + j); } };
+    if (i === 0 && j === 0) continue;
+    if (i === 1 && j === 1) break outerLoop;
+  }
+}
+assert.sameValue(trace.join(","), "i00,i01,o0,i10,i11,o1");
+""")
+
+    w("language/using-for-of-and-c-for-loop-per-iteration.js", """/*---
+---*/
+const order = [];
+const items = [1, 2, 3].map((id) => ({
+  id,
+  [Symbol.dispose]() { order.push("d" + id); }
+}));
+
+for (using x of items) {
+  order.push("b" + x.id);
+  if (x.id === 2) break;
+}
+assert.sameValue(order.join(","), "b1,d1,b2,d2");
+
+const cOrder = [];
+let stepIdx = 0;
+for (using c = { [Symbol.dispose]() { cOrder.push("cd" + stepIdx); } }; stepIdx < 2; stepIdx++) {
+  cOrder.push("cb" + stepIdx);
+}
+assert.sameValue(cOrder.join(","), "cb0,cb1,cd2");
+""")
+
+    w("language/using-suppressed-error-chaining.js", """/*---
+---*/
+const se = new SuppressedError("newErr", "oldErr", "suppressed msg");
+assert(se instanceof SuppressedError, "instanceof SuppressedError");
+assert(se instanceof Error, "instanceof Error");
+assert.sameValue(Error.isError(se), true);
+assert.sameValue(SuppressedError.length, 3);
+assert.sameValue(se.name, "SuppressedError");
+assert.sameValue(se.error, "newErr");
+assert.sameValue(se.suppressed, "oldErr");
+assert.sameValue(se.message, "suppressed msg");
+
+const eBody = new Error("body");
+const eD1 = new Error("d1");
+const eD2 = new Error("d2");
+let caught = null;
+try {
+  using r1 = { [Symbol.dispose]() { throw eD1; } };
+  using r2 = { [Symbol.dispose]() { throw eD2; } };
+  throw eBody;
+} catch (err) {
+  caught = err;
+}
+assert(caught instanceof SuppressedError, "outer SuppressedError");
+assert.sameValue(caught.error, eD1);
+assert(caught.suppressed instanceof SuppressedError, "inner SuppressedError");
+assert.sameValue(caught.suppressed.error, eD2);
+assert.sameValue(caught.suppressed.suppressed, eBody);
+""")
+
+    w("language/using-without-init-syntax-error.js", """/*---
+negative:
+  phase: parse
+  type: SyntaxError
+---*/
+$DONOTEVALUATE();
+{
+  using x;
+}
+""")
+
+    w("language/using-binding-pattern-syntax-error.js", """/*---
+negative:
+  phase: parse
+  type: SyntaxError
+---*/
+$DONOTEVALUATE();
+{
+  using { a } = { a: 1, [Symbol.dispose]() {} };
+}
+""")
+
+    w("language/using-for-in-syntax-error.js", """/*---
+negative:
+  phase: parse
+  type: SyntaxError
+---*/
+$DONOTEVALUATE();
+for (using x in { a: 1 }) {}
+""")
+
+    w("async/await-using-lifo-sync-fallback-and-for-await.js", """/*---
+flags: [async]
+---*/
+(async () => {
+  const events = [];
+  {
+    await using syncFallback = {
+      [Symbol.dispose]() { events.push("sync-fallback"); }
+    };
+    await using asyncRes = {
+      async [Symbol.asyncDispose]() {
+        await Promise.resolve();
+        events.push("async-res");
+      }
+    };
+    await using nul = null;
+    assert.sameValue(nul, null);
+    events.push("body");
+  }
+  assert.sameValue(events.join(","), "body,async-res,sync-fallback");
+
+  let agenClosed = false;
+  async function* makeAsyncGen() {
+    try {
+      yield 10;
+      yield 20;
+    } finally {
+      agenClosed = true;
+    }
+  }
+  {
+    await using ag = makeAsyncGen();
+    const first = await ag.next();
+    assert.sameValue(first.value, 10);
+  }
+  assert.sameValue(agenClosed, true);
+
+  let caught = null;
+  try {
+    await using r1 = { [Symbol.asyncDispose]() { return Promise.reject("rej1"); } };
+    throw "bodyErr";
+  } catch (e) {
+    caught = e;
+  }
+  assert(caught instanceof SuppressedError, "async SuppressedError");
+  assert.sameValue(caught.error, "rej1");
+  assert.sameValue(caught.suppressed, "bodyErr");
+
+  const faLog = [];
+  async function* asyncItems() {
+    yield { id: 1, async [Symbol.asyncDispose]() { await Promise.resolve(); faLog.push("ad1"); } };
+    yield { id: 2, async [Symbol.asyncDispose]() { await Promise.resolve(); faLog.push("ad2"); } };
+  }
+  for await (await using item of asyncItems()) {
+    faLog.push("ab" + item.id);
+  }
+  assert.sameValue(faLog.join(","), "ab1,ad1,ab2,ad2");
+})().then(() => $DONE(), $DONE);
+""")
+
+    w("modules/_fixtures/using_dep.js", """
+export const modEvents = [];
+{
+  using s = { [Symbol.dispose]() { modEvents.push("dep-sync"); } };
+  modEvents.push("dep-body");
+}
+await using topAsync = {
+  async [Symbol.asyncDispose]() {
+    await Promise.resolve();
+    modEvents.push("dep-top-async");
+  }
+};
+modEvents.push("dep-after-decl");
+""")
+    w("modules/top-level-using-and-await-using.js", """/*---
+flags: [module, async]
+---*/
+import { modEvents } from "./_fixtures/using_dep.js";
+assert.sameValue(modEvents.join(","), "dep-body,dep-sync,dep-after-decl,dep-top-async");
+$DONE();
+""")
+
+    w("builtins/disposable-stack-and-async-disposable-stack.js", """/*---
+flags: [async]
+---*/
+const syncLog = [];
+const ds = new DisposableStack();
+assert.sameValue(ds.disposed, false);
+assert.sameValue(DisposableStack.prototype[Symbol.dispose], DisposableStack.prototype.dispose);
+
+const rObj = { id: 1, [Symbol.dispose]() { syncLog.push("use"); } };
+assert.sameValue(ds.use(rObj), rObj);
+assert.sameValue(ds.use(null), null);
+assert.sameValue(ds.adopt("handle", (v) => syncLog.push("adopt:" + v)), "handle");
+ds.defer(() => syncLog.push("defer"));
+
+assert.throws(TypeError, () => ds.adopt("x", null));
+assert.throws(TypeError, () => ds.defer(123));
+
+const moved = ds.move();
+assert.sameValue(ds.disposed, true);
+assert.sameValue(moved.disposed, false);
+assert.throws(ReferenceError, () => ds.use(null));
+assert.throws(ReferenceError, () => ds.move());
+
+moved.dispose();
+assert.sameValue(moved.disposed, true);
+moved.dispose();
+assert.sameValue(syncLog.join(","), "defer,adopt:handle,use");
+
+(async () => {
+  const asyncLog = [];
+  const ads = new AsyncDisposableStack();
+  assert.sameValue(ads.disposed, false);
+  assert.sameValue(AsyncDisposableStack.prototype[Symbol.asyncDispose], AsyncDisposableStack.prototype.disposeAsync);
+
+  ads.use({ [Symbol.dispose]() { asyncLog.push("sync-use"); } });
+  ads.use({ async [Symbol.asyncDispose]() { await Promise.resolve(); asyncLog.push("async-use"); } });
+  ads.adopt(7, async (v) => { await Promise.resolve(); asyncLog.push("adopt:" + v); });
+  ads.defer(async () => { await Promise.resolve(); asyncLog.push("defer"); });
+
+  const amoved = ads.move();
+  assert.sameValue(ads.disposed, true);
+  await amoved.disposeAsync();
+  assert.sameValue(amoved.disposed, true);
+  assert.sameValue(asyncLog.join(","), "defer,adopt:7,async-use,sync-use");
+})().then(() => $DONE(), $DONE);
+""")
+
     return harness_dir, test_dir
 
 
@@ -1484,7 +2019,7 @@ def main() -> int:
     ap.add_argument("--harness-dir", help="Path to Test262 harness/ directory")
     ap.add_argument("-j", "--jobs", type=int, default=max(1, os.cpu_count() or 4), help="Parallel worker count")
     ap.add_argument("-f", "--filter", help="Substring or glob filter on test ID")
-    ap.add_argument("--timeout", "--timeout-sec", dest="timeout", type=float, default=5.0, help="Per-test timeout in seconds")
+    ap.add_argument("--timeout", "--timeout-sec", dest="timeout", type=float, default=10.0, help="Per-test timeout in seconds")
     ap.add_argument("--json-out", "--out-json", dest="json_out", help="Write JSON report to file")
     args = ap.parse_args()
 

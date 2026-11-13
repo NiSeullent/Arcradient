@@ -3168,7 +3168,9 @@ static bool ensure_view_js_vm(ArcrWebView *view) {
 
     size_t heap_cap = (view->engine->cfg.profile == ARCR_PROFILE_MINIMUM)
                           ? (4u * 1024u * 1024u)
-                          : (32u * 1024u * 1024u);
+                          : ((sizeof(void *) >= 8u)
+                                 ? ((size_t)256u * 1024u * 1024u)
+                                 : (48u * 1024u * 1024u));
     ArcrJsHostCallbacks hcb;
     memset(&hcb, 0, sizeof(hcb));
     hcb.userdata                = view;
@@ -3307,16 +3309,28 @@ static ScriptTagKind classify_script_element(const ArcrDocument *doc, const Arcr
     return kind;
 }
 
-static void eval_classic_script_with_url(ArcrWebView *view, const char *code, size_t len,
+static void eval_classic_script_with_url(ArcrWebView *view, uint32_t script_uid,
+                                         const char *code, size_t len,
                                          const char *source_url) {
     if (!view || !code || len == 0u) return;
     if (!ensure_view_js_vm(view)) return;
     const ArcrJsVTable *js_vt = get_js_vt(view->engine);
     if (!js_vt) return;
+    if (script_uid != 0u && js_vt->eval_script) {
+        char push_js[64];
+        int pn = snprintf(push_js, sizeof(push_js),
+                          "if(window.__pushCurScript)window.__pushCurScript(%u);",
+                          (unsigned)script_uid);
+        if (pn > 0) (void)js_vt->eval_script(view->js_vm, push_js, (size_t)pn);
+    }
     if (js_vt->eval_script_ex) {
         (void)js_vt->eval_script_ex(view->js_vm, code, len, source_url ? source_url : view->url);
     } else if (js_vt->eval_script) {
         (void)js_vt->eval_script(view->js_vm, code, len);
+    }
+    if (script_uid != 0u && js_vt->eval_script) {
+        static const char kPopJs[] = "if(window.__popCurScript)window.__popCurScript();";
+        (void)js_vt->eval_script(view->js_vm, kPopJs, sizeof(kPopJs) - 1u);
     }
 }
 
@@ -3344,7 +3358,7 @@ static void eval_module_script_node(ArcrWebView *view, uint32_t script_uid) {
         if (js_vt->eval_module) {
             (void)js_vt->eval_module(view->js_vm, sn->text, sn->text_len, eff_base);
         } else {
-            eval_classic_script_with_url(view, sn->text, sn->text_len, eff_base);
+            eval_classic_script_with_url(view, script_uid, sn->text, sn->text_len, eff_base);
         }
     }
 
@@ -3397,7 +3411,7 @@ static bool flush_finished_subres_job(ArcrWebView *view, bool rebuild_now) {
                 if (it->is_module_script && js_vt && js_vt->eval_module) {
                     (void)js_vt->eval_module(view->js_vm, u8, u8_len, furl);
                 } else {
-                    eval_classic_script_with_url(view, u8, u8_len, furl);
+                    eval_classic_script_with_url(view, it->owner_uid, u8, u8_len, furl);
                 }
                 free(u8);
                 dom_or_img_changed = true;
@@ -4048,7 +4062,8 @@ static bool load_html_bytes_internal(ArcrWebView      *view,
                 ArcrAtom ta_a  = arcr_atom_intern_lower(&view->engine->atoms, "textarea", 8u);
                 init_form_defaults_recursive(doc, doc->root, inp_a, ta_a);
 
-                eval_classic_script_with_url(view, exec_code, exec_len, script_url);
+                eval_classic_script_with_url(view, paused_node->node_uid,
+                                             exec_code, exec_len, script_url);
                 sync_doc_title_effects(view);
 
                 if (view->pending_js_nav_url[0] != '\0' || view->pending_hist_nav_idx >= 0) {
@@ -4124,7 +4139,7 @@ static bool load_html_bytes_internal(ArcrWebView      *view,
                     char *u8 = decode_html_bytes_to_utf8_alloc(sbytes, sblen, sctype, &u8_len);
                     engine_free_resource(view->engine, sbytes);
                     if (u8) {
-                        eval_classic_script_with_url(view, u8, u8_len,
+                        eval_classic_script_with_url(view, defer_list[i].uid, u8, u8_len,
                                                      sfinal[0] ? sfinal : script_url);
                         free(u8);
                     }

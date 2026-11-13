@@ -307,7 +307,7 @@ bool ajs_ta_set_index(AjsVm *vm, AjsObject *ta_obj, uint32_t idx, AjsValue val) 
 static AjsObject *alloc_array_buffer_internal(AjsVm *vm, AjsRealm *r, AjsValue proto,
                                               size_t byte_len, size_t max_byte_len,
                                               bool resizable, bool shared) {
-    size_t limit = vm->cfg.heap_limit_bytes ? vm->cfg.heap_limit_bytes : (32u * 1024u * 1024u);
+    size_t limit = vm->cfg.heap_limit_bytes ? vm->cfg.heap_limit_bytes : AJS_DEFAULT_HEAP_LIMIT_BYTES;
     if (byte_len > limit || (resizable && max_byte_len > limit)) {
         ajs_throw_err_kind(vm, AJS_ERR_KIND_RANGE, "ArrayBuffer allocation exceeds maximum size");
         return NULL;

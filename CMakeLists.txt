@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(waterscape VERSION 2.0.0 LANGUAGES C)
+project(waterscape VERSION 2.1.0 LANGUAGES C)
 
 # Strict Pure C11 standard without GNU VLA bloat
 set(CMAKE_C_STANDARD 11)

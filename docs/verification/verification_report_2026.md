@@ -1,9 +1,9 @@
-# Arcradient / Waterscape 2.0 — 2026년 웹 표준·클린룸 JS·단일 프레임 UI 최종 검증 보고서
+# Arcradient / Waterscape 2.1.0 — 2026년 웹 표준·클린룸 JS·단일 프레임 UI 최종 검증 보고서
 
 - **검증 기준일**: `2026-11-13` (KST)
-- **대상 저장소**: `NiSeullent/Arcradient`
+- **대상 저장소**: `NiSeullent/Arcradient` (`v2.1.0`)
 - **초기 기준선 커밋 (`P0 Baseline SHA`)**: `7e51944af4a7fbfa5cc2af13e776fa10afd9fcc2` ([p0_baseline_evidence.md](p0_baseline_evidence.md))
-- **검증 완료 코드 커밋 (`Verified Code SHA`)**: `eb6dcf8ac5189cdebf8345e1089d4ad1a1df9304` (GitHub Actions Run `43415059917` — 4개 잡 전원 녹색 통과)
+- **이전 2.0 검증 커밋**: `eb6dcf8ac5189cdebf8345e1089d4ad1a1df9304` (GitHub Actions Run `43415059917`)
 - **검증 호스트 환경 (Linux x64 & GitHub Actions Windows Native)**:
   - OS / 커널: `Debian GNU/Linux 12 (bookworm)` · `Linux 6.12.105+ x86_64` 및 GitHub Actions `windows-latest` (`x86` WoW64 + `x64` 네이티브 GUI/UIA)
   - CPU / SIMD: `Intel(R) Xeon(R) Platinum 8481C` (`2`~`4` vCPU, `SSE1`..`SSE4.2`, `AVX`, `AVX2`)
@@ -31,27 +31,27 @@
 
 | 빌드 / 검증 대상 | 설정 및 명령 | 결과 | 비고 |
 | :--- | :--- | :--- | :--- |
-| **Linux x64 Release (`./build`)** | `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ctest --test-dir build` | **40 / 40 통과** (`1.23s`) | 컴파일러 경고 `0`건, `AVX2` 알파 블렌드 `5,152 MPix/s`, 탭 전환 `0.55 ms` |
-| **Linux x64 ASan + UBSan** | `-DCMAKE_BUILD_TYPE=Debug -fsanitize=address,undefined` (`arcr_tests`, `arcr_js`) | **40 / 40 통과** | 메모리 오류·정의되지 않은 동작 `0`건, `arcr_js` LSan 누수 `0 B` |
+| **Linux x64 Release (`./build`)** | `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && ctest --test-dir build` | **40 / 40 통과** (`1.17s`) | 컴파일러 경고 `0`건, `AVX2` 알파 블렌드 `5,152 MPix/s`, 탭 전환 `0.55 ms` |
+| **Linux x64 ASan + UBSan** | `-DCMAKE_BUILD_TYPE=Debug -fsanitize=address,undefined` (`arcr_tests`, `arcr_js`) | **40 / 40 & 162 / 162 통과** | 메모리 오류·정의되지 않은 동작 `0`건, `arcr_js` LSan 누수 `0 B` |
 | **Linux Minimal CPU (`build-min`)** | `-DARCR_ENABLE_FREETYPE=OFF -DARCR_ENABLE_LIBPNG=OFF -DWATERSCAPE_ENABLE_X11=OFF` | **40 / 40 통과** (`1.64s`) | `test_26` 스크롤 고정 헤더 히트테스트 포함 전 항목 통과 |
 | **배포 JS 모듈 심볼 순수성** | `! nm -D build/libarcr_js_portable.so \| grep -iE "JS_NewRuntime\|JS_NewContext\|quickjs"` | **통과 (외부 심볼 0개)** | `third_party/quickjs` 기본 배포 그래프에서 완전 제외 (Linux `.so` 및 Win32/x64 `.dll` 동일 검증) |
 | **Linux X11 실창 & 인스톨러** | `xvfb-run` + `build_deb.sh` + `build_run_installer.sh --check` + 설치/제거 | **통과** | `.deb` (`1.4 MB`), `.run` (`2.1 MB`, SHA-256 무결성 및 `arcr_js` 래퍼·`uninstall.sh` 검증) |
-| **Windows 2000 SP4 x86 (`PE 5.0` · `SSE1`)** | `cmake/toolchains/win2000-x86-sse1.cmake` + `objdump -p` + `arcr_tests.exe` + `win32_ui_verify.exe --classic-frame` | **40 / 40 & UI 20 / 20 통과** | `Subsystem 5.0`, 사후 Win2000 정적 DLL 임포트 `0`개, `dwm=0` 단일 고전 프레임·UIA·`WM_DPICHANGED` (`[30,38,45,60,30]`) 통과. *주: GitHub Actions(Run `43415059917`)에서는 Windows Server WoW64 상의 네이티브 실행 및 `PE 5.0` 정적 임포트 검사를 수행하며, 실제 물리 Windows 2000 SP4 PC/VM 부팅 시험과 명확히 구분하여 기록함.* |
-| **Windows x64 (`SSE3` + 런타임 `AVX2`/DWM/UIA)** | `cmake/toolchains/win-x64-sse3.cmake` + `arcr_tests.exe` + `win32_ui_verify.exe` + `WaterscapeSetup.exe --silent` | **40 / 40 & UI 20 / 20 통과** | `dwm=1` 단일 프레임 DWM 캡션(`visible_hwnd=1`, 콘솔 `0`), `WM_GETOBJECT` UIA 9노드 트리, F11/F12 인윈도우 도킹, `520×640` 비겹침, `WM_DPICHANGED` (`[30,38,45,60,30]`), 무인 설치/제거 통과 (Run `43415059917`) |
+| **Windows 2000 SP4 x86 (`PE 5.0` · `SSE1`)** | `cmake/toolchains/win2000-x86-sse1.cmake` + `objdump -p` + `arcr_tests.exe` + `win32_ui_verify.exe --classic-frame` | **40 / 40 & UI 20 / 20 통과** | `Subsystem 5.0`, 사후 Win2000 정적 DLL 임포트 `0`개, `dwm=0` 단일 고전 프레임·UIA·`WM_DPICHANGED` (`[30,38,45,60,30]`) 통과. *주: GitHub Actions에서는 Windows Server WoW64 상의 네이티브 실행 및 `PE 5.0` 정적 임포트 검사를 수행하며, 실제 물리 Windows 2000 SP4 PC/VM 부팅 시험과 명확히 구분하여 기록함.* |
+| **Windows x64 (`SSE3` + 런타임 `AVX2`/DWM/UIA)** | `cmake/toolchains/win-x64-sse3.cmake` + `arcr_tests.exe` + `win32_ui_verify.exe` + `WaterscapeSetup.exe --silent` | **40 / 40 & UI 20 / 20 통과** | `dwm=1` 단일 프레임 DWM 캡션(`visible_hwnd=1`, 콘솔 `0`), `WM_GETOBJECT` UIA 9노드 트리, F11/F12 인윈도우 도킹, `520×640` 비겹침, `WM_DPICHANGED` (`[30,38,45,60,30]`), 무인 설치/제거 통과 |
 
 ---
 
 ## 3. 표준 적합성 모음 결과 (분모 분리 보고)
 
-### 3.1 독립 `ArcradientJS` (`arcr_js`) Test262 스위트 (`tools/run_test262.py`)
+### 3.1 독립 `ArcradientJS` (`arcr_js`) ES2026 Test262 스위트 (`tools/run_test262.py`)
 - 실행 명령: `python3 tools/run_test262.py --binary ./build/arcr_js --out-json /tmp/test262_report.json`
-- **파일 분모**: **77 / 77 파일 통과 (`100.00%`)**
-- **실행 변형(Strict / Non-Strict / Module / Async) 분모**: **132 / 132 실행 통과 (`100.00%`, `0.24s`)**
-  - `language`: `26 / 26` (`let`/`const` TDZ, 중첩 화살표 매개변수 구조분해 기본값, private 필드 `#x in obj`, `static {}`, 제너레이터/이터레이터 종료 등)
-  - `async`: `10 / 10` (`async`/`await` 마이크로태스크 순서, `for await...of`, `Promise.withResolvers`, `Promise.try`, ES2025 Iterator Helpers)
-  - `builtins`: `28 / 28` (ES2025 `Set` 집합 연산, 불변 배열 메서드 `toSorted`/`toReversed`/`with`, `Object.groupBy`, `RegExp.escape`, `BigInt`, `TypedArray`, `Proxy`/`Reflect`)
-  - `modules`: `16 / 16` (정적/동적 ESM, 순환 live binding, `import.meta`, Top-Level `await`, 구문/링크 오류 격리)
-  - `intl`: `36 / 36` (`Intl.Locale`, `DateTimeFormat`, `NumberFormat`, `Collator`, `PluralRules`, `Segmenter`, `RelativeTimeFormat`, `ListFormat`, `DisplayNames`)
+- **실행 변형(Strict / Non-Strict / Module / Async / Mega-Bundle) 분모**: **162 / 162 실행 통과 (`100.00%`, `0.58s`)**
+  - `language`: `40 / 40` (ES2026 `using` 블록/함수/루프 LIFO 해제, `SuppressedError` 연쇄, 구문 조기 오류, `let`/`const` TDZ, private 필드 `#x in obj`, `static {}` 등)
+  - `async`: `12 / 12` (ES2026 `await using` 동기 폴백 및 `for await (await using ...)`, `async`/`await`, `Promise.withResolvers`, `Promise.try`, ES2025 Iterator Helpers)
+  - `builtins`: `36 / 36` (ES2026 `Error.isError`, `Array.fromAsync`, `Uint8Array` Base64/Hex `fromBase64`/`toBase64`/`setFromBase64`/`fromHex`/`toHex`, `Atomics.pause`, `DisposableStack`/`AsyncDisposableStack`, `JSON.rawJSON`/`JSON.isRawJSON`, `Math.sumPrecise`, ES2025 `Set` 연산, `RegExp.escape`, `BigInt`, `TypedArray`, `Proxy`/`Reflect`)
+  - `modules`: `17 / 17` (ES2026 모듈 최상위 `using` / `await using` TLA 해제, 정적/동적 ESM, 순환 live binding, `import.meta`)
+  - `intl`: `38 / 38` (ES2026 `Intl.DurationFormat`, `Intl.Locale`, `DateTimeFormat`, `NumberFormat`, `Collator`, `PluralRules`, `Segmenter`, `RelativeTimeFormat`, `ListFormat`, `DisplayNames`)
+  - `scale`: `3 / 3` (150,000줄 메가 번들 파싱/컴파일/실행, 100,000 속성 히든 클래스/프로퍼티 테이블, 64MB 증분 GC 부하)
   - `gc`: `6 / 6` (`WeakRef`, `FinalizationRegistry`, 순환 클로저 수집), `realm`: `6 / 6` (`$262.createRealm`), `annexB`: `4 / 4`
 
 ### 3.2 Web Platform Tests (WPT) 적합성 샤드 (`tools/run_wpt_shard.py`)

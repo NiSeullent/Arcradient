@@ -410,6 +410,8 @@ static const char *const kDefaultMonoBoldCandidates[] = {
 };
 
 static const char *const kDefaultSymbolFontCandidates[] = {
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
     "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",

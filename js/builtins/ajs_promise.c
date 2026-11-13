@@ -1074,3 +1074,749 @@ void ajs_init_promise_builtins(AjsVm *vm, AjsRealm *r) {
 
     ajs_temp_root_restore(vm, rs);
 }
+
+/* ============================================================================
+ * 7. ES2026 Explicit Resource Management (DisposableStack & AsyncDisposableStack)
+ * ============================================================================ */
+
+#define AJS_DISP_STACK_TAG       0x4453544Bu /* 'DSTK' */
+#define AJS_ASYNC_DISP_STACK_TAG 0x4144534Bu /* 'ADSK' */
+
+typedef struct AjsDispRecord {
+    AjsValue val;
+    AjsValue method;
+    bool     is_async;
+    bool     is_adopt;
+    bool     sync_fallback;
+} AjsDispRecord;
+
+typedef struct AjsDispStackData {
+    bool           disposed;
+    bool           has_err;
+    AjsValue       err;
+    uint32_t       count;
+    uint32_t       cap;
+    AjsDispRecord *entries;
+} AjsDispStackData;
+
+static void disp_stack_gc_mark(AjsVm *vm, void *opaque, void (*mark_val)(AjsVm *, AjsValue)) {
+    AjsDispStackData *d = (AjsDispStackData *)opaque;
+    if (!d) return;
+    if (d->has_err) mark_val(vm, d->err);
+    for (uint32_t i = 0; i < d->count; i++) {
+        mark_val(vm, d->entries[i].val);
+        mark_val(vm, d->entries[i].method);
+    }
+}
+
+static void disp_stack_finalizer(AjsVm *vm, void *opaque) {
+    (void)vm;
+    AjsDispStackData *d = (AjsDispStackData *)opaque;
+    if (!d) return;
+    free(d->entries);
+    free(d);
+}
+
+static bool disp_stack_push_rec(AjsVm *vm, AjsDispStackData *d, AjsDispRecord rec) {
+    if (d->count >= d->cap) {
+        uint32_t ncap = d->cap ? d->cap * 2u : 4u;
+        AjsDispRecord *ne = (AjsDispRecord *)realloc(d->entries, (size_t)ncap * sizeof(AjsDispRecord));
+        if (!ne) {
+            ajs_throw(vm, vm->oom_error);
+            return false;
+        }
+        d->entries = ne;
+        d->cap = ncap;
+    }
+    d->entries[d->count++] = rec;
+    return true;
+}
+
+static AjsValue make_suppressed_err(AjsVm *vm, AjsValue new_err, AjsValue suppressed_err) {
+    AjsRealm *r = vm->active_realm ? vm->active_realm : vm->main_realm;
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, new_err);
+    ajs_temp_root_push(vm, suppressed_err);
+    AjsString *msg = ajs_str_from_cstr(vm, "An error was suppressed during disposal", false);
+    AjsValue msg_v = msg ? ajs_val_from_gc(msg) : AJS_VAL_UNDEFINED;
+    ajs_temp_root_push(vm, msg_v);
+    AjsValue args[3] = { new_err, suppressed_err, msg_v };
+    AjsValue ctor = r->error_ctor[AJS_ERR_KIND_SUPPRESSED];
+    AjsValue se = ajs_construct_internal(vm, ctor, 3, args, ctor);
+    if (vm->has_exception) {
+        ajs_clear_exception(vm);
+        se = new_err;
+    }
+    ajs_temp_root_restore(vm, rs);
+    return se;
+}
+
+static AjsValue disp_stack_alloc_with_proto(AjsVm *vm, AjsRealm *realm, AjsValue proto, bool is_async) {
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, proto);
+    AjsObject *obj = ajs_obj_new(vm, realm, AJS_OBJ_ORDINARY, proto);
+    if (!obj) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    AjsDispStackData *d = (AjsDispStackData *)calloc(1, sizeof(AjsDispStackData));
+    if (!d) {
+        ajs_temp_root_restore(vm, rs);
+        return ajs_throw(vm, vm->oom_error);
+    }
+    d->err = AJS_VAL_UNDEFINED;
+    obj->opaque_tag = is_async ? AJS_ASYNC_DISP_STACK_TAG : AJS_DISP_STACK_TAG;
+    obj->opaque_ptr = d;
+    obj->gc_mark = disp_stack_gc_mark;
+    obj->finalizer = disp_stack_finalizer;
+    ajs_temp_root_restore(vm, rs);
+    return ajs_val_from_gc(obj);
+}
+
+AjsValue ajs_erm_disp_stack_new_internal(AjsVm *vm, AjsRealm *realm, bool is_async) {
+    AjsRealm *r = realm ? realm : (vm->active_realm ? vm->active_realm : vm->main_realm);
+    AjsValue proto = is_async ? r->async_disp_stack_proto : r->disp_stack_proto;
+    return disp_stack_alloc_with_proto(vm, r, proto, is_async);
+}
+
+bool ajs_erm_add_disposable(AjsVm *vm, AjsObject *stack_obj, AjsValue val, bool is_async) {
+    if (!stack_obj || !stack_obj->opaque_ptr) return false;
+    AjsDispStackData *d = (AjsDispStackData *)stack_obj->opaque_ptr;
+    if (ajs_is_nullish(val)) return true;
+    if (!ajs_is_object(vm, val)) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Disposable resource is not an object");
+        return false;
+    }
+
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, ajs_val_from_gc(stack_obj));
+    ajs_temp_root_push(vm, val);
+
+    AjsDispRecord rec;
+    memset(&rec, 0, sizeof(rec));
+    rec.val = val;
+    rec.is_async = is_async;
+    rec.is_adopt = false;
+    rec.sync_fallback = false;
+
+    if (is_async) {
+        AjsValue m = ajs_obj_get(vm, val, ajs_val_from_gc(vm->well_known_syms[AJS_SYM_ASYNC_DISPOSE]), val);
+        if (vm->has_exception) { ajs_temp_root_restore(vm, rs); return false; }
+        if (!ajs_is_nullish(m)) {
+            if (!ajs_is_callable(vm, m)) {
+                ajs_temp_root_restore(vm, rs);
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "[Symbol.asyncDispose] is not a function");
+                return false;
+            }
+            rec.method = m;
+        } else {
+            AjsValue sm = ajs_obj_get(vm, val, ajs_val_from_gc(vm->well_known_syms[AJS_SYM_DISPOSE]), val);
+            if (vm->has_exception) { ajs_temp_root_restore(vm, rs); return false; }
+            if (ajs_is_nullish(sm) || !ajs_is_callable(vm, sm)) {
+                ajs_temp_root_restore(vm, rs);
+                ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Object is not async-disposable or disposable");
+                return false;
+            }
+            rec.method = sm;
+            rec.sync_fallback = true;
+        }
+    } else {
+        AjsValue sm = ajs_obj_get(vm, val, ajs_val_from_gc(vm->well_known_syms[AJS_SYM_DISPOSE]), val);
+        if (vm->has_exception) { ajs_temp_root_restore(vm, rs); return false; }
+        if (ajs_is_nullish(sm) || !ajs_is_callable(vm, sm)) {
+            ajs_temp_root_restore(vm, rs);
+            ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "[Symbol.dispose] is not a function");
+            return false;
+        }
+        rec.method = sm;
+    }
+
+    ajs_temp_root_push(vm, rec.method);
+    bool ok = disp_stack_push_rec(vm, d, rec);
+    ajs_temp_root_restore(vm, rs);
+    return ok;
+}
+
+bool ajs_erm_dispose_step(AjsVm *vm, AjsObject *stack_obj, AjsValue *out_await_val, uint8_t *out_mode) {
+    *out_await_val = AJS_VAL_UNDEFINED;
+    *out_mode = 0;
+    if (!stack_obj || !stack_obj->opaque_ptr) return true;
+    AjsDispStackData *d = (AjsDispStackData *)stack_obj->opaque_ptr;
+    d->disposed = true;
+    if (d->count == 0) {
+        free(d->entries);
+        d->entries = NULL;
+        d->cap = 0;
+        return true;
+    }
+
+    AjsDispRecord rec = d->entries[--d->count];
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, ajs_val_from_gc(stack_obj));
+    ajs_temp_root_push(vm, rec.val);
+    ajs_temp_root_push(vm, rec.method);
+
+    AjsValue res = rec.is_adopt
+                   ? ajs_call_internal(vm, rec.method, AJS_VAL_UNDEFINED, 1, &rec.val)
+                   : ajs_call_internal(vm, rec.method, rec.val, 0, NULL);
+    ajs_temp_root_restore(vm, rs);
+    if (vm->has_exception) return false;
+
+    if (rec.is_async) {
+        *out_await_val = rec.sync_fallback ? AJS_VAL_UNDEFINED : res;
+        *out_mode = 1u;
+    } else {
+        *out_await_val = AJS_VAL_UNDEFINED;
+        *out_mode = 2u;
+    }
+    return true;
+}
+
+void ajs_erm_dispose_record_error(AjsVm *vm, AjsObject *stack_obj, AjsValue err) {
+    if (!stack_obj || !stack_obj->opaque_ptr) return;
+    AjsDispStackData *d = (AjsDispStackData *)stack_obj->opaque_ptr;
+    if (!d->has_err) {
+        d->has_err = true;
+        d->err = err;
+    } else {
+        size_t rs = ajs_temp_root_save(vm);
+        ajs_temp_root_push(vm, ajs_val_from_gc(stack_obj));
+        d->err = make_suppressed_err(vm, err, d->err);
+        ajs_temp_root_restore(vm, rs);
+    }
+}
+
+bool ajs_erm_dispose_finish(AjsVm *vm, AjsObject *stack_obj, bool has_pending_throw, AjsValue *io_pending_err) {
+    if (!stack_obj || !stack_obj->opaque_ptr) return !has_pending_throw;
+    AjsDispStackData *d = (AjsDispStackData *)stack_obj->opaque_ptr;
+    d->disposed = true;
+    free(d->entries);
+    d->entries = NULL;
+    d->count = 0;
+    d->cap = 0;
+    if (d->has_err) {
+        AjsValue ferr = d->err;
+        d->has_err = false;
+        d->err = AJS_VAL_UNDEFINED;
+        if (has_pending_throw) {
+            *io_pending_err = make_suppressed_err(vm, ferr, *io_pending_err);
+        } else {
+            *io_pending_err = ferr;
+        }
+        return false;
+    }
+    return !has_pending_throw;
+}
+
+static AjsObject *require_disp_stack(AjsVm *vm, AjsValue this_val, bool is_async, const char *fn_name, AjsDispStackData **out_d) {
+    uint32_t tag = is_async ? AJS_ASYNC_DISP_STACK_TAG : AJS_DISP_STACK_TAG;
+    if (!ajs_val_is_gc_kind(this_val, AJS_GC_OBJECT)) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "%s called on non-object", fn_name);
+        return NULL;
+    }
+    AjsObject *obj = (AjsObject *)ajs_val_to_gc(this_val);
+    if (obj->opaque_tag != tag || !obj->opaque_ptr) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "%s called on incompatible receiver", fn_name);
+        return NULL;
+    }
+    *out_d = (AjsDispStackData *)obj->opaque_ptr;
+    return obj;
+}
+
+static AjsValue js_disp_stack_ctor(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)this_val; (void)argc; (void)argv; (void)ud;
+    bool is_async = (current_fn_magic(vm) == -38);
+    AjsValue nt = ajs_get_native_new_target(vm);
+    if (nt == AJS_VAL_UNDEFINED) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE,
+                                  is_async ? "Constructor AsyncDisposableStack requires 'new'"
+                                           : "Constructor DisposableStack requires 'new'");
+    }
+    AjsRealm *def_r = vm->active_realm ? vm->active_realm : vm->main_realm;
+    if (ajs_val_is_gc_kind(nt, AJS_GC_OBJECT) && ((AjsObject *)ajs_val_to_gc(nt))->realm) {
+        def_r = ((AjsObject *)ajs_val_to_gc(nt))->realm;
+    }
+    AjsValue proto = is_async ? def_r->async_disp_stack_proto : def_r->disp_stack_proto;
+    if (ajs_val_is_gc_kind(nt, AJS_GC_OBJECT)) {
+        AjsValue p = ajs_obj_get(vm, nt, ajs_val_from_gc(vm->str_prototype), nt);
+        if (vm->has_exception) return AJS_VAL_EXCEPTION;
+        if (ajs_val_is_gc_kind(p, AJS_GC_OBJECT)) proto = p;
+    }
+    return disp_stack_alloc_with_proto(vm, vm->active_realm ? vm->active_realm : def_r, proto, is_async);
+}
+
+static AjsValue js_disp_stack_get_disposed(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)argc; (void)argv; (void)ud;
+    bool is_async = (current_fn_magic(vm) == 1);
+    AjsDispStackData *d = NULL;
+    if (!require_disp_stack(vm, this_val, is_async,
+                            is_async ? "get AsyncDisposableStack.prototype.disposed"
+                                     : "get DisposableStack.prototype.disposed", &d)) {
+        return AJS_VAL_EXCEPTION;
+    }
+    return ajs_bool(d->disposed);
+}
+
+static AjsValue js_disp_stack_use(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    bool is_async = (current_fn_magic(vm) == 1);
+    AjsDispStackData *d = NULL;
+    AjsObject *obj = require_disp_stack(vm, this_val, is_async,
+                                        is_async ? "AsyncDisposableStack.prototype.use"
+                                                 : "DisposableStack.prototype.use", &d);
+    if (!obj) return AJS_VAL_EXCEPTION;
+    if (d->disposed) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_REFERENCE,
+                                  is_async ? "Cannot call use on an already-disposed AsyncDisposableStack"
+                                           : "Cannot call use on an already-disposed DisposableStack");
+    }
+    AjsValue val = argc > 0 ? argv[0] : AJS_VAL_UNDEFINED;
+    if (!ajs_erm_add_disposable(vm, obj, val, is_async)) return AJS_VAL_EXCEPTION;
+    return val;
+}
+
+static AjsValue js_disp_stack_adopt(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    bool is_async = (current_fn_magic(vm) == 1);
+    AjsDispStackData *d = NULL;
+    AjsObject *obj = require_disp_stack(vm, this_val, is_async,
+                                        is_async ? "AsyncDisposableStack.prototype.adopt"
+                                                 : "DisposableStack.prototype.adopt", &d);
+    if (!obj) return AJS_VAL_EXCEPTION;
+    if (d->disposed) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_REFERENCE,
+                                  is_async ? "Cannot call adopt on an already-disposed AsyncDisposableStack"
+                                           : "Cannot call adopt on an already-disposed DisposableStack");
+    }
+    AjsValue val = argc > 0 ? argv[0] : AJS_VAL_UNDEFINED;
+    AjsValue on_disp = argc > 1 ? argv[1] : AJS_VAL_UNDEFINED;
+    if (!ajs_is_callable(vm, on_disp)) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "onDispose callback is not callable");
+    }
+    AjsDispRecord rec = {
+        .val = val,
+        .method = on_disp,
+        .is_async = is_async,
+        .is_adopt = true,
+        .sync_fallback = false
+    };
+    if (!disp_stack_push_rec(vm, d, rec)) return AJS_VAL_EXCEPTION;
+    return val;
+}
+
+static AjsValue js_disp_stack_defer(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)ud;
+    bool is_async = (current_fn_magic(vm) == 1);
+    AjsDispStackData *d = NULL;
+    AjsObject *obj = require_disp_stack(vm, this_val, is_async,
+                                        is_async ? "AsyncDisposableStack.prototype.defer"
+                                                 : "DisposableStack.prototype.defer", &d);
+    if (!obj) return AJS_VAL_EXCEPTION;
+    if (d->disposed) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_REFERENCE,
+                                  is_async ? "Cannot call defer on an already-disposed AsyncDisposableStack"
+                                           : "Cannot call defer on an already-disposed DisposableStack");
+    }
+    AjsValue on_disp = argc > 0 ? argv[0] : AJS_VAL_UNDEFINED;
+    if (!ajs_is_callable(vm, on_disp)) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "onDispose callback is not callable");
+    }
+    AjsDispRecord rec = {
+        .val = AJS_VAL_UNDEFINED,
+        .method = on_disp,
+        .is_async = is_async,
+        .is_adopt = false,
+        .sync_fallback = false
+    };
+    if (!disp_stack_push_rec(vm, d, rec)) return AJS_VAL_EXCEPTION;
+    return AJS_VAL_UNDEFINED;
+}
+
+static AjsValue js_disp_stack_move(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)argc; (void)argv; (void)ud;
+    bool is_async = (current_fn_magic(vm) == 1);
+    AjsDispStackData *d = NULL;
+    AjsObject *obj = require_disp_stack(vm, this_val, is_async,
+                                        is_async ? "AsyncDisposableStack.prototype.move"
+                                                 : "DisposableStack.prototype.move", &d);
+    if (!obj) return AJS_VAL_EXCEPTION;
+    if (d->disposed) {
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_REFERENCE,
+                                  is_async ? "Cannot call move on an already-disposed AsyncDisposableStack"
+                                           : "Cannot call move on an already-disposed DisposableStack");
+    }
+    AjsRealm *r = vm->active_realm ? vm->active_realm : (obj->realm ? obj->realm : vm->main_realm);
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, this_val);
+    AjsValue nv = ajs_erm_disp_stack_new_internal(vm, r, is_async);
+    ajs_temp_root_restore(vm, rs);
+    if (vm->has_exception) return AJS_VAL_EXCEPTION;
+
+    AjsObject *nobj = (AjsObject *)ajs_val_to_gc(nv);
+    AjsDispStackData *nd = (AjsDispStackData *)nobj->opaque_ptr;
+    nd->entries = d->entries;
+    nd->count = d->count;
+    nd->cap = d->cap;
+    d->entries = NULL;
+    d->count = 0;
+    d->cap = 0;
+    d->disposed = true;
+    return nv;
+}
+
+static AjsValue js_disp_stack_dispose(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)argc; (void)argv; (void)ud;
+    AjsDispStackData *d = NULL;
+    AjsObject *obj = require_disp_stack(vm, this_val, false, "DisposableStack.prototype.dispose", &d);
+    if (!obj) return AJS_VAL_EXCEPTION;
+    if (d->disposed) return AJS_VAL_UNDEFINED;
+    d->disposed = true;
+
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, this_val);
+    while (d->count > 0) {
+        AjsValue await_val = AJS_VAL_UNDEFINED;
+        uint8_t mode = 0;
+        if (!ajs_erm_dispose_step(vm, obj, &await_val, &mode)) {
+            AjsValue exc = vm->exception;
+            ajs_temp_root_push(vm, exc);
+            ajs_clear_exception(vm);
+            ajs_erm_dispose_record_error(vm, obj, exc);
+        }
+    }
+    AjsValue ferr = AJS_VAL_UNDEFINED;
+    bool ok = ajs_erm_dispose_finish(vm, obj, false, &ferr);
+    ajs_temp_root_restore(vm, rs);
+    if (!ok) {
+        return ajs_throw(vm, ferr);
+    }
+    return AJS_VAL_UNDEFINED;
+}
+
+static void async_disp_drive(AjsVm *vm, AjsRealm *r, AjsValue stack_val, AjsValue out_prom_val);
+
+static AjsValue async_disp_step_reaction(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)this_val; (void)ud;
+    AjsEnv *env = current_fn_env(vm);
+    if (!env || env->count < 2) return AJS_VAL_UNDEFINED;
+    AjsValue stack_val = env->slots[0];
+    AjsValue out_prom_val = env->slots[1];
+    bool is_reject = (current_fn_magic(vm) == 1);
+    if (is_reject && ajs_val_is_gc_kind(stack_val, AJS_GC_OBJECT)) {
+        AjsValue reason = argc > 0 ? argv[0] : AJS_VAL_UNDEFINED;
+        ajs_erm_dispose_record_error(vm, (AjsObject *)ajs_val_to_gc(stack_val), reason);
+    }
+    AjsRealm *r = vm->active_realm ? vm->active_realm : vm->main_realm;
+    async_disp_drive(vm, r, stack_val, out_prom_val);
+    return AJS_VAL_UNDEFINED;
+}
+
+static void async_disp_drive(AjsVm *vm, AjsRealm *r, AjsValue stack_val, AjsValue out_prom_val) {
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, stack_val);
+    ajs_temp_root_push(vm, out_prom_val);
+
+    AjsObject *sobj = (AjsObject *)ajs_val_to_gc(stack_val);
+    AjsObject *pobj = (AjsObject *)ajs_val_to_gc(out_prom_val);
+    AjsDispStackData *d = (AjsDispStackData *)sobj->opaque_ptr;
+
+    while (d && d->count > 0) {
+        AjsValue await_val = AJS_VAL_UNDEFINED;
+        uint8_t mode = 0;
+        if (!ajs_erm_dispose_step(vm, sobj, &await_val, &mode)) {
+            AjsValue exc = vm->exception;
+            ajs_temp_root_push(vm, exc);
+            ajs_clear_exception(vm);
+            ajs_erm_dispose_record_error(vm, sobj, exc);
+            continue;
+        }
+        ajs_temp_root_push(vm, await_val);
+        AjsValue prom = ajs_promise_resolve_val(vm, r, r->promise_ctor, await_val);
+        if (vm->has_exception || !ajs_val_is_gc_kind(prom, AJS_GC_OBJECT)) {
+            AjsValue exc = vm->exception;
+            ajs_temp_root_push(vm, exc);
+            ajs_clear_exception(vm);
+            ajs_erm_dispose_record_error(vm, sobj, exc);
+            continue;
+        }
+        ajs_temp_root_push(vm, prom);
+        AjsEnv *cenv = ajs_env_new(vm, NULL, 2, NULL);
+        if (!cenv) {
+            ajs_clear_exception(vm);
+            reject_promise_internal(vm, pobj, vm->oom_error);
+            ajs_temp_root_restore(vm, rs);
+            return;
+        }
+        cenv->slots[0] = stack_val;
+        cenv->slots[1] = out_prom_val;
+        ajs_temp_root_push(vm, ajs_val_from_gc(cenv));
+        AjsObject *on_f = prom_make_closure_fn(vm, r, async_disp_step_reaction, "", 1, false, 0, cenv);
+        ajs_temp_root_push(vm, ajs_val_from_gc(on_f));
+        AjsObject *on_r = prom_make_closure_fn(vm, r, async_disp_step_reaction, "", 1, false, 1, cenv);
+        ajs_temp_root_push(vm, ajs_val_from_gc(on_r));
+        ajs_promise_then_internal(vm, (AjsObject *)ajs_val_to_gc(prom),
+                                  ajs_val_from_gc(on_f), ajs_val_from_gc(on_r),
+                                  AJS_VAL_UNDEFINED, AJS_VAL_UNDEFINED, AJS_VAL_UNDEFINED);
+        ajs_temp_root_restore(vm, rs);
+        return;
+    }
+
+    AjsValue ferr = AJS_VAL_UNDEFINED;
+    bool ok = ajs_erm_dispose_finish(vm, sobj, false, &ferr);
+    if (!ok) {
+        reject_promise_internal(vm, pobj, ferr);
+    } else {
+        fulfill_promise_internal(vm, pobj, AJS_VAL_UNDEFINED);
+    }
+    ajs_temp_root_restore(vm, rs);
+}
+
+static AjsValue js_async_disp_stack_disposeAsync(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)argc; (void)argv; (void)ud;
+    AjsRealm *r = vm->active_realm ? vm->active_realm : vm->main_realm;
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, this_val);
+
+    AjsObject *pobj = ajs_obj_new(vm, r, AJS_OBJ_PROMISE, r->promise_proto);
+    if (!pobj) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    pobj->u.promise.state = AJS_PROMISE_PENDING;
+    pobj->u.promise.result = AJS_VAL_UNDEFINED;
+    AjsValue pval = ajs_val_from_gc(pobj);
+    ajs_temp_root_push(vm, pval);
+
+    AjsDispStackData *d = NULL;
+    if (!require_disp_stack(vm, this_val, true, "AsyncDisposableStack.prototype.disposeAsync", &d)) {
+        AjsValue exc = vm->exception;
+        ajs_temp_root_push(vm, exc);
+        ajs_clear_exception(vm);
+        reject_promise_internal(vm, pobj, exc);
+        ajs_temp_root_restore(vm, rs);
+        return pval;
+    }
+    if (d->disposed) {
+        fulfill_promise_internal(vm, pobj, AJS_VAL_UNDEFINED);
+        ajs_temp_root_restore(vm, rs);
+        return pval;
+    }
+    d->disposed = true;
+    async_disp_drive(vm, r, this_val, pval);
+    ajs_temp_root_restore(vm, rs);
+    return pval;
+}
+
+static void erm_def_to_string_tag(AjsVm *vm, AjsValue obj_v, const char *tag) {
+    AjsPropDesc td;
+    memset(&td, 0, sizeof(td));
+    td.flags = AJS_DESC_HAS_VALUE | AJS_DESC_HAS_WRITABLE | AJS_DESC_HAS_ENUMERABLE |
+               AJS_DESC_HAS_CONFIGURABLE | AJS_DESC_CONFIGURABLE;
+    td.value = ajs_val_from_gc(ajs_str_from_cstr(vm, tag, true));
+    ajs_obj_define_own_prop(vm, (AjsObject *)ajs_val_to_gc(obj_v),
+                            ajs_val_from_gc(vm->well_known_syms[AJS_SYM_TO_STRING_TAG]), &td, false);
+}
+
+static void erm_def_disposed_getter(AjsVm *vm, AjsRealm *r, AjsValue proto_v, int32_t magic) {
+    AjsObject *gfn = prom_make_closure_fn(vm, r, js_disp_stack_get_disposed, "get disposed", 0, false, magic, NULL);
+    if (!gfn) return;
+    size_t rs = ajs_temp_root_save(vm);
+    AjsValue gv = ajs_val_from_gc(gfn);
+    ajs_temp_root_push(vm, gv);
+    AjsPropDesc d;
+    memset(&d, 0, sizeof(d));
+    d.flags = AJS_DESC_IS_ACCESSOR | AJS_DESC_HAS_GET | AJS_DESC_HAS_SET |
+              AJS_DESC_HAS_ENUMERABLE | AJS_DESC_HAS_CONFIGURABLE | AJS_DESC_CONFIGURABLE;
+    d.getter = gv;
+    d.setter = AJS_VAL_UNDEFINED;
+    AjsString *k = ajs_str_from_cstr(vm, "disposed", true);
+    ajs_obj_define_own_prop(vm, (AjsObject *)ajs_val_to_gc(proto_v), ajs_val_from_gc(k), &d, false);
+    ajs_temp_root_restore(vm, rs);
+}
+
+static AjsValue js_iter_proto_dispose(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)argc; (void)argv; (void)ud;
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, this_val);
+    AjsValue ret_fn = ajs_obj_get(vm, this_val, ajs_val_from_gc(vm->str_return), this_val);
+    if (vm->has_exception) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    if (ajs_is_nullish(ret_fn)) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_UNDEFINED;
+    }
+    if (!ajs_is_callable(vm, ret_fn)) {
+        ajs_temp_root_restore(vm, rs);
+        return ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "Iterator return property is not callable");
+    }
+    ajs_temp_root_push(vm, ret_fn);
+    ajs_call_internal(vm, ret_fn, this_val, 0, NULL);
+    ajs_temp_root_restore(vm, rs);
+    return vm->has_exception ? AJS_VAL_EXCEPTION : AJS_VAL_UNDEFINED;
+}
+
+static AjsValue async_iter_dispose_undef_cb(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)vm; (void)this_val; (void)argc; (void)argv; (void)ud;
+    return AJS_VAL_UNDEFINED;
+}
+
+static AjsValue js_async_iter_proto_asyncDispose(AjsVm *vm, AjsValue this_val, int argc, const AjsValue *argv, void *ud) {
+    (void)argc; (void)argv; (void)ud;
+    AjsRealm *r = vm->active_realm ? vm->active_realm : vm->main_realm;
+    size_t rs = ajs_temp_root_save(vm);
+    ajs_temp_root_push(vm, this_val);
+
+    AjsObject *pobj = ajs_obj_new(vm, r, AJS_OBJ_PROMISE, r->promise_proto);
+    if (!pobj) {
+        ajs_temp_root_restore(vm, rs);
+        return AJS_VAL_EXCEPTION;
+    }
+    pobj->u.promise.state = AJS_PROMISE_PENDING;
+    pobj->u.promise.result = AJS_VAL_UNDEFINED;
+    AjsValue pval = ajs_val_from_gc(pobj);
+    ajs_temp_root_push(vm, pval);
+
+    AjsValue ret_fn = ajs_obj_get(vm, this_val, ajs_val_from_gc(vm->str_return), this_val);
+    if (vm->has_exception) {
+        AjsValue exc = vm->exception;
+        ajs_temp_root_push(vm, exc);
+        ajs_clear_exception(vm);
+        reject_promise_internal(vm, pobj, exc);
+        ajs_temp_root_restore(vm, rs);
+        return pval;
+    }
+    if (ajs_is_nullish(ret_fn)) {
+        fulfill_promise_internal(vm, pobj, AJS_VAL_UNDEFINED);
+        ajs_temp_root_restore(vm, rs);
+        return pval;
+    }
+    if (!ajs_is_callable(vm, ret_fn)) {
+        ajs_throw_err_kind(vm, AJS_ERR_KIND_TYPE, "AsyncIterator return property is not callable");
+        AjsValue exc = vm->exception;
+        ajs_temp_root_push(vm, exc);
+        ajs_clear_exception(vm);
+        reject_promise_internal(vm, pobj, exc);
+        ajs_temp_root_restore(vm, rs);
+        return pval;
+    }
+
+    ajs_temp_root_push(vm, ret_fn);
+    AjsValue res = ajs_call_internal(vm, ret_fn, this_val, 0, NULL);
+    if (vm->has_exception) {
+        AjsValue exc = vm->exception;
+        ajs_temp_root_push(vm, exc);
+        ajs_clear_exception(vm);
+        reject_promise_internal(vm, pobj, exc);
+        ajs_temp_root_restore(vm, rs);
+        return pval;
+    }
+    ajs_temp_root_push(vm, res);
+
+    AjsValue inner_p = ajs_promise_resolve_val(vm, r, r->promise_ctor, res);
+    if (vm->has_exception || !ajs_val_is_gc_kind(inner_p, AJS_GC_OBJECT)) {
+        AjsValue exc = vm->exception;
+        ajs_temp_root_push(vm, exc);
+        ajs_clear_exception(vm);
+        reject_promise_internal(vm, pobj, exc);
+        ajs_temp_root_restore(vm, rs);
+        return pval;
+    }
+    ajs_temp_root_push(vm, inner_p);
+
+    AjsValue res_fn = AJS_VAL_UNDEFINED, rej_fn = AJS_VAL_UNDEFINED;
+    create_resolving_functions(vm, r, pval, &res_fn, &rej_fn);
+    ajs_temp_root_push(vm, res_fn);
+    ajs_temp_root_push(vm, rej_fn);
+
+    AjsObject *on_f = prom_make_closure_fn(vm, r, async_iter_dispose_undef_cb, "", 0, false, 0, NULL);
+    if (!on_f) {
+        ajs_clear_exception(vm);
+        reject_promise_internal(vm, pobj, vm->oom_error);
+        ajs_temp_root_restore(vm, rs);
+        return pval;
+    }
+    ajs_temp_root_push(vm, ajs_val_from_gc(on_f));
+
+    ajs_promise_then_internal(vm, (AjsObject *)ajs_val_to_gc(inner_p),
+                              ajs_val_from_gc(on_f), AJS_VAL_UNDEFINED,
+                              res_fn, rej_fn, pval);
+    ajs_temp_root_restore(vm, rs);
+    return pval;
+}
+
+void ajs_init_erm_builtins(AjsVm *vm, AjsRealm *r) {
+    size_t rs = ajs_temp_root_save(vm);
+
+    /* 1. DisposableStack */
+    r->disp_stack_proto = ajs_val_from_gc(ajs_obj_new(vm, r, AJS_OBJ_ORDINARY, r->object_proto));
+    r->disp_stack_ctor  = ajs_val_from_gc(prom_make_closure_fn(vm, r, js_disp_stack_ctor, "DisposableStack", 0, true, -37, NULL));
+    ajs_define_prop_str(vm, r->disp_stack_ctor, "prototype", r->disp_stack_proto, 0);
+    ajs_define_prop_str(vm, r->disp_stack_proto, "constructor", r->disp_stack_ctor, AJS_METHOD_FLAGS);
+    ajs_define_prop_str(vm, r->global_obj, "DisposableStack", r->disp_stack_ctor, AJS_METHOD_FLAGS);
+
+    ajs_def_native_method(vm, r, r->disp_stack_proto, "use",   js_disp_stack_use,   1, AJS_METHOD_FLAGS, 0);
+    ajs_def_native_method(vm, r, r->disp_stack_proto, "adopt", js_disp_stack_adopt, 2, AJS_METHOD_FLAGS, 0);
+    ajs_def_native_method(vm, r, r->disp_stack_proto, "defer", js_disp_stack_defer, 1, AJS_METHOD_FLAGS, 0);
+    ajs_def_native_method(vm, r, r->disp_stack_proto, "move",  js_disp_stack_move,  0, AJS_METHOD_FLAGS, 0);
+    erm_def_disposed_getter(vm, r, r->disp_stack_proto, 0);
+    erm_def_to_string_tag(vm, r->disp_stack_proto, "DisposableStack");
+    {
+        AjsObject *dfn = prom_make_closure_fn(vm, r, js_disp_stack_dispose, "dispose", 0, false, 0, NULL);
+        if (dfn) {
+            AjsValue dv = ajs_val_from_gc(dfn);
+            ajs_temp_root_push(vm, dv);
+            ajs_define_prop_str(vm, r->disp_stack_proto, "dispose", dv, AJS_METHOD_FLAGS);
+            AjsPropDesc sd;
+            memset(&sd, 0, sizeof(sd));
+            sd.flags = AJS_DESC_HAS_VALUE | AJS_DESC_HAS_WRITABLE | AJS_DESC_WRITABLE |
+                       AJS_DESC_HAS_ENUMERABLE | AJS_DESC_HAS_CONFIGURABLE | AJS_DESC_CONFIGURABLE;
+            sd.value = dv;
+            ajs_obj_define_own_prop(vm, (AjsObject *)ajs_val_to_gc(r->disp_stack_proto),
+                                    ajs_val_from_gc(vm->well_known_syms[AJS_SYM_DISPOSE]), &sd, false);
+        }
+    }
+
+    /* 2. AsyncDisposableStack */
+    r->async_disp_stack_proto = ajs_val_from_gc(ajs_obj_new(vm, r, AJS_OBJ_ORDINARY, r->object_proto));
+    r->async_disp_stack_ctor  = ajs_val_from_gc(prom_make_closure_fn(vm, r, js_disp_stack_ctor, "AsyncDisposableStack", 0, true, -38, NULL));
+    ajs_define_prop_str(vm, r->async_disp_stack_ctor, "prototype", r->async_disp_stack_proto, 0);
+    ajs_define_prop_str(vm, r->async_disp_stack_proto, "constructor", r->async_disp_stack_ctor, AJS_METHOD_FLAGS);
+    ajs_define_prop_str(vm, r->global_obj, "AsyncDisposableStack", r->async_disp_stack_ctor, AJS_METHOD_FLAGS);
+
+    ajs_def_native_method(vm, r, r->async_disp_stack_proto, "use",   js_disp_stack_use,   1, AJS_METHOD_FLAGS, 1);
+    ajs_def_native_method(vm, r, r->async_disp_stack_proto, "adopt", js_disp_stack_adopt, 2, AJS_METHOD_FLAGS, 1);
+    ajs_def_native_method(vm, r, r->async_disp_stack_proto, "defer", js_disp_stack_defer, 1, AJS_METHOD_FLAGS, 1);
+    ajs_def_native_method(vm, r, r->async_disp_stack_proto, "move",  js_disp_stack_move,  0, AJS_METHOD_FLAGS, 1);
+    erm_def_disposed_getter(vm, r, r->async_disp_stack_proto, 1);
+    erm_def_to_string_tag(vm, r->async_disp_stack_proto, "AsyncDisposableStack");
+    {
+        AjsObject *adfn = prom_make_closure_fn(vm, r, js_async_disp_stack_disposeAsync, "disposeAsync", 0, false, 1, NULL);
+        if (adfn) {
+            AjsValue adv = ajs_val_from_gc(adfn);
+            ajs_temp_root_push(vm, adv);
+            ajs_define_prop_str(vm, r->async_disp_stack_proto, "disposeAsync", adv, AJS_METHOD_FLAGS);
+            AjsPropDesc sd;
+            memset(&sd, 0, sizeof(sd));
+            sd.flags = AJS_DESC_HAS_VALUE | AJS_DESC_HAS_WRITABLE | AJS_DESC_WRITABLE |
+                       AJS_DESC_HAS_ENUMERABLE | AJS_DESC_HAS_CONFIGURABLE | AJS_DESC_CONFIGURABLE;
+            sd.value = adv;
+            ajs_obj_define_own_prop(vm, (AjsObject *)ajs_val_to_gc(r->async_disp_stack_proto),
+                                    ajs_val_from_gc(vm->well_known_syms[AJS_SYM_ASYNC_DISPOSE]), &sd, false);
+        }
+    }
+
+    /* 3. %IteratorPrototype%[Symbol.dispose] & %AsyncIteratorPrototype%[Symbol.asyncDispose] */
+    if (ajs_val_is_gc_kind(r->iterator_proto, AJS_GC_OBJECT)) {
+        ajs_def_native_sym_method(vm, r, r->iterator_proto, vm->well_known_syms[AJS_SYM_DISPOSE],
+                                  "[Symbol.dispose]", js_iter_proto_dispose, 0, AJS_METHOD_FLAGS);
+    }
+    if (ajs_val_is_gc_kind(r->async_iterator_proto, AJS_GC_OBJECT)) {
+        ajs_def_native_sym_method(vm, r, r->async_iterator_proto, vm->well_known_syms[AJS_SYM_ASYNC_DISPOSE],
+                                  "[Symbol.asyncDispose]", js_async_iter_proto_asyncDispose, 0, AJS_METHOD_FLAGS);
+    }
+
+    ajs_temp_root_restore(vm, rs);
+}
+
