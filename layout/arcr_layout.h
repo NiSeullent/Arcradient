@@ -55,6 +55,10 @@ typedef struct ArcrLayoutBox {
     ArcrRect                 clip_rect;    /* Active overflow:hidden/auto clip rect when has_clip */
     bool                     has_clip;
     bool                     is_fixed;     /* position: fixed (does not scroll with document!) */
+    bool                     is_sticky;    /* position: sticky (clamps within scroll container) */
+    int32_t                  sticky_anchor_y;
+    int32_t                  sticky_top_px;
+    int32_t                  sticky_max_dy;
     int32_t                  z_index;
     uint8_t                  effective_opacity; /* 0..255 */
     bool                     is_list_item;

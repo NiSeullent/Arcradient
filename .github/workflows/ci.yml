@@ -31,8 +31,23 @@ jobs:
           cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           cmake --build build
 
-      - name: Run Full Verification Suite (CTest)
-        run: ctest --test-dir build --output-on-failure -V
+      - name: Verify Clean-Room ArcradientJS Symbol Purity & Run Full 40-Test Suite (CTest)
+        run: |
+          ! nm -D build/libarcr_js_portable.so | grep -iE "JS_NewRuntime|JS_NewContext|quickjs"
+          ctest --test-dir build --output-on-failure -V
+
+      - name: Verify Minimal CPU Fallback Build (FreeType=OFF · libpng=OFF · X11=OFF)
+        run: |
+          cmake -B build-min -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DARCR_ENABLE_FREETYPE=OFF -DARCR_ENABLE_LIBPNG=OFF -DWATERSCAPE_ENABLE_X11=OFF
+          cmake --build build-min --target arcr_tests
+          ctest --test-dir build-min --output-on-failure -V
+
+      - name: Run Standalone ArcradientJS Test262, WPT Shards & Local HTTP/HTTPS/CORS Fixture Matrix
+        run: |
+          python3 tools/run_test262.py --binary ./build/arcr_js
+          python3 tools/run_wpt_shard.py --binary ./build/waterscape --module-dir ./build --out-json /tmp/wpt_shard_ci.json
+          python3 tools/run_verification_matrix.py --binary ./build/waterscape --module-dir ./build --out-dir /tmp/verify_ci
 
       - name: Run Multi-Core + AVX2 Browser Rendering Benchmark & Live X11 SHM Window Test
         run: |
@@ -60,11 +75,14 @@ jobs:
           name: waterscape-linux-x64-installers
           path: dist-linux/*
 
-      - name: Upload Linux Rendered Snapshots
+      - name: Upload Linux Rendered Snapshots & Verification Reports
         uses: actions/upload-artifact@v4
         with:
           name: waterscape-linux-snapshots
-          path: snapshots/*.png
+          path: |
+            snapshots/*.png
+            /tmp/wpt_shard_ci.json
+            /tmp/verify_ci/verification_matrix_report.json
 
   win2000-x86-sse1:
     name: Windows 2000 SP4 Legacy x86 (PE 5.0 · SSE1 · WaterscapeSetup.exe)
@@ -79,20 +97,23 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ninja-build gcc-mingw-w64-i686 binutils-mingw-w64-i686
 
-      - name: Cross-Build Waterscape 2.0 + SFX Installer (Win2000 x86 SSE1)
+      - name: Cross-Build Waterscape 2.0 + ArcradientJS + SFX Installer (Win2000 x86 SSE1)
         run: |
           cmake -B build-win2k -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/win2000-x86-sse1.cmake
           cmake --build build-win2k
 
-      - name: Verify PE 5.0 Subsystem & Zero Non-System DLL Imports
+      - name: Verify PE 5.0 Subsystem, Zero Post-Win2000 DLL Imports & Zero QuickJS Symbols
         run: |
           i686-w64-mingw32-objdump -p build-win2k/waterscape.exe | grep -E "Major(OperatingSystem|Subsystem)Version|Minor(OperatingSystem|Subsystem)Version|DLL Name:"
           i686-w64-mingw32-objdump -p build-win2k/waterscape.exe | grep -q "MajorSubsystemVersion.*5"
           i686-w64-mingw32-objdump -p build-win2k/waterscape.exe | grep -q "MinorSubsystemVersion.*0"
+          i686-w64-mingw32-objdump -p build-win2k/arcr_js.exe | grep -q "MajorSubsystemVersion.*5"
+          i686-w64-mingw32-objdump -p build-win2k/win32_ui_verify.exe | grep -q "MajorSubsystemVersion.*5"
           i686-w64-mingw32-objdump -p build-win2k/WaterscapeSetup.exe | grep -q "MajorSubsystemVersion.*5"
-          ! i686-w64-mingw32-objdump -p build-win2k/waterscape.exe build-win2k/WaterscapeSetup.exe build-win2k/uninstall.exe build-win2k/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread|vcruntime|api-ms-win)"
+          ! i686-w64-mingw32-objdump -p build-win2k/waterscape.exe build-win2k/arcr_js.exe build-win2k/win32_ui_verify.exe build-win2k/WaterscapeSetup.exe build-win2k/uninstall.exe build-win2k/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread|vcruntime|api-ms-win|dwmapi|uxtheme|shcore|uiautomationcore|d3d11|dxgi|mfplat)"
+          ! i686-w64-mingw32-objdump -x build-win2k/arcr_js_portable.dll | grep -iE "JS_NewRuntime|JS_NewContext"
           mkdir -p dist-win2k/addons
           cp build-win2k/WaterscapeSetup.exe dist-win2k/WaterscapeSetup-2.0.0-win2000-x86.exe
           cp build-win2k/*.exe build-win2k/*.dll dist-win2k/
@@ -118,17 +139,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ninja-build gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
 
-      - name: Cross-Build Waterscape 2.0 + SFX Installer (Windows x64)
+      - name: Cross-Build Waterscape 2.0 + ArcradientJS + SFX Installer (Windows x64)
         run: |
           cmake -B build-win64 -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TOOLCHAIN_FILE=cmake/toolchains/win-x64-sse3.cmake
           cmake --build build-win64
 
-      - name: Verify Clean Win32 System DLL Imports Only
+      - name: Verify Clean Win32 System DLL Imports & Zero QuickJS Symbols
         run: |
           x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe | grep -E "DLL Name:"
-          ! x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe build-win64/WaterscapeSetup.exe build-win64/uninstall.exe build-win64/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread)"
+          ! x86_64-w64-mingw32-objdump -p build-win64/waterscape.exe build-win64/arcr_js.exe build-win64/win32_ui_verify.exe build-win64/WaterscapeSetup.exe build-win64/uninstall.exe build-win64/*.dll | grep -iE "DLL Name:.*(libgcc|winpthread)"
+          ! x86_64-w64-mingw32-objdump -x build-win64/arcr_js_portable.dll | grep -iE "JS_NewRuntime|JS_NewContext"
           mkdir -p dist-win64/addons
           cp build-win64/WaterscapeSetup.exe dist-win64/WaterscapeSetup-2.0.0-x64.exe
           cp build-win64/*.exe build-win64/*.dll dist-win64/
@@ -142,7 +164,7 @@ jobs:
           path: dist-win64/**
 
   windows-runtime-verify:
-    name: Windows Native Execution (Full Test Suite + SFX Setup & Uninstall)
+    name: Windows Native Execution (40-Test Suite + Win32 Single-Frame/UIA/DPI GUI + SFX Setup)
     runs-on: windows-latest
     needs: [win2000-x86-sse1, win-x64-sse3]
     steps:
@@ -158,11 +180,16 @@ jobs:
           name: waterscape-win-x64-sse3
           path: run-win64
 
-      - name: Verify 32-bit Legacy x86 Suite, SFX Installer, Browser & Uninstaller on Windows (WoW64)
+      - name: Verify 32-bit Legacy x86 Suite, ArcradientJS CLI, Win32 GUI/UIA & SFX Installer (WoW64)
         shell: pwsh
         run: |
           Push-Location run-win2k
           ./arcr_tests.exe .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./arcr_js.exe -e "if ((1n << 32n) !== 4294967296n) throw new Error('x86 bigint fail');"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path ui_snaps_x86 | Out-Null
+          ./win32_ui_verify.exe --exe waterscape.exe --module-dir . --theme classic --extra-arg "--classic-frame" --url waterscape://addons --out-dir ui_snaps_x86 --report win32_ui_report_x86.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./WaterscapeSetup-2.0.0-win2000-x86.exe --verify-stub
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -175,11 +202,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
 
-      - name: Verify 64-bit x64 Suite, Benchmark, SFX Installer, Browser & Uninstaller on Windows
+      - name: Verify 64-bit x64 Suite, ArcradientJS CLI, Win32 Single-Frame DWM/UIA/DPI GUI & SFX Installer
         shell: pwsh
         run: |
           Push-Location run-win64
           ./arcr_tests.exe .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ./arcr_js.exe -e "if (typeof Promise.withResolvers !== 'function') throw new Error('x64 es2026 fail');"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force -Path ui_snaps_x64 | Out-Null
+          ./win32_ui_verify.exe --exe waterscape.exe --module-dir . --theme dark --url waterscape://addons --out-dir ui_snaps_x64 --report win32_ui_report_x64.json
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ./arcradient.exe --module-dir . --benchmark
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -193,6 +225,17 @@ jobs:
           & "$inst64\uninstall.exe" --silent --dir "$inst64"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
+
+      - name: Upload Native Windows GUI Screenshots & UIA Verification JSON Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: waterscape-windows-ui-verify
+          path: |
+            run-win2k/win32_ui_report_x86.json
+            run-win2k/ui_snaps_x86/*
+            run-win64/win32_ui_report_x64.json
+            run-win64/ui_snaps_x64/*
 
   publish-release:
     name: Publish GitHub Release Installers (Windows x86/x64 & Linux .deb/.run)
@@ -244,9 +287,9 @@ jobs:
           - **`SHA256SUMS.txt`**: 전 플랫폼 설치 파일 SHA-256 체크섬 목록
 
           ## Waterscape 2.0 핵심 업그레이드
-          1. **0ms 무지연 탭 전환 & 멀티코어 비동기 아키텍처**: 탭별 전용 프레임버퍼 캐시, 백그라운드 비동기 네비게이션 및 멀티코어 병렬 서브리소스 로더, Y-밴드 공간 인덱싱 `64×64` SIMD 타일 래스터라이저 + 락프리 글리프 아틀라스
+          1. **단일 창 프레임 소유권 & 무지연 멀티코어 UI**: Win32 DWM 확장 타이틀바 + Per-Monitor V2 DPI + UI Automation + 탭별 전용 프레임버퍼 캐시, 비동기 서브리소스 배칭 및 `64×64` SIMD 타일 래스터라이저
           2. **선명한 sRGB 감마 보정 폰트 안티에일리어싱**: 256단계 스템 다크닝 & 감마 보정 안티에일리어싱(`ClearType`/`FreeType Light`)으로 한글·영문·코드 가독성 극대화
-          3. **2026 최신 웹 규격 전면 지원**: `QuickJS-NG` ES2026 + 모던 Web API(`fetch`, `Promise`, `rAF`, `MutationObserver`, `CustomEvent`, `Canvas 2D`, `HTMLMediaElement`), `Brotli(br)` / `WebP` / `JPEG` / `PNG` / 애니메이션 `GIF` / 벡터 `SVG`, Tailwind CSS v4(`@layer`, `@supports`, `oklch()`, `color-mix()`), 60 FPS `@keyframes` 애니메이션 & `transform`, 실시간 `<video>` 플레이어 및 **YouTube · Google · X · Zuzunza · GitHub** 완벽 대응
+          3. **자체 클린룸 Pure C11 `ArcradientJS` ES2026 엔진 & 분리형 Web IDL 호스트**: 외부 JS 엔진 의존성 `0`개의 자체 `ArcradientJS` 바이트코드 VM/GC/ESM + 모던 Web API(`fetch`/Streams, `CustomElements`/`ShadowRoot`, `History` `pushState`, `IndexedDB`, `WebCrypto`, `Canvas 2D`), `Brotli(br)` / `WebP` / `SVG`, CSS 2026(`@layer`, `revert-layer`, `@container`, `@scope`, `oklch()`, Grid/Flex) 지원
           EOF
           sed -i 's/^          //' ../RELEASE_NOTES.md
           if gh release view "${GITHUB_REF_NAME}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then

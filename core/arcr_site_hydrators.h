@@ -378,6 +378,7 @@ static void arcr_hydrator_before_scripts(ArcrWebView *view,
     if (out_ssr_len)           *out_ssr_len           = 0u;
     if (out_needs_nextjs_shim) *out_needs_nextjs_shim = false;
     if (!view || !view->doc || !view->engine) return;
+    if (view->engine->cfg.conformance_mode) return;
 
     ArcrDocument *doc = view->doc;
     char host[192];
@@ -890,7 +891,8 @@ static bool arcr_hydrator_after_scripts(ArcrWebView *view,
                                         size_t       raw_len,
                                         const char  *ssr_snapshot,
                                         size_t       ssr_len) {
-    if (!view || !view->doc || !view->doc->body) return false;
+    if (!view || !view->doc || !view->doc->body || !view->engine) return false;
+    if (view->engine->cfg.conformance_mode) return false;
     ArcrDocument *doc = view->doc;
 
     /* 1. Next.js / React 19 (`www.zuzunza.com`, `__next_f`) SSR Wipeout Recovery */

@@ -197,6 +197,54 @@ static const GUID kWsIID_IShellLinkW = {
 static const GUID kWsIID_IPersistFile = {
     0x0000010Bu, 0x0000u, 0x0000u, {0xC0u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x46u}
 };
+static const GUID kWsIID_IPropertyStore = {
+    0x886D8EEBu, 0x8CF2u, 0x4446u, {0x8Du, 0x02u, 0xCDu, 0xBAu, 0x1Du, 0xBDu, 0xCFu, 0x99u}
+};
+
+#define WS_SHORTCUT_APP_USER_MODEL_ID L"Waterscape.Browser.2"
+#define WS_VT_LPWSTR                  ((USHORT)31u)
+
+typedef struct WsPropertyKey {
+    GUID  fmtid;
+    DWORD pid;
+} WsPropertyKey;
+
+/* System.AppUserModel.ID = {9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}, 5 */
+static const WsPropertyKey kWsPKEY_AppUserModel_ID = {
+    {0x9F4C2855u, 0x9F79u, 0x4B39u, {0xA8u, 0xD0u, 0xE1u, 0xD4u, 0x2Du, 0xE1u, 0xD5u, 0xF3u}},
+    5u
+};
+
+typedef struct WsPropVariant {
+    USHORT vt;
+    WORD   wReserved1;
+    WORD   wReserved2;
+    WORD   wReserved3;
+    union {
+        LPCWSTR pwszVal;
+        struct {
+            ULONG cElems;
+            void *pElems;
+        } ca;
+        ULONGLONG uhVal;
+    } u;
+} WsPropVariant;
+
+typedef struct WsPropertyStore WsPropertyStore;
+typedef struct WsPropertyStoreVtbl {
+    HRESULT (STDMETHODCALLTYPE *QueryInterface)(WsPropertyStore *This, REFIID riid, void **ppvObject);
+    ULONG   (STDMETHODCALLTYPE *AddRef)(WsPropertyStore *This);
+    ULONG   (STDMETHODCALLTYPE *Release)(WsPropertyStore *This);
+    HRESULT (STDMETHODCALLTYPE *GetCount)(WsPropertyStore *This, DWORD *cProps);
+    HRESULT (STDMETHODCALLTYPE *GetAt)(WsPropertyStore *This, DWORD iProp, WsPropertyKey *pkey);
+    HRESULT (STDMETHODCALLTYPE *GetValue)(WsPropertyStore *This, const WsPropertyKey *key, WsPropVariant *pv);
+    HRESULT (STDMETHODCALLTYPE *SetValue)(WsPropertyStore *This, const WsPropertyKey *key, const WsPropVariant *propvar);
+    HRESULT (STDMETHODCALLTYPE *Commit)(WsPropertyStore *This);
+} WsPropertyStoreVtbl;
+
+struct WsPropertyStore {
+    const WsPropertyStoreVtbl *lpVtbl;
+};
 
 /* Control IDs for the 4-Page Win32 Setup Wizard */
 #define IDC_BTN_BACK       1001
@@ -737,9 +785,26 @@ static bool ws_create_shell_shortcut(const WCHAR *lnk_path,
 
     IShellLinkW *psl = (IShellLinkW *)psl_void;
     psl->lpVtbl->SetPath(psl, target_exe);
+    psl->lpVtbl->SetArguments(psl, L"");
     psl->lpVtbl->SetWorkingDirectory(psl, work_dir);
     psl->lpVtbl->SetDescription(psl, description);
     psl->lpVtbl->SetIconLocation(psl, target_exe, 0);
+
+    /* Stamp explicit AppUserModelID ("Waterscape.Browser.2") on Vista/7/10/11+ so taskbar
+     * pinning and grouping match SetCurrentProcessExplicitAppUserModelID in waterscape.exe;
+     * degrades gracefully on Windows 2000/XP where IPropertyStore is unavailable. */
+    void *pps_void = NULL;
+    if (SUCCEEDED(psl->lpVtbl->QueryInterface(psl, &kWsIID_IPropertyStore, &pps_void)) && pps_void) {
+        WsPropertyStore *pps = (WsPropertyStore *)pps_void;
+        WsPropVariant pv;
+        memset(&pv, 0, sizeof(pv));
+        pv.vt        = WS_VT_LPWSTR;
+        pv.u.pwszVal = WS_SHORTCUT_APP_USER_MODEL_ID;
+        if (SUCCEEDED(pps->lpVtbl->SetValue(pps, &kWsPKEY_AppUserModel_ID, &pv))) {
+            (void)pps->lpVtbl->Commit(pps);
+        }
+        pps->lpVtbl->Release(pps);
+    }
 
     bool ok = false;
     void *ppf_void = NULL;
@@ -933,12 +998,14 @@ static bool ws_perform_installation(const uint8_t *zip_bytes,
     }
     free(names);
 
-    ws_wcopy(out_browser_exe, out_exe_cap, install_dir);
-    if (found_waterscape_exe || !found_arcradient_exe) {
-        ws_wcat(out_browser_exe, out_exe_cap, L"\\waterscape.exe");
-    } else {
-        ws_wcat(out_browser_exe, out_exe_cap, L"\\arcradient.exe");
+    if (!found_waterscape_exe && found_arcradient_exe) {
+        snprintf(err_buf, err_cap, "Installer archive is missing GUI executable 'waterscape.exe'.");
+        return false;
     }
+
+    /* Strictly target WIN32 GUI subsystem waterscape.exe — never console arcradient.exe */
+    ws_wcopy(out_browser_exe, out_exe_cap, install_dir);
+    ws_wcat(out_browser_exe, out_exe_cap, L"\\waterscape.exe");
 
     if (opt->write_registry) {
         if (progress_cb) {

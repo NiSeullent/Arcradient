@@ -1638,6 +1638,10 @@ void arcr_accel_fill_linear_gradient(ArcrAccelContext *ctx, uint32_t *dst_argb,
 
     if (a0 == 0u && a1 == 0u) return;
 
+    bool     both_opaque = (a0 == 255u && a1 == 255u);
+    uint32_t pr0 = r0 * a0, pg0 = g0 * a0, pb0 = b0 * a0;
+    uint32_t pr1 = r1 * a1, pg1 = g1 * a1, pb1 = b1 * a1;
+
     int32_t x0, y0, x1, y1;
     if (!clip_rect(fb_w, fb_h, rect, &x0, &y0, &x1, &y1)) return;
 
@@ -1676,10 +1680,23 @@ void arcr_accel_fill_linear_gradient(ArcrAccelContext *ctx, uint32_t *dst_argb,
             int64_t p_clamped = ARCR_CLAMP(base_prj, 0LL, denom);
             uint32_t t = (uint32_t)((p_clamped * 1024LL + (denom >> 1)) / denom);
             uint32_t inv_t = 1024u - t;
-            uint32_t ca = (a0 * inv_t + a1 * t + 512u) >> 10;
-            uint32_t cr = (r0 * inv_t + r1 * t + 512u) >> 10;
-            uint32_t cg = (g0 * inv_t + g1 * t + 512u) >> 10;
-            uint32_t cb = (b0 * inv_t + b1 * t + 512u) >> 10;
+            uint32_t ca, cr, cg, cb;
+            if (both_opaque) {
+                ca = 255u;
+                cr = (r0 * inv_t + r1 * t + 512u) >> 10;
+                cg = (g0 * inv_t + g1 * t + 512u) >> 10;
+                cb = (b0 * inv_t + b1 * t + 512u) >> 10;
+            } else {
+                uint32_t pa_q10 = a0 * inv_t + a1 * t;
+                ca = (pa_q10 + 512u) >> 10;
+                if (pa_q10 > 0u) {
+                    cr = ARCR_MIN(255u, (pr0 * inv_t + pr1 * t + (pa_q10 >> 1)) / pa_q10);
+                    cg = ARCR_MIN(255u, (pg0 * inv_t + pg1 * t + (pa_q10 >> 1)) / pa_q10);
+                    cb = ARCR_MIN(255u, (pb0 * inv_t + pb1 * t + (pa_q10 >> 1)) / pa_q10);
+                } else {
+                    cr = cg = cb = 0u;
+                }
+            }
             uint32_t row_argb = (ca << 24) | (cr << 16) | (cg << 8) | cb;
 
             if (in_y_core) {
@@ -1728,13 +1745,23 @@ void arcr_accel_fill_linear_gradient(ArcrAccelContext *ctx, uint32_t *dst_argb,
             uint32_t t = (uint32_t)ARCR_CLAMP(t_raw + dither, 0, 1024);
             uint32_t inv_t = 1024u - t;
 
-            uint32_t ca = (a0 * inv_t + a1 * t + 512u) >> 10;
+            uint32_t pa_q10 = a0 * inv_t + a1 * t;
+            uint32_t ca = both_opaque ? 255u : ((pa_q10 + 512u) >> 10);
             uint32_t sa = (cov == 255u) ? ca : div255_exact(ca * cov);
             if (sa == 0u) continue;
 
-            uint32_t cr = (r0 * inv_t + r1 * t + 512u) >> 10;
-            uint32_t cg = (g0 * inv_t + g1 * t + 512u) >> 10;
-            uint32_t cb = (b0 * inv_t + b1 * t + 512u) >> 10;
+            uint32_t cr, cg, cb;
+            if (both_opaque) {
+                cr = (r0 * inv_t + r1 * t + 512u) >> 10;
+                cg = (g0 * inv_t + g1 * t + 512u) >> 10;
+                cb = (b0 * inv_t + b1 * t + 512u) >> 10;
+            } else if (pa_q10 > 0u) {
+                cr = ARCR_MIN(255u, (pr0 * inv_t + pr1 * t + (pa_q10 >> 1)) / pa_q10);
+                cg = ARCR_MIN(255u, (pg0 * inv_t + pg1 * t + (pa_q10 >> 1)) / pa_q10);
+                cb = ARCR_MIN(255u, (pb0 * inv_t + pb1 * t + (pa_q10 >> 1)) / pa_q10);
+            } else {
+                continue;
+            }
 
             if (sa >= 255u) {
                 row[px] = 0xFF000000u | (cr << 16) | (cg << 8) | cb;

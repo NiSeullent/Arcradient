@@ -28,8 +28,12 @@ typedef struct ArcrDisplayCmd {
     ArcrRect                   bounds;
     ArcrRect                   clip_rect;
     bool                       has_clip;
-    bool                       is_fixed; /* Viewport-fixed: does NOT shift by scroll_y! */
-    uint8_t                    opacity;  /* 0..255 */
+    bool                       is_fixed;  /* Viewport-fixed: does NOT shift by scroll_y! */
+    bool                       is_sticky; /* Sticky-clamped across scroll_y */
+    int32_t                    sticky_anchor_y;
+    int32_t                    sticky_top_px;
+    int32_t                    sticky_max_dy;
+    uint8_t                    opacity;   /* 0..255 */
     uint32_t                   color_argb;
     uint32_t                   color2_argb; /* End color for linear gradient */
     int32_t                    angle_deg;

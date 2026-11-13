@@ -57,8 +57,11 @@ mkdir -p \
     "${PAYLOAD_DIR}/share/icons/hicolor/48x48/apps" \
     "${PAYLOAD_DIR}/share/icons/hicolor/scalable/apps"
 
-# 1. Stage main binary, dynamic Pure C11 modules, and .wsx extensions
+# 1. Stage main binary, standalone ArcradientJS CLI, dynamic Pure C11 modules, and .wsx extensions
 install -m 0755 "${MAIN_BIN}" "${PAYLOAD_DIR}/lib/waterscape/waterscape"
+if [[ -f "${BUILD_DIR}/arcr_js" ]]; then
+    install -m 0755 "${BUILD_DIR}/arcr_js" "${PAYLOAD_DIR}/lib/waterscape/arcr_js"
+fi
 
 shopt -s nullglob
 for so_file in "${BUILD_DIR}"/libarcr_*.so* "${BUILD_DIR}"/libws_plugin_*.so*; do
@@ -260,7 +263,7 @@ PREFIX_ABS="$(cd "${PREFIX}" && pwd)"
 
 tail -n +"${ARCHIVE_LINE}" "$0" | tar -C "${PREFIX_ABS}" -xzf -
 
-# Generate <prefix>/bin/waterscape wrapper script
+# Generate <prefix>/bin/waterscape and <prefix>/bin/arcr_js wrapper scripts
 cat > "${PREFIX_ABS}/bin/waterscape" <<EOW
 #!/bin/sh
 set -eu
@@ -269,6 +272,15 @@ export LD_LIBRARY_PATH="\${WS_LIB}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
 exec "\${WS_LIB}/waterscape" --module-dir "\${WS_LIB}" "\$@"
 EOW
 chmod 0755 "${PREFIX_ABS}/bin/waterscape"
+
+if [ -x "${PREFIX_ABS}/lib/waterscape/arcr_js" ]; then
+    cat > "${PREFIX_ABS}/bin/arcr_js" <<EOJ
+#!/bin/sh
+set -eu
+exec "${PREFIX_ABS}/lib/waterscape/arcr_js" "\$@"
+EOJ
+    chmod 0755 "${PREFIX_ABS}/bin/arcr_js"
+fi
 
 XDG_DESKTOP_INSTALLED=""
 XDG_ICON256_INSTALLED=""
@@ -318,7 +330,7 @@ fi
 if [ -n "${XDG_ICONSVG_INSTALLED}" ] && [ -f "${XDG_ICONSVG_INSTALLED}" ]; then
     rm -f "${XDG_ICONSVG_INSTALLED}"
 fi
-rm -rf "${PREFIX_ABS}/bin/waterscape" "${PREFIX_ABS}/lib/waterscape" "${PREFIX_ABS}/share"
+rm -rf "${PREFIX_ABS}/bin/waterscape" "${PREFIX_ABS}/bin/arcr_js" "${PREFIX_ABS}/lib/waterscape" "${PREFIX_ABS}/share"
 rm -f "${PREFIX_ABS}/uninstall.sh"
 rmdir "${PREFIX_ABS}/bin" "${PREFIX_ABS}/lib" "${PREFIX_ABS}" 2>/dev/null || true
 echo "Waterscape uninstalled cleanly."

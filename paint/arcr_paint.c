@@ -64,18 +64,26 @@ typedef struct PaintClipState {
     ArcrRect clip_rect;
     bool     has_clip;
     bool     is_fixed;
+    bool     is_sticky;
+    int32_t  sticky_anchor_y;
+    int32_t  sticky_top_px;
+    int32_t  sticky_max_dy;
     uint8_t  opacity;
 } PaintClipState;
 
 static ArcrDisplayCmd make_cmd(ArcrDisplayCmdKind kind, ArcrRect bounds, PaintClipState cs) {
     ArcrDisplayCmd c;
     memset(&c, 0, sizeof(c));
-    c.kind      = kind;
-    c.bounds    = bounds;
-    c.clip_rect = cs.clip_rect;
-    c.has_clip  = cs.has_clip;
-    c.is_fixed  = cs.is_fixed;
-    c.opacity   = cs.opacity;
+    c.kind            = kind;
+    c.bounds          = bounds;
+    c.clip_rect       = cs.clip_rect;
+    c.has_clip        = cs.has_clip;
+    c.is_fixed        = cs.is_fixed;
+    c.is_sticky       = cs.is_sticky;
+    c.sticky_anchor_y = cs.sticky_anchor_y;
+    c.sticky_top_px   = cs.sticky_top_px;
+    c.sticky_max_dy   = cs.sticky_max_dy;
+    c.opacity         = cs.opacity;
     return c;
 }
 
@@ -252,37 +260,54 @@ static void record_box_self(ArcrDisplayList *dl, const ArcrLayoutBox *box,
                             bool parent_has_clip, ArcrRect parent_clip) {
     if (!box || !box->style) return;
     const ArcrComputedStyle *st = box->style;
-    if (st->visibility_hidden || box->effective_opacity == 0u) return;
+    if (st->visibility_hidden || st->sr_only_clip || box->effective_opacity == 0u) return;
 
     ArcrRect br = box->border_rect;
     bool enters_fixed = (st->position == ARCR_POS_FIXED);
 
     PaintClipState outer_cs = {
-        .clip_rect = parent_clip,
-        .has_clip  = enters_fixed ? false : parent_has_clip,
-        .is_fixed  = box->is_fixed,
-        .opacity   = box->effective_opacity
+        .clip_rect       = parent_clip,
+        .has_clip        = enters_fixed ? false : parent_has_clip,
+        .is_fixed        = box->is_fixed,
+        .is_sticky       = box->is_sticky,
+        .sticky_anchor_y = box->sticky_anchor_y,
+        .sticky_top_px   = box->sticky_top_px,
+        .sticky_max_dy   = box->sticky_max_dy,
+        .opacity         = box->effective_opacity
     };
     PaintClipState inner_cs = {
-        .clip_rect = box->clip_rect,
-        .has_clip  = box->has_clip,
-        .is_fixed  = box->is_fixed,
-        .opacity   = box->effective_opacity
+        .clip_rect       = box->clip_rect,
+        .has_clip        = box->has_clip,
+        .is_fixed        = box->is_fixed,
+        .is_sticky       = box->is_sticky,
+        .sticky_anchor_y = box->sticky_anchor_y,
+        .sticky_top_px   = box->sticky_top_px,
+        .sticky_max_dy   = box->sticky_max_dy,
+        .opacity         = box->effective_opacity
     };
 
     if (box->is_hr) {
         int32_t line_y = br.y + br.height / 2;
+        uint32_t hr_c  = (((st->border_top_argb >> 24) & 0xFFu) > 0u)
+                             ? st->border_top_argb
+                             : ((((st->border_argb >> 24) & 0xFFu) > 0u) ? st->border_argb
+                                                                         : 0xFFCBD5E1u);
         ArcrDisplayCmd c = make_cmd(
             ARCR_DCMD_SOLID_RECT,
             (ArcrRect){br.x, line_y, br.width, ARCR_MAX(1, st->border.top ? st->border.top : 1)},
             outer_cs);
-        c.color_argb = (((st->border_argb >> 24) & 0xFFu) > 0u) ? st->border_argb : 0xFFCBD5E1u;
+        c.color_argb = hr_c;
         dl_push(dl, c);
         return;
     }
 
     bool is_focused = (box->dom_node && (box->dom_node->state_flags & ARCR_STATE_FOCUS) != 0u);
     bool is_checked = (box->dom_node && (box->dom_node->state_flags & ARCR_STATE_CHECKED) != 0u);
+    bool has_surface = (box->dom_node && box->dom_node->surface &&
+                        box->dom_node->surface->argb_pixels &&
+                        box->dom_node->surface->width > 0 &&
+                        box->dom_node->surface->height > 0);
+    bool has_tinted_mask = (st->mask_image_url != NULL && has_surface);
 
     /* 1. Elevation Box Shadow (clipped only by ancestor clip, never self overflow clip) */
     if (st->shadow_blur > 0 && ((st->shadow_argb >> 24) & 0xFFu) > 0u &&
@@ -313,7 +338,7 @@ static void record_box_self(ArcrDisplayList *dl, const ArcrLayoutBox *box,
     if (box->control_kind == ARCR_CTRL_CHECKBOX && is_checked) {
         bg_c = 0xFF2563EBu;
     }
-    if (st->has_gradient && br.width > 0 && br.height > 0 &&
+    if (!has_tinted_mask && st->has_gradient && br.width > 0 && br.height > 0 &&
         !(box->control_kind == ARCR_CTRL_CHECKBOX && is_checked)) {
         ArcrDisplayCmd c = make_cmd(ARCR_DCMD_LINEAR_GRADIENT, br, outer_cs);
         c.radius_px   = st->border_radius;
@@ -321,7 +346,7 @@ static void record_box_self(ArcrDisplayList *dl, const ArcrLayoutBox *box,
         c.color2_argb = st->grad_end_argb;
         c.angle_deg   = st->grad_angle_deg;
         dl_push(dl, c);
-    } else if (((bg_c >> 24) & 0xFFu) > 0u && br.width > 0 && br.height > 0) {
+    } else if (!has_tinted_mask && ((bg_c >> 24) & 0xFFu) > 0u && br.width > 0 && br.height > 0) {
         if (st->border_radius > 0) {
             ArcrDisplayCmd c = make_cmd(ARCR_DCMD_ROUNDED_RECT, br, outer_cs);
             c.radius_px  = st->border_radius;
@@ -334,58 +359,67 @@ static void record_box_self(ArcrDisplayList *dl, const ArcrLayoutBox *box,
         }
     }
 
-    /* 4. Borders (Rounded 4-side stroke ONLY when all 4 edges > 0; else per-side rects) */
-    uint32_t border_c = st->border_argb;
+    /* 4. Borders (Rounded 4-side stroke ONLY when all 4 edges > 0 & uniform color; else per-side) */
+    bool legacy_only_border_argb = (st->border_top_argb == 0u && st->border_right_argb == 0u &&
+                                    st->border_bottom_argb == 0u && st->border_left_argb == 0u &&
+                                    st->border_argb != 0u);
+    uint32_t c_top    = legacy_only_border_argb ? st->border_argb : st->border_top_argb;
+    uint32_t c_right  = legacy_only_border_argb ? st->border_argb : st->border_right_argb;
+    uint32_t c_bottom = legacy_only_border_argb ? st->border_argb : st->border_bottom_argb;
+    uint32_t c_left   = legacy_only_border_argb ? st->border_argb : st->border_left_argb;
+
     if (box->control_kind == ARCR_CTRL_CHECKBOX && is_checked) {
-        border_c = 0xFF1D4ED8u;
+        c_top = c_right = c_bottom = c_left = 0xFF1D4ED8u;
     } else if (is_focused && box->control_kind == ARCR_CTRL_TEXT_INPUT) {
-        border_c = 0xFF2563EBu;
+        c_top = c_right = c_bottom = c_left = 0xFF2563EBu;
     }
 
-    if (((border_c >> 24) & 0xFFu) > 0u && br.width > 0 && br.height > 0) {
-        bool all_four = (st->border.top > 0 && st->border.right > 0 &&
-                         st->border.bottom > 0 && st->border.left > 0);
-        if (st->border_radius > 0 && all_four) {
+    if (br.width > 0 && br.height > 0) {
+        bool all_four     = (st->border.top > 0 && st->border.right > 0 &&
+                             st->border.bottom > 0 && st->border.left > 0);
+        bool uniform_col  = (c_top == c_right && c_top == c_bottom && c_top == c_left &&
+                             ((c_top >> 24) & 0xFFu) > 0u);
+        if (st->border_radius > 0 && all_four && uniform_col) {
             int32_t max_bw = ARCR_MAX(ARCR_MAX(st->border.top, st->border.bottom),
                                       ARCR_MAX(st->border.left, st->border.right));
             ArcrDisplayCmd c = make_cmd(ARCR_DCMD_ROUNDED_STROKE, br, outer_cs);
             c.radius_px         = st->border_radius;
             c.border_or_blur_px = max_bw;
-            c.color_argb        = border_c;
+            c.color_argb        = c_top;
             dl_push(dl, c);
         } else {
-            if (st->border.top > 0) {
+            if (st->border.top > 0 && ((c_top >> 24) & 0xFFu) > 0u) {
                 ArcrDisplayCmd c = make_cmd(
                     ARCR_DCMD_SOLID_RECT,
                     (ArcrRect){br.x, br.y, br.width, st->border.top},
                     outer_cs);
-                c.color_argb = border_c;
+                c.color_argb = c_top;
                 dl_push(dl, c);
             }
-            if (st->border.bottom > 0) {
+            if (st->border.bottom > 0 && ((c_bottom >> 24) & 0xFFu) > 0u) {
                 ArcrDisplayCmd c = make_cmd(
                     ARCR_DCMD_SOLID_RECT,
                     (ArcrRect){br.x, br.y + br.height - st->border.bottom,
                                br.width, st->border.bottom},
                     outer_cs);
-                c.color_argb = border_c;
+                c.color_argb = c_bottom;
                 dl_push(dl, c);
             }
-            if (st->border.left > 0) {
+            if (st->border.left > 0 && ((c_left >> 24) & 0xFFu) > 0u) {
                 ArcrDisplayCmd c = make_cmd(
                     ARCR_DCMD_SOLID_RECT,
                     (ArcrRect){br.x, br.y, st->border.left, br.height},
                     outer_cs);
-                c.color_argb = border_c;
+                c.color_argb = c_left;
                 dl_push(dl, c);
             }
-            if (st->border.right > 0) {
+            if (st->border.right > 0 && ((c_right >> 24) & 0xFFu) > 0u) {
                 ArcrDisplayCmd c = make_cmd(
                     ARCR_DCMD_SOLID_RECT,
                     (ArcrRect){br.x + br.width - st->border.right, br.y,
                                st->border.right, br.height},
                     outer_cs);
-                c.color_argb = border_c;
+                c.color_argb = c_right;
                 dl_push(dl, c);
             }
         }
@@ -397,10 +431,6 @@ static void record_box_self(ArcrDisplayList *dl, const ArcrLayoutBox *box,
     }
 
     /* 6. Decoded <img> / <svg> / <canvas> / <video> Surface Blit */
-    bool has_surface = (box->dom_node && box->dom_node->surface &&
-                        box->dom_node->surface->argb_pixels &&
-                        box->dom_node->surface->width > 0 &&
-                        box->dom_node->surface->height > 0);
     ArcrRect media_dst = (box->content_rect.width > 0 && box->content_rect.height > 0)
                              ? box->content_rect
                              : br;
@@ -432,7 +462,7 @@ static void record_box_self(ArcrDisplayList *dl, const ArcrLayoutBox *box,
     }
 
     /* 7. Unordered List Bullet Marker (<ul>) */
-    if (box->is_list_item && box->list_ordinal == 0) {
+    if (box->is_list_item && box->list_ordinal == 0 && !st->list_style_none) {
         int32_t dot_sz = ARCR_CLAMP(st->font_px / 3, 5, 8);
         int32_t dot_x  = box->content_rect.x - dot_sz * 2 - 4;
         int32_t dot_y  = box->content_rect.y + (st->font_px * 52) / 100;
@@ -521,6 +551,7 @@ static int cmp_stacked_children(const void *pa, const void *pb) {
 static void record_box_stacked(ArcrDisplayList *dl, const ArcrLayoutBox *box,
                                bool parent_has_clip, ArcrRect parent_clip) {
     if (!box) return;
+    if (box->style && box->style->sr_only_clip) return;
 
     size_t pos_cnt = 0u;
     for (const ArcrLayoutBox *ch = box->first_child; ch != NULL; ch = ch->next_sibling) {
@@ -589,6 +620,7 @@ static void scan_find_matches_rec(ArcrDisplayList *dl, const ArcrLayoutBox *box,
                                   uint32_t *inout_match_count,
                                   int32_t *out_active_doc_y) {
     if (!box) return;
+    if (box->style && box->style->sr_only_clip) return;
 
     if (box->dom_node != NULL && box->style && !box->style->visibility_hidden &&
         box->effective_opacity > 0u && box->glyph_count >= q_len && box->glyphs) {
@@ -606,7 +638,10 @@ static void scan_find_matches_rec(ArcrDisplayList *dl, const ArcrLayoutBox *box,
                 if (emit_rects) {
                     bool     is_active = (cur_idx == active_idx);
                     uint32_t hl_color  = is_active ? 0x99F97316u : 0x66FACC15u;
-                    PaintClipState cs  = {box->clip_rect, box->has_clip, box->is_fixed, 255u};
+                    PaintClipState cs  = {
+                        box->clip_rect, box->has_clip, box->is_fixed, box->is_sticky,
+                        box->sticky_anchor_y, box->sticky_top_px, box->sticky_max_dy, 255u
+                    };
 
                     uint32_t s = 0u;
                     while (s < q_len) {
@@ -720,7 +755,7 @@ static void build_spatial_bins(ArcrDisplayList *dl, int32_t total_layout_h) {
     for (uint32_t i = 0u; i < dl->count; ++i) {
         ArcrRect cr;
         if (!compute_cmd_cull_rect(&dl->cmds[i], &cr)) continue;
-        if (dl->cmds[i].is_fixed) {
+        if (dl->cmds[i].is_fixed || dl->cmds[i].is_sticky) {
             ++fixed_cnt;
         } else {
             int32_t y1 = cr.y + cr.height;
@@ -742,7 +777,7 @@ static void build_spatial_bins(ArcrDisplayList *dl, int32_t total_layout_h) {
 
     /* Pass 1: Count commands per 64px document Y-band */
     for (uint32_t i = 0u; i < dl->count; ++i) {
-        if (dl->cmds[i].is_fixed) continue;
+        if (dl->cmds[i].is_fixed || dl->cmds[i].is_sticky) continue;
         ArcrRect cr;
         if (!compute_cmd_cull_rect(&dl->cmds[i], &cr)) continue;
         int32_t y1 = cr.y + cr.height - 1;
@@ -758,7 +793,7 @@ static void build_spatial_bins(ArcrDisplayList *dl, int32_t total_layout_h) {
         }
     }
 
-    /* Allocate arena slices for non-empty bands + fixed layer */
+    /* Allocate arena slices for non-empty bands + fixed/sticky layer */
     uint32_t **band_mut = (uint32_t **)calloc(band_count, sizeof(uint32_t *));
     if (!band_mut) {
         free(band_caps);
@@ -784,7 +819,7 @@ static void build_spatial_bins(ArcrDisplayList *dl, int32_t total_layout_h) {
         ArcrRect cr;
         if (!compute_cmd_cull_rect(&dl->cmds[i], &cr)) continue;
 
-        if (dl->cmds[i].is_fixed) {
+        if (dl->cmds[i].is_fixed || dl->cmds[i].is_sticky) {
             if (dl->fixed_cmd_indices && dl->fixed_cmd_count < fixed_cnt) {
                 dl->fixed_cmd_indices[dl->fixed_cmd_count++] = i;
             }
@@ -924,11 +959,23 @@ static void blit_image_with_opacity(uint32_t *win_dst, int32_t win_w, int32_t wi
     }
 }
 
+static int32_t compute_cmd_y_scroll(const ArcrDisplayCmd *cmd, int32_t scroll_y) {
+    if (cmd->is_fixed) return 0;
+    if (cmd->is_sticky) {
+        int64_t raw_dy = (int64_t)scroll_y + (int64_t)cmd->sticky_top_px -
+                         (int64_t)cmd->sticky_anchor_y;
+        int32_t max_dy    = ARCR_MAX(0, cmd->sticky_max_dy);
+        int32_t sticky_dy = (raw_dy <= 0) ? 0 : ((raw_dy >= max_dy) ? max_dy : (int32_t)raw_dy);
+        return scroll_y - sticky_dy;
+    }
+    return scroll_y;
+}
+
 static void execute_cmd_on_tile(const TileRasterJob *job, const ArcrDisplayCmd *cmd,
                                 ArcrRect tile_screen_r) {
     if (cmd->opacity == 0u) return;
 
-    int32_t y_scroll = cmd->is_fixed ? 0 : job->scroll_y;
+    int32_t y_scroll = compute_cmd_y_scroll(cmd, job->scroll_y);
     ArcrRect screen_r = {
         .x      = job->viewport_rect.x + cmd->bounds.x,
         .y      = job->viewport_rect.y + cmd->bounds.y - y_scroll,
@@ -1134,7 +1181,7 @@ static void prewarm_cmd_glyphs_for_viewport(const ArcrDisplayCmd *cmd,
                                             ArcrRect eff_vp,
                                             int32_t scroll_y) {
     if (cmd->kind != ARCR_DCMD_GLYPH_BATCH || !cmd->glyphs || cmd->opacity == 0u) return;
-    int32_t y_scroll = cmd->is_fixed ? 0 : scroll_y;
+    int32_t y_scroll = compute_cmd_y_scroll(cmd, scroll_y);
     ArcrRect screen_r = {
         .x      = viewport_rect.x + cmd->bounds.x,
         .y      = viewport_rect.y + cmd->bounds.y - y_scroll,

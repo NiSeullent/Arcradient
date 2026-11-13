@@ -179,14 +179,20 @@ typedef struct ArcrCookieEntry {
 
 typedef struct ArcrCacheEntry {
     bool              valid;
+    bool              must_revalidate;
     uint64_t          last_used_tick;
     char              url[ARCR_NET_MAX_URL_LEN];
     char              content_type[256];
+    char              etag[128];
+    char              last_modified[128];
     int               status_code;
     ArcrSecurityState security;
     char              detail[256];
     uint8_t          *body;
     size_t            body_len;
+    size_t            encoded_bytes;
+    char             *raw_headers;
+    size_t            raw_headers_len;
 } ArcrCacheEntry;
 
 static ArcrCookieEntry g_cookies[ARCR_NET_MAX_COOKIES];
@@ -199,10 +205,8 @@ static void net_clear_cookies_and_cache(void) {
     net_mutex_lock(&g_state_mtx);
     memset(g_cookies, 0, sizeof(g_cookies));
     for (size_t i = 0u; i < ARCR_NET_CACHE_SLOTS; ++i) {
-        if (g_cache[i].body) {
-            free(g_cache[i].body);
-            g_cache[i].body = NULL;
-        }
+        free(g_cache[i].body);
+        free(g_cache[i].raw_headers);
         memset(&g_cache[i], 0, sizeof(g_cache[i]));
     }
     g_cache_bytes_used = 0u;
@@ -414,33 +418,81 @@ static size_t cookie_jar_build_header(const char *req_host, const char *req_path
     return pos;
 }
 
-static bool cache_lookup(const char *url, ArcrHttpResponse *out_resp) {
+static bool populate_resp_from_cache_entry_unlocked(ArcrCacheEntry *e, ArcrHttpResponse *out_resp,
+                                                    bool revalidated_304) {
+    uint8_t *copy = (uint8_t *)malloc(e->body_len + 1u);
+    if (!copy) return false;
+    char *hdr_copy = NULL;
+    if (e->raw_headers && e->raw_headers_len > 0u) {
+        hdr_copy = (char *)malloc(e->raw_headers_len + 1u);
+        if (!hdr_copy) {
+            free(copy);
+            return false;
+        }
+        memcpy(hdr_copy, e->raw_headers, e->raw_headers_len);
+        hdr_copy[e->raw_headers_len] = '\0';
+    }
+    if (e->body_len > 0u) {
+        memcpy(copy, e->body, e->body_len);
+    }
+    copy[e->body_len] = '\0';
+
+    e->last_used_tick         = ++g_cache_clock;
+    out_resp->status_code     = e->status_code;
+    arcr_str_copy(out_resp->final_url, sizeof(out_resp->final_url), e->url);
+    arcr_str_copy(out_resp->content_type, sizeof(out_resp->content_type), e->content_type);
+    out_resp->body            = copy;
+    out_resp->body_len        = e->body_len;
+    out_resp->encoded_bytes   = revalidated_304 ? 0u : e->encoded_bytes;
+    out_resp->decoded_bytes   = e->body_len;
+    out_resp->raw_headers     = hdr_copy;
+    out_resp->raw_headers_len = hdr_copy ? e->raw_headers_len : 0u;
+    out_resp->security        = e->security;
+    arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
+                  revalidated_304 ? "304 Not Modified (캐시 재검증 완료)" : e->detail);
+    out_resp->from_cache      = true;
+    return true;
+}
+
+static bool cache_lookup_or_validators(const char *url, ArcrHttpResponse *out_resp,
+                                       char *out_etag, size_t etag_cap,
+                                       char *out_lastmod, size_t lm_cap,
+                                       bool *out_has_validator) {
+    if (out_etag && etag_cap > 0u) out_etag[0] = '\0';
+    if (out_lastmod && lm_cap > 0u) out_lastmod[0] = '\0';
+    if (out_has_validator) *out_has_validator = false;
+
     net_mutex_lock(&g_state_mtx);
     for (size_t i = 0u; i < ARCR_NET_CACHE_SLOTS; ++i) {
         ArcrCacheEntry *e = &g_cache[i];
         if (!e->valid || strcmp(e->url, url) != 0) continue;
 
-        uint8_t *copy = (uint8_t *)malloc(e->body_len + 1u);
-        if (!copy) {
+        if (e->must_revalidate) {
+            if (out_etag && etag_cap > 0u) arcr_str_copy(out_etag, etag_cap, e->etag);
+            if (out_lastmod && lm_cap > 0u) arcr_str_copy(out_lastmod, lm_cap, e->last_modified);
+            if (out_has_validator) {
+                *out_has_validator = (e->etag[0] != '\0' || e->last_modified[0] != '\0');
+            }
             net_mutex_unlock(&g_state_mtx);
             return false;
         }
-        if (e->body_len > 0u) {
-            memcpy(copy, e->body, e->body_len);
-        }
-        copy[e->body_len] = '\0';
 
-        e->last_used_tick     = ++g_cache_clock;
-        out_resp->status_code = e->status_code;
-        arcr_str_copy(out_resp->final_url, sizeof(out_resp->final_url), e->url);
-        arcr_str_copy(out_resp->content_type, sizeof(out_resp->content_type), e->content_type);
-        out_resp->body        = copy;
-        out_resp->body_len    = e->body_len;
-        out_resp->security    = e->security;
-        arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), e->detail);
-        out_resp->from_cache  = true;
+        bool ok = populate_resp_from_cache_entry_unlocked(e, out_resp, false);
         net_mutex_unlock(&g_state_mtx);
-        return true;
+        return ok;
+    }
+    net_mutex_unlock(&g_state_mtx);
+    return false;
+}
+
+static bool cache_fulfill_304(const char *url, ArcrHttpResponse *out_resp) {
+    net_mutex_lock(&g_state_mtx);
+    for (size_t i = 0u; i < ARCR_NET_CACHE_SLOTS; ++i) {
+        ArcrCacheEntry *e = &g_cache[i];
+        if (!e->valid || strcmp(e->url, url) != 0) continue;
+        bool ok = populate_resp_from_cache_entry_unlocked(e, out_resp, true);
+        net_mutex_unlock(&g_state_mtx);
+        return ok;
     }
     net_mutex_unlock(&g_state_mtx);
     return false;
@@ -454,17 +506,27 @@ static void cache_evict_slot_unlocked(size_t idx) {
             g_cache_bytes_used = 0u;
         }
         free(g_cache[idx].body);
+        free(g_cache[idx].raw_headers);
         memset(&g_cache[idx], 0, sizeof(g_cache[idx]));
     }
 }
 
-static void cache_insert(const char *url, const ArcrHttpResponse *resp) {
+static void cache_insert(const char *url, const ArcrHttpResponse *resp,
+                         const char *etag, const char *last_modified, bool must_revalidate) {
     if (!url || !resp || !resp->body) return;
     if (resp->body_len > ARCR_NET_MAX_CACHE_ITEM) return;
     if (strlen(url) >= sizeof(g_cache[0].url)) return;
 
     uint8_t *buf = (uint8_t *)malloc(resp->body_len + 1u);
     if (!buf) return;
+    char *hdr_copy = NULL;
+    if (resp->raw_headers && resp->raw_headers_len > 0u) {
+        hdr_copy = (char *)malloc(resp->raw_headers_len + 1u);
+        if (hdr_copy) {
+            memcpy(hdr_copy, resp->raw_headers, resp->raw_headers_len);
+            hdr_copy[resp->raw_headers_len] = '\0';
+        }
+    }
     if (resp->body_len > 0u) memcpy(buf, resp->body, resp->body_len);
     buf[resp->body_len] = '\0';
 
@@ -504,20 +566,27 @@ static void cache_insert(const char *url, const ArcrHttpResponse *resp) {
     if (target == ARCR_NET_CACHE_SLOTS) {
         net_mutex_unlock(&g_state_mtx);
         free(buf);
+        free(hdr_copy);
         return;
     }
     if (g_cache[target].valid) cache_evict_slot_unlocked(target);
 
-    ArcrCacheEntry *e = &g_cache[target];
-    e->valid          = true;
-    e->last_used_tick = ++g_cache_clock;
+    ArcrCacheEntry *e  = &g_cache[target];
+    e->valid           = true;
+    e->must_revalidate = must_revalidate;
+    e->last_used_tick  = ++g_cache_clock;
     arcr_str_copy(e->url, sizeof(e->url), url);
     arcr_str_copy(e->content_type, sizeof(e->content_type), resp->content_type);
-    e->status_code    = resp->status_code;
-    e->security       = resp->security;
+    arcr_str_copy(e->etag, sizeof(e->etag), etag ? etag : "");
+    arcr_str_copy(e->last_modified, sizeof(e->last_modified), last_modified ? last_modified : "");
+    e->status_code     = resp->status_code;
+    e->security        = resp->security;
     arcr_str_copy(e->detail, sizeof(e->detail), resp->detail);
-    e->body           = buf;
-    e->body_len       = resp->body_len;
+    e->body            = buf;
+    e->body_len        = resp->body_len;
+    e->encoded_bytes   = resp->encoded_bytes;
+    e->raw_headers     = hdr_copy;
+    e->raw_headers_len = hdr_copy ? resp->raw_headers_len : 0u;
     g_cache_bytes_used += resp->body_len;
     net_mutex_unlock(&g_state_mtx);
 }
@@ -1147,9 +1216,11 @@ static bool fill_static_html_response(const char *url, const char *html,
     out->status_code = 200;
     arcr_str_copy(out->final_url, sizeof(out->final_url), url);
     arcr_str_copy(out->content_type, sizeof(out->content_type), "text/html; charset=utf-8");
-    out->body       = buf;
-    out->body_len   = len;
-    out->security   = ARCR_SEC_LOCAL_OR_NONE;
+    out->body          = buf;
+    out->body_len      = len;
+    out->encoded_bytes = len;
+    out->decoded_bytes = len;
+    out->security      = ARCR_SEC_LOCAL_OR_NONE;
     arcr_str_copy(out->detail, sizeof(out->detail), detail_str);
     out->from_cache = false;
     return true;
@@ -1256,9 +1327,11 @@ static bool handle_data_uri_view(const char *full_url, size_t full_url_len,
     memcpy(out->final_url, full_url, flen);
     out->final_url[flen] = '\0';
     arcr_str_copy(out->content_type, sizeof(out->content_type), mime);
-    out->body       = decoded;
-    out->body_len   = decoded_len;
-    out->security   = ARCR_SEC_LOCAL_OR_NONE;
+    out->body          = decoded;
+    out->body_len      = decoded_len;
+    out->encoded_bytes = data_len;
+    out->decoded_bytes = decoded_len;
+    out->security      = ARCR_SEC_LOCAL_OR_NONE;
     arcr_str_copy(out->detail, sizeof(out->detail), "인라인 데이터 URI (data:)");
     out->from_cache = false;
     return true;
@@ -1465,15 +1538,17 @@ static bool resolve_proxy_for_target(const char *target_host, uint16_t target_po
  * 6. Heap-Allocated TCP + TLS 1.3 Stream & 8-Slot Keep-Alive Connection Pool
  * ========================================================================= */
 typedef struct ArcrNetStream {
-    bool              is_tls;
-    bool              via_http_proxy; /* Plain HTTP via HTTP_PROXY uses absolute-form URI */
-    char              proxy_auth_hdr[512];
-    ArcrSecurityState security;
-    char              detail[256];
+    bool                is_tls;
+    bool                via_http_proxy; /* Plain HTTP via HTTP_PROXY uses absolute-form URI */
+    bool                was_cancelled;
+    const volatile int *cancel_flag;
+    char                proxy_auth_hdr[512];
+    ArcrSecurityState   security;
+    char                detail[256];
     /* Unread pushback buffer for incremental HTTP/1.1 framing across 1xx & Keep-Alive */
-    uint8_t           pre_buf[ARCR_NET_PRE_BUF_CAP];
-    size_t            pre_pos;
-    size_t            pre_len;
+    uint8_t             pre_buf[ARCR_NET_PRE_BUF_CAP];
+    size_t              pre_pos;
+    size_t              pre_len;
 #if defined(_WIN32)
     SOCKET            sock;
     HMODULE           secur32_mod;
@@ -1605,7 +1680,12 @@ static bool load_sspi_functions(HMODULE mod, ArcrSspiTable *out) {
     return true;
 }
 
-static SOCKET win32_connect_with_timeout(const struct sockaddr *sa, int sa_len) {
+static SOCKET win32_connect_with_timeout(const struct sockaddr *sa, int sa_len,
+                                         const volatile int *cancel_flag, bool *out_cancelled) {
+    if (cancel_flag && *cancel_flag != 0) {
+        if (out_cancelled) *out_cancelled = true;
+        return INVALID_SOCKET;
+    }
     SOCKET s = socket(sa->sa_family, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return INVALID_SOCKET;
 
@@ -1619,16 +1699,34 @@ static SOCKET win32_connect_with_timeout(const struct sockaddr *sa, int sa_len) 
             closesocket(s);
             return INVALID_SOCKET;
         }
-        fd_set wfds, efds;
-        FD_ZERO(&wfds);
-        FD_ZERO(&efds);
-        FD_SET(s, &wfds);
-        FD_SET(s, &efds);
-        struct timeval tv;
-        tv.tv_sec  = ARCR_NET_CONNECT_TIMEOUT_MS / 1000;
-        tv.tv_usec = (ARCR_NET_CONNECT_TIMEOUT_MS % 1000) * 1000;
-        int sel = select(0, NULL, &wfds, &efds, &tv);
-        if (sel <= 0 || FD_ISSET(s, &efds) || !FD_ISSET(s, &wfds)) {
+        int elapsed_ms = 0;
+        bool ready = false;
+        while (elapsed_ms < ARCR_NET_CONNECT_TIMEOUT_MS) {
+            if (cancel_flag && *cancel_flag != 0) {
+                if (out_cancelled) *out_cancelled = true;
+                closesocket(s);
+                return INVALID_SOCKET;
+            }
+            fd_set wfds, efds;
+            FD_ZERO(&wfds);
+            FD_ZERO(&efds);
+            FD_SET(s, &wfds);
+            FD_SET(s, &efds);
+            struct timeval tv;
+            tv.tv_sec  = 0;
+            tv.tv_usec = 50000; /* 50ms cancellable slice */
+            int sel = select(0, NULL, &wfds, &efds, &tv);
+            if (sel < 0 || FD_ISSET(s, &efds)) {
+                closesocket(s);
+                return INVALID_SOCKET;
+            }
+            if (sel > 0 && FD_ISSET(s, &wfds)) {
+                ready = true;
+                break;
+            }
+            elapsed_ms += 50;
+        }
+        if (!ready) {
             closesocket(s);
             return INVALID_SOCKET;
         }
@@ -1650,7 +1748,8 @@ static SOCKET win32_connect_with_timeout(const struct sockaddr *sa, int sa_len) 
     return s;
 }
 
-static SOCKET win32_tcp_connect(const char *host, uint16_t port) {
+static SOCKET win32_tcp_connect(const char *host, uint16_t port,
+                                const volatile int *cancel_flag, bool *out_cancelled) {
     if (!host || !ensure_winsock_initialized()) return INVALID_SOCKET;
 
     char clean_host[256];
@@ -1690,8 +1789,9 @@ static SOCKET win32_tcp_connect(const char *host, uint16_t port) {
         if (fn_getaddrinfo(host, port_str, &hints, &res) == 0 && res) {
             SOCKET connected = INVALID_SOCKET;
             for (ArcrWinAddrInfo *ai = res; ai != NULL; ai = ai->ai_next) {
-                connected = win32_connect_with_timeout(ai->ai_addr, (int)ai->ai_addrlen);
-                if (connected != INVALID_SOCKET) break;
+                connected = win32_connect_with_timeout(ai->ai_addr, (int)ai->ai_addrlen,
+                                                       cancel_flag, out_cancelled);
+                if (connected != INVALID_SOCKET || (out_cancelled && *out_cancelled)) break;
             }
             fn_freeaddrinfo(res);
             return connected;
@@ -1707,7 +1807,8 @@ static SOCKET win32_tcp_connect(const char *host, uint16_t port) {
     unsigned long ip_num = inet_addr(host);
     if (ip_num != INADDR_NONE) {
         sin4.sin_addr.s_addr = ip_num;
-        return win32_connect_with_timeout((const struct sockaddr *)&sin4, (int)sizeof(sin4));
+        return win32_connect_with_timeout((const struct sockaddr *)&sin4, (int)sizeof(sin4),
+                                          cancel_flag, out_cancelled);
     }
 
     struct in_addr addrs[8];
@@ -1723,8 +1824,9 @@ static SOCKET win32_tcp_connect(const char *host, uint16_t port) {
 
     for (int i = 0; i < addr_count; ++i) {
         sin4.sin_addr = addrs[i];
-        SOCKET s = win32_connect_with_timeout((const struct sockaddr *)&sin4, (int)sizeof(sin4));
-        if (s != INVALID_SOCKET) return s;
+        SOCKET s = win32_connect_with_timeout((const struct sockaddr *)&sin4, (int)sizeof(sin4),
+                                              cancel_flag, out_cancelled);
+        if (s != INVALID_SOCKET || (out_cancelled && *out_cancelled)) return s;
     }
     return INVALID_SOCKET;
 }
@@ -1801,6 +1903,10 @@ static bool win32_schannel_handshake_loop(ArcrNetStream *st, const ArcrSspiTable
     bool skip_recv_once = call_isc_first;
 
     while (ss == SEC_I_CONTINUE_NEEDED || ss == SEC_E_INCOMPLETE_MESSAGE) {
+        if (st->cancel_flag && *st->cancel_flag != 0) {
+            st->was_cancelled = true;
+            return false;
+        }
         if (!skip_recv_once && (st->enc_len == 0u || ss == SEC_E_INCOMPLETE_MESSAGE)) {
             if (st->enc_len >= st->enc_cap) {
                 if (!win32_grow_enc_buf(st)) return false;
@@ -1905,8 +2011,15 @@ static void stream_destroy(ArcrNetStream *st) {
 }
 
 static ArcrNetStream *stream_connect_new(const char *host, uint16_t port, bool use_tls,
+                                         const volatile int *cancel_flag, bool *out_cancelled,
                                          ArcrSecurityState *out_sec,
                                          char *out_detail, size_t detail_cap) {
+    if (out_cancelled) *out_cancelled = false;
+    if (cancel_flag && *cancel_flag != 0) {
+        if (out_cancelled) *out_cancelled = true;
+        arcr_str_copy(out_detail, detail_cap, "요청 취소됨");
+        return NULL;
+    }
     if (use_tls && arcr_platform_wall_epoch_sec() < ARCR_BUILD_MIN_EPOCH_SEC) {
         *out_sec = ARCR_SEC_CLOCK_SKEW_ERR;
         arcr_str_copy(out_detail, detail_cap,
@@ -1916,18 +2029,22 @@ static ArcrNetStream *stream_connect_new(const char *host, uint16_t port, bool u
 
     ArcrNetStream *st = (ArcrNetStream *)calloc(1u, sizeof(ArcrNetStream));
     if (!st) return NULL;
-    st->sock   = INVALID_SOCKET;
-    st->is_tls = use_tls;
+    st->sock        = INVALID_SOCKET;
+    st->is_tls      = use_tls;
+    st->cancel_flag = cancel_flag;
 
     ArcrProxyConfig proxy;
     bool has_proxy = resolve_proxy_for_target(host, port, use_tls, &proxy);
     const char *dial_host = has_proxy ? proxy.host : host;
     uint16_t    dial_port = has_proxy ? proxy.port : port;
 
-    st->sock = win32_tcp_connect(dial_host, dial_port);
+    bool conn_cancelled = false;
+    st->sock = win32_tcp_connect(dial_host, dial_port, cancel_flag, &conn_cancelled);
     if (st->sock == INVALID_SOCKET) {
+        if (conn_cancelled && out_cancelled) *out_cancelled = true;
         *out_sec = use_tls ? ARCR_SEC_CERT_ERROR : ARCR_SEC_HTTP_INSECURE;
-        arcr_str_copy(out_detail, detail_cap, "서버 TCP 연결 또는 DNS 조회 실패");
+        arcr_str_copy(out_detail, detail_cap,
+                      conn_cancelled ? "요청 취소됨" : "서버 TCP 연결 또는 DNS 조회 실패");
         stream_destroy(st);
         return NULL;
     }
@@ -2138,8 +2255,44 @@ static bool stream_write_all(ArcrNetStream *st, const uint8_t *data, size_t len)
     return true;
 }
 
+static bool win32_wait_readable(ArcrNetStream *st) {
+    if (!st) return false;
+    if (st->cancel_flag && *st->cancel_flag != 0) {
+        st->was_cancelled = true;
+        return false;
+    }
+    if (!st->cancel_flag) return true;
+
+    int elapsed_ms = 0;
+    while (elapsed_ms < ARCR_NET_IO_TIMEOUT_MS) {
+        if (*st->cancel_flag != 0) {
+            st->was_cancelled = true;
+            return false;
+        }
+        fd_set rfds, efds;
+        FD_ZERO(&rfds);
+        FD_ZERO(&efds);
+        FD_SET(st->sock, &rfds);
+        FD_SET(st->sock, &efds);
+        struct timeval tv;
+        tv.tv_sec  = 0;
+        tv.tv_usec = 50000;
+        int sel = select(0, &rfds, NULL, &efds, &tv);
+        if (sel < 0) return false;
+        if (sel > 0 && (FD_ISSET(st->sock, &rfds) || FD_ISSET(st->sock, &efds))) {
+            return true;
+        }
+        elapsed_ms += 50;
+    }
+    return false;
+}
+
 static int stream_read_some(ArcrNetStream *st, uint8_t *out, size_t cap) {
     if (!st || !out || cap == 0u) return -1;
+    if (st->cancel_flag && *st->cancel_flag != 0) {
+        st->was_cancelled = true;
+        return -1;
+    }
 
     /* 1. Drain unread pushback bytes first */
     if (st->pre_pos < st->pre_len) {
@@ -2154,6 +2307,7 @@ static int stream_read_some(ArcrNetStream *st, uint8_t *out, size_t cap) {
     }
 
     if (!st->is_tls) {
+        if (!win32_wait_readable(st)) return -1;
         int r = recv(st->sock, (char *)out, (int)ARCR_MIN(cap, 65536u), 0);
         if (r < 0) return -1;
         return r; /* 0 on clean TCP EOF, >0 on data */
@@ -2175,6 +2329,10 @@ static int stream_read_some(ArcrNetStream *st, uint8_t *out, size_t cap) {
     if (!load_sspi_functions(st->secur32_mod, &sspi)) return -1;
 
     for (;;) {
+        if (st->cancel_flag && *st->cancel_flag != 0) {
+            st->was_cancelled = true;
+            return -1;
+        }
         if (st->enc_len > 0u) {
             SecBuffer bufs[4];
             bufs[0].pvBuffer   = st->enc_buf;
@@ -2249,6 +2407,7 @@ static int stream_read_some(ArcrNetStream *st, uint8_t *out, size_t cap) {
         if (st->enc_len >= st->enc_cap) {
             if (!win32_grow_enc_buf(st)) return -1;
         }
+        if (!win32_wait_readable(st)) return -1;
         int r = recv(st->sock, (char *)(st->enc_buf + st->enc_len),
                      (int)(st->enc_cap - st->enc_len), 0);
         if (r < 0) return -1; /* Socket timeout or connection reset */
@@ -2260,14 +2419,29 @@ static int stream_read_some(ArcrNetStream *st, uint8_t *out, size_t cap) {
 #else /* POSIX Sockets + Shared Cached OpenSSL SSL_CTX */
 
 #  if defined(ARCR_HAVE_OPENSSL)
-static SSL_CTX *g_shared_ssl_ctx = NULL;
+static SSL_CTX *g_shared_ssl_ctx      = NULL;
+static char     g_loaded_ca_file[1024] = "";
+static bool     g_ssl_ctx_inited      = false;
 
 static SSL_CTX *get_or_init_shared_ssl_ctx(void) {
+    const char *ca_env = getenv("ARCR_SSL_CA_FILE");
+    if (!ca_env || ca_env[0] == '\0') {
+        ca_env = getenv("SSL_CERT_FILE");
+    }
+    if (!ca_env) ca_env = "";
+
     net_mutex_lock(&g_ssl_mtx);
+    if (g_shared_ssl_ctx && (!g_ssl_ctx_inited || strcmp(g_loaded_ca_file, ca_env) != 0)) {
+        SSL_CTX_free(g_shared_ssl_ctx);
+        g_shared_ssl_ctx = NULL;
+    }
     if (!g_shared_ssl_ctx) {
         g_shared_ssl_ctx = SSL_CTX_new(TLS_client_method());
         if (g_shared_ssl_ctx) {
             (void)SSL_CTX_set_default_verify_paths(g_shared_ssl_ctx);
+            if (ca_env[0] != '\0') {
+                (void)SSL_CTX_load_verify_locations(g_shared_ssl_ctx, ca_env, NULL);
+            }
             SSL_CTX_set_verify(g_shared_ssl_ctx, SSL_VERIFY_NONE, NULL);
 #    ifdef TLS1_2_VERSION
             (void)SSL_CTX_set_min_proto_version(g_shared_ssl_ctx, TLS1_2_VERSION);
@@ -2275,6 +2449,8 @@ static SSL_CTX *get_or_init_shared_ssl_ctx(void) {
             /* Advertise ALPN "http/1.1" so TLS 1.3 servers never negotiate h2 over HTTP/1.1 parser */
             static const unsigned char kAlpnHttp11[] = {8, 'h', 't', 't', 'p', '/', '1', '.', '1'};
             (void)SSL_CTX_set_alpn_protos(g_shared_ssl_ctx, kAlpnHttp11, sizeof(kAlpnHttp11));
+            arcr_str_copy(g_loaded_ca_file, sizeof(g_loaded_ca_file), ca_env);
+            g_ssl_ctx_inited = true;
         }
     }
     SSL_CTX *ctx = g_shared_ssl_ctx;
@@ -2283,7 +2459,12 @@ static SSL_CTX *get_or_init_shared_ssl_ctx(void) {
 }
 #  endif
 
-static int posix_connect_with_timeout(const struct sockaddr *sa, socklen_t sa_len) {
+static int posix_connect_with_timeout(const struct sockaddr *sa, socklen_t sa_len,
+                                      const volatile int *cancel_flag, bool *out_cancelled) {
+    if (cancel_flag && *cancel_flag != 0) {
+        if (out_cancelled) *out_cancelled = true;
+        return -1;
+    }
     int fd = socket(sa->sa_family, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
@@ -2298,14 +2479,33 @@ static int posix_connect_with_timeout(const struct sockaddr *sa, socklen_t sa_le
             close(fd);
             return -1;
         }
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
-        struct timeval tv;
-        tv.tv_sec  = ARCR_NET_CONNECT_TIMEOUT_MS / 1000;
-        tv.tv_usec = (ARCR_NET_CONNECT_TIMEOUT_MS % 1000) * 1000;
-        int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
-        if (sel <= 0 || !FD_ISSET(fd, &wfds)) {
+        int elapsed_ms = 0;
+        bool ready = false;
+        while (elapsed_ms < ARCR_NET_CONNECT_TIMEOUT_MS) {
+            if (cancel_flag && *cancel_flag != 0) {
+                if (out_cancelled) *out_cancelled = true;
+                close(fd);
+                return -1;
+            }
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(fd, &wfds);
+            struct timeval tv;
+            tv.tv_sec  = 0;
+            tv.tv_usec = 50000; /* 50ms cancellable slice */
+            int sel = select(fd + 1, NULL, &wfds, NULL, &tv);
+            if (sel < 0) {
+                if (errno == EINTR) continue;
+                close(fd);
+                return -1;
+            }
+            if (sel > 0 && FD_ISSET(fd, &wfds)) {
+                ready = true;
+                break;
+            }
+            elapsed_ms += 50;
+        }
+        if (!ready) {
             close(fd);
             return -1;
         }
@@ -2328,7 +2528,8 @@ static int posix_connect_with_timeout(const struct sockaddr *sa, socklen_t sa_le
     return fd;
 }
 
-static int posix_tcp_connect(const char *host, uint16_t port) {
+static int posix_tcp_connect(const char *host, uint16_t port,
+                             const volatile int *cancel_flag, bool *out_cancelled) {
     if (!host || host[0] == '\0') return -1;
     char clean_host[256];
     if (host[0] == '[') {
@@ -2357,8 +2558,8 @@ static int posix_tcp_connect(const char *host, uint16_t port) {
 
     int fd = -1;
     for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
-        fd = posix_connect_with_timeout(ai->ai_addr, ai->ai_addrlen);
-        if (fd >= 0) break;
+        fd = posix_connect_with_timeout(ai->ai_addr, ai->ai_addrlen, cancel_flag, out_cancelled);
+        if (fd >= 0 || (out_cancelled && *out_cancelled)) break;
     }
     freeaddrinfo(res);
     return fd;
@@ -2463,8 +2664,15 @@ static void stream_destroy(ArcrNetStream *st) {
 }
 
 static ArcrNetStream *stream_connect_new(const char *host, uint16_t port, bool use_tls,
+                                         const volatile int *cancel_flag, bool *out_cancelled,
                                          ArcrSecurityState *out_sec,
                                          char *out_detail, size_t detail_cap) {
+    if (out_cancelled) *out_cancelled = false;
+    if (cancel_flag && *cancel_flag != 0) {
+        if (out_cancelled) *out_cancelled = true;
+        arcr_str_copy(out_detail, detail_cap, "요청 취소됨");
+        return NULL;
+    }
     if (use_tls && arcr_platform_wall_epoch_sec() < ARCR_BUILD_MIN_EPOCH_SEC) {
         *out_sec = ARCR_SEC_CLOCK_SKEW_ERR;
         arcr_str_copy(out_detail, detail_cap,
@@ -2483,18 +2691,22 @@ static ArcrNetStream *stream_connect_new(const char *host, uint16_t port, bool u
 
     ArcrNetStream *st = (ArcrNetStream *)calloc(1u, sizeof(ArcrNetStream));
     if (!st) return NULL;
-    st->fd     = -1;
-    st->is_tls = use_tls;
+    st->fd          = -1;
+    st->is_tls      = use_tls;
+    st->cancel_flag = cancel_flag;
 
     ArcrProxyConfig proxy;
     bool has_proxy = resolve_proxy_for_target(host, port, use_tls, &proxy);
     const char *dial_host = has_proxy ? proxy.host : host;
     uint16_t    dial_port = has_proxy ? proxy.port : port;
 
-    st->fd = posix_tcp_connect(dial_host, dial_port);
+    bool conn_cancelled = false;
+    st->fd = posix_tcp_connect(dial_host, dial_port, cancel_flag, &conn_cancelled);
     if (st->fd < 0) {
+        if (conn_cancelled && out_cancelled) *out_cancelled = true;
         *out_sec = use_tls ? ARCR_SEC_CERT_ERROR : ARCR_SEC_HTTP_INSECURE;
-        arcr_str_copy(out_detail, detail_cap, "서버 TCP 연결 또는 DNS 조회 실패");
+        arcr_str_copy(out_detail, detail_cap,
+                      conn_cancelled ? "요청 취소됨" : "서버 TCP 연결 또는 DNS 조회 실패");
         stream_destroy(st);
         return NULL;
     }
@@ -2536,7 +2748,7 @@ static ArcrNetStream *stream_connect_new(const char *host, uint16_t port, bool u
         return NULL;
     }
 
-    /* Strip IPv6 brackets for SNI & X.509 hostname verification */
+    /* Strip IPv6 brackets for SNI & X.509 hostname/IP verification */
     char clean_host[256];
     arcr_str_copy(clean_host, sizeof(clean_host), host);
     if (clean_host[0] == '[') {
@@ -2547,11 +2759,17 @@ static ArcrNetStream *stream_connect_new(const char *host, uint16_t port, bool u
         }
     }
 
-    (void)SSL_set_tlsext_host_name(st->ssl, clean_host);
     X509_VERIFY_PARAM *vparam = SSL_get0_param(st->ssl);
-    if (vparam) {
-        (void)X509_VERIFY_PARAM_set1_host(vparam, clean_host, 0u);
+    bool is_ip_literal = false;
+    if (vparam && X509_VERIFY_PARAM_set1_ip_asc(vparam, clean_host) == 1) {
+        is_ip_literal = true;
+    } else {
+        (void)SSL_set_tlsext_host_name(st->ssl, clean_host);
+        if (vparam) {
+            (void)X509_VERIFY_PARAM_set1_host(vparam, clean_host, 0u);
+        }
     }
+    (void)is_ip_literal;
     (void)SSL_set_fd(st->ssl, st->fd);
 
     if (SSL_connect(st->ssl) != 1) {
@@ -2621,8 +2839,46 @@ static bool stream_write_all(ArcrNetStream *st, const uint8_t *data, size_t len)
 #  endif
 }
 
+static bool posix_wait_readable(ArcrNetStream *st) {
+    if (!st) return false;
+    if (st->cancel_flag && *st->cancel_flag != 0) {
+        st->was_cancelled = true;
+        return false;
+    }
+    if (!st->cancel_flag) return true;
+    if (st->fd < 0 || st->fd >= FD_SETSIZE) return true;
+
+    int elapsed_ms = 0;
+    while (elapsed_ms < ARCR_NET_IO_TIMEOUT_MS) {
+        if (*st->cancel_flag != 0) {
+            st->was_cancelled = true;
+            return false;
+        }
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(st->fd, &rfds);
+        struct timeval tv;
+        tv.tv_sec  = 0;
+        tv.tv_usec = 50000; /* 50ms cancellable slice */
+        int sel = select(st->fd + 1, &rfds, NULL, NULL, &tv);
+        if (sel < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (sel > 0 && FD_ISSET(st->fd, &rfds)) {
+            return true;
+        }
+        elapsed_ms += 50;
+    }
+    return false;
+}
+
 static int stream_read_some(ArcrNetStream *st, uint8_t *out, size_t cap) {
     if (!st || !out || cap == 0u) return -1;
+    if (st->cancel_flag && *st->cancel_flag != 0) {
+        st->was_cancelled = true;
+        return -1;
+    }
 
     if (st->pre_pos < st->pre_len) {
         size_t avail = ARCR_MIN(cap, st->pre_len - st->pre_pos);
@@ -2637,8 +2893,15 @@ static int stream_read_some(ArcrNetStream *st, uint8_t *out, size_t cap) {
 
     int chunk = (cap > 65536u) ? 65536 : (int)cap;
     for (;;) {
+        if (st->cancel_flag && *st->cancel_flag != 0) {
+            st->was_cancelled = true;
+            return -1;
+        }
 #  if defined(ARCR_HAVE_OPENSSL)
         if (st->is_tls) {
+            if (SSL_pending(st->ssl) == 0 && !posix_wait_readable(st)) {
+                return -1;
+            }
             int n = SSL_read(st->ssl, out, chunk);
             if (n > 0) return n;
             int err = SSL_get_error(st->ssl, n);
@@ -2648,6 +2911,9 @@ static int stream_read_some(ArcrNetStream *st, uint8_t *out, size_t cap) {
             return -1;
         }
 #  endif
+        if (!posix_wait_readable(st)) {
+            return -1;
+        }
         ssize_t n = recv(st->fd, out, (size_t)chunk, 0);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -2723,14 +2989,19 @@ static ArcrNetStream *ka_pool_acquire(const char *host, uint16_t port, bool use_
         stream_destroy(found);
         return NULL;
     }
+    if (found) {
+        found->cancel_flag   = NULL;
+        found->was_cancelled = false;
+    }
     return found;
 }
 
 static void ka_pool_release(ArcrNetStream *st, const char *host, uint16_t port, bool use_tls) {
-    if (!st || !host || host[0] == '\0' || strlen(host) >= sizeof(g_ka_pool[0].host)) {
+    if (!st || st->was_cancelled || !host || host[0] == '\0' || strlen(host) >= sizeof(g_ka_pool[0].host)) {
         stream_destroy(st);
         return;
     }
+    st->cancel_flag = NULL;
     /* Do not pool streams with leftover unconsumed pushback bytes */
     if (st->pre_pos < st->pre_len) {
         stream_destroy(st);
@@ -3086,13 +3357,55 @@ typedef struct ParsedHttpHeaders {
     char     content_type[256];
     char     content_encoding[64];
     char     cache_control[128];
+    char     etag[128];
+    char     last_modified[128];
     char     location[ARCR_NET_MAX_URL_LEN];
 } ParsedHttpHeaders;
 
+static bool extra_headers_has_name(const char *extra_hdr, const char *name_nocase) {
+    if (!extra_hdr || !name_nocase || name_nocase[0] == '\0') return false;
+    size_t nlen = strlen(name_nocase);
+    const char *p = extra_hdr;
+    while (*p != '\0') {
+        while (*p == '\r' || *p == '\n') ++p;
+        if (*p == '\0') break;
+        const char *lstart = p;
+        while (*p != '\0' && *p != '\r' && *p != '\n') ++p;
+        size_t llen = (size_t)(p - lstart);
+        const char *colon = memchr(lstart, ':', llen);
+        if (colon) {
+            const char *hk = lstart;
+            size_t hk_len  = (size_t)(colon - lstart);
+            arcr_str_trim_view(&hk, &hk_len);
+            if (hk_len == nlen && arcr_str_eq_nocase_n(hk, hk_len, name_nocase, nlen)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool is_same_origin_url(const char *origin_url, const ArcrParsedUrl *target) {
+    if (!origin_url || origin_url[0] == '\0' || !target) return true;
+    if (arcr_str_eq_nocase(origin_url, "null")) return false;
+    ArcrParsedUrl op;
+    if (!net_parse_url(origin_url, &op)) return false;
+    uint16_t p1 = op.port;
+    if (p1 == 0u) p1 = arcr_str_eq_nocase(op.scheme, "https") ? 443u : 80u;
+    uint16_t p2 = target->port;
+    if (p2 == 0u) p2 = arcr_str_eq_nocase(target->scheme, "https") ? 443u : 80u;
+    return arcr_str_eq_nocase(op.scheme, target->scheme) &&
+           arcr_str_eq_nocase(op.host, target->host) &&
+           p1 == p2;
+}
+
 static bool parse_http_header_block(const char *hdr_text, size_t hdr_len,
                                     const char *req_host, const char *req_path,
-                                    bool store_cookies, ParsedHttpHeaders *out) {
+                                    bool store_cookies, ParsedHttpHeaders *out,
+                                    char **out_raw_hdrs, size_t *out_raw_hdrs_len) {
     memset(out, 0, sizeof(*out));
+    if (out_raw_hdrs) *out_raw_hdrs = NULL;
+    if (out_raw_hdrs_len) *out_raw_hdrs_len = 0u;
     arcr_str_copy(out->content_type, sizeof(out->content_type), "text/html; charset=utf-8");
 
     size_t line_end = 0u;
@@ -3115,6 +3428,23 @@ static bool parse_http_header_block(const char *hdr_text, size_t hdr_len,
     out->status_code = (int)sc;
 
     size_t hpos = line_end;
+    while (hpos < hdr_len && (hdr_text[hpos] == '\r' || hdr_text[hpos] == '\n')) ++hpos;
+    if (out_raw_hdrs && hpos <= hdr_len) {
+        size_t rem = hdr_len - hpos;
+        char *rh = (char *)malloc(rem + 3u);
+        if (rh) {
+            if (rem > 0u) memcpy(rh, hdr_text + hpos, rem);
+            size_t rlen = rem;
+            if (rlen > 0u && rh[rlen - 1u] != '\n') {
+                rh[rlen++] = '\r';
+                rh[rlen++] = '\n';
+            }
+            rh[rlen] = '\0';
+            *out_raw_hdrs = rh;
+            if (out_raw_hdrs_len) *out_raw_hdrs_len = rlen;
+        }
+    }
+
     while (hpos < hdr_len) {
         while (hpos < hdr_len && (hdr_text[hpos] == '\r' || hdr_text[hpos] == '\n')) ++hpos;
         if (hpos >= hdr_len) break;
@@ -3174,6 +3504,14 @@ static bool parse_http_header_block(const char *hdr_text, size_t hdr_len,
             size_t cl = ARCR_MIN(hv_len, sizeof(out->cache_control) - 1u);
             memcpy(out->cache_control, hv, cl);
             out->cache_control[cl] = '\0';
+        } else if (arcr_str_eq_nocase_n(hk, hk_len, "etag", 4u)) {
+            size_t cl = ARCR_MIN(hv_len, sizeof(out->etag) - 1u);
+            memcpy(out->etag, hv, cl);
+            out->etag[cl] = '\0';
+        } else if (arcr_str_eq_nocase_n(hk, hk_len, "last-modified", 13u)) {
+            size_t cl = ARCR_MIN(hv_len, sizeof(out->last_modified) - 1u);
+            memcpy(out->last_modified, hv, cl);
+            out->last_modified[cl] = '\0';
         } else if (arcr_str_eq_nocase_n(hk, hk_len, "set-cookie", 10u)) {
             if (store_cookies) {
                 cookie_jar_store_header(req_host, req_path, hv, hv_len);
@@ -3201,6 +3539,8 @@ static bool build_http_request_wire(const ArcrParsedUrl *parsed, bool use_tls,
                                     const char *method,
                                     const char *post_body, size_t post_len,
                                     const ArcrHttpRequest *req,
+                                    bool allow_cookies,
+                                    const char *cond_etag, const char *cond_lastmod,
                                     char **out_wire, size_t *out_wire_len) {
     *out_wire     = NULL;
     *out_wire_len = 0u;
@@ -3233,8 +3573,12 @@ static bool build_http_request_wire(const ArcrParsedUrl *parsed, bool use_tls,
         arcr_str_copy(req_target, ARCR_NET_MAX_URL_LEN + 320u, parsed->path);
     }
 
+    const char *extra_hdr = (req->extra_headers && req->extra_headers[0] != '\0')
+                                ? req->extra_headers
+                                : NULL;
+
     size_t cookie_len = 0u;
-    if (!req->private_browsing) {
+    if (allow_cookies && !extra_headers_has_name(extra_hdr, "cookie")) {
         cookie_len = cookie_jar_build_header(parsed->host, parsed->path, use_tls,
                                              cookie_vals, 16384u);
     }
@@ -3243,15 +3587,26 @@ static bool build_http_request_wire(const ArcrParsedUrl *parsed, bool use_tls,
         ? req->accept
         : "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
     const char *referer_hdr = (req->referer && req->referer[0] != '\0') ? req->referer : NULL;
-    const char *extra_hdr   = (req->extra_headers && req->extra_headers[0] != '\0')
-                                  ? req->extra_headers
+    const char *origin_hdr  = (req->origin && req->origin[0] != '\0' &&
+                               !extra_headers_has_name(extra_hdr, "origin"))
+                                  ? req->origin
                                   : NULL;
+    const char *inm_hdr     = (cond_etag && cond_etag[0] != '\0' &&
+                               !extra_headers_has_name(extra_hdr, "if-none-match"))
+                                  ? cond_etag
+                                  : NULL;
+    const char *ims_hdr     = (cond_lastmod && cond_lastmod[0] != '\0' &&
+                               !extra_headers_has_name(extra_hdr, "if-modified-since"))
+                                  ? cond_lastmod
+                                  : NULL;
+
     size_t extra_len = extra_hdr ? strlen(extra_hdr) : 0u;
     bool extra_needs_crlf = (extra_len > 0u && extra_hdr[extra_len - 1u] != '\n');
 
     size_t cap = strlen(req_target) + cookie_len +
                  (referer_hdr ? strlen(referer_hdr) : 0u) +
-                 extra_len + 2048u;
+                 (origin_hdr ? strlen(origin_hdr) : 0u) +
+                 extra_len + 2560u;
     char *wire = (char *)malloc(cap);
     if (!wire) {
         free(req_target);
@@ -3262,6 +3617,7 @@ static bool build_http_request_wire(const ArcrParsedUrl *parsed, bool use_tls,
     bool has_body_hdrs = arcr_str_eq_nocase(method, "POST") ||
                          arcr_str_eq_nocase(method, "PUT") ||
                          (post_body != NULL && post_len > 0u);
+    bool emit_ctype = has_body_hdrs && !extra_headers_has_name(extra_hdr, "content-type");
     const char *ctype = (req->content_type && req->content_type[0] != '\0')
                             ? req->content_type
                             : "application/x-www-form-urlencoded";
@@ -3277,6 +3633,9 @@ static bool build_http_request_wire(const ArcrParsedUrl *parsed, bool use_tls,
         "%s"
         "%s%s%s"
         "%s%s%s"
+        "%s%s%s"
+        "%s%s%s"
+        "%s%s%s"
         "%s%s"
         "Connection: keep-alive\r\n",
         method, req_target,
@@ -3284,6 +3643,9 @@ static bool build_http_request_wire(const ArcrParsedUrl *parsed, bool use_tls,
         accept_hdr,
         stream->via_http_proxy ? stream->proxy_auth_hdr : "",
         referer_hdr ? "Referer: " : "", referer_hdr ? referer_hdr : "", referer_hdr ? "\r\n" : "",
+        origin_hdr ? "Origin: " : "", origin_hdr ? origin_hdr : "", origin_hdr ? "\r\n" : "",
+        inm_hdr ? "If-None-Match: " : "", inm_hdr ? inm_hdr : "", inm_hdr ? "\r\n" : "",
+        ims_hdr ? "If-Modified-Since: " : "", ims_hdr ? ims_hdr : "", ims_hdr ? "\r\n" : "",
         (cookie_len > 0u) ? "Cookie: " : "", (cookie_len > 0u) ? cookie_vals : "", (cookie_len > 0u) ? "\r\n" : "",
         extra_hdr ? extra_hdr : "", extra_needs_crlf ? "\r\n" : ""
     );
@@ -3296,10 +3658,14 @@ static bool build_http_request_wire(const ArcrParsedUrl *parsed, bool use_tls,
     }
     size_t pos = (size_t)n;
     if (has_body_hdrs) {
-        int nb = snprintf(wire + pos, cap - pos,
-                          "Content-Type: %s\r\n"
-                          "Content-Length: %lu\r\n\r\n",
-                          ctype, (unsigned long)post_len);
+        int nb = emit_ctype
+                     ? snprintf(wire + pos, cap - pos,
+                                "Content-Type: %s\r\n"
+                                "Content-Length: %lu\r\n\r\n",
+                                ctype, (unsigned long)post_len)
+                     : snprintf(wire + pos, cap - pos,
+                                "Content-Length: %lu\r\n\r\n",
+                                (unsigned long)post_len);
         if (nb <= 0 || pos + (size_t)nb >= cap) {
             free(wire);
             return false;
@@ -3319,6 +3685,12 @@ static bool build_http_request_wire(const ArcrParsedUrl *parsed, bool use_tls,
 static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_resp) {
     if (!req || !req->url || !out_resp) return false;
     memset(out_resp, 0, sizeof(*out_resp));
+
+    if (req->cancel_flag && *req->cancel_flag != 0) {
+        out_resp->cancelled = true;
+        arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "요청 취소됨");
+        return false;
+    }
 
     /* 0. Handle arbitrary-size inline data: URIs BEFORE copying into fixed 4096B URL buffers! */
     const char *init_url = req->url;
@@ -3360,12 +3732,21 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
     size_t post_len       = (post_body != NULL) ? req->post_body_len : 0u;
 
     for (int hop = 0; hop <= ARCR_NET_MAX_REDIRECTS; ++hop) {
+        if (req->cancel_flag && *req->cancel_flag != 0) {
+            out_resp->cancelled = true;
+            arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "요청 취소됨");
+            free(current_url);
+            free(next_url);
+            return false;
+        }
         arcr_str_copy(out_resp->final_url, sizeof(out_resp->final_url), current_url);
+        out_resp->redirected = (hop > 0);
 
         size_t cur_len = strlen(current_url);
         if (cur_len >= 5u && arcr_str_eq_nocase_n(current_url, 5u, "data:", 5u)) {
             bool ok = handle_data_uri_view(current_url, cur_len,
                                            current_url + 5u, cur_len - 5u, out_resp);
+            out_resp->redirected = (hop > 0);
             free(current_url);
             free(next_url);
             return ok;
@@ -3496,12 +3877,14 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             buf[rd] = '\0';
             fclose(fp);
 
-            out_resp->status_code = 200;
+            out_resp->status_code   = 200;
             arcr_str_copy(out_resp->content_type, sizeof(out_resp->content_type),
                           guess_mime_from_path(dec_fpath));
-            out_resp->body       = buf;
-            out_resp->body_len   = rd;
-            out_resp->security   = ARCR_SEC_LOCAL_OR_NONE;
+            out_resp->body          = buf;
+            out_resp->body_len      = rd;
+            out_resp->encoded_bytes = rd;
+            out_resp->decoded_bytes = rd;
+            out_resp->security      = ARCR_SEC_LOCAL_OR_NONE;
             arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "로컬 문서 (file://)");
 
             free(raw_fpath);
@@ -3522,6 +3905,11 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             return false;
         }
 
+        bool is_cross_origin = (req->origin && req->origin[0] != '\0') &&
+                               !is_same_origin_url(req->origin, parsed);
+        bool allow_cookies   = !req->private_browsing &&
+                               (!is_cross_origin || req->include_credentials);
+
         /* 4. Check 32-entry LRU GET cache (keyed without #fragment via canonicalized URL) */
         const char *frag_in_cur = strchr(current_url, '#');
         size_t cache_key_len = frag_in_cur ? (size_t)(frag_in_cur - current_url) : strlen(current_url);
@@ -3535,9 +3923,20 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
         memcpy(cache_key, current_url, cache_key_len);
         cache_key[cache_key_len] = '\0';
 
-        if (is_get && !req->bypass_cache && !req->private_browsing) {
-            if (cache_lookup(cache_key, out_resp)) {
+        char cond_etag[128]    = "";
+        char cond_lastmod[128] = "";
+        bool has_cond_validator = false;
+        bool caller_sent_conditional =
+            extra_headers_has_name(req->extra_headers, "if-none-match") ||
+            extra_headers_has_name(req->extra_headers, "if-modified-since");
+
+        if (is_get && !req->bypass_cache && !req->private_browsing && !caller_sent_conditional) {
+            if (cache_lookup_or_validators(cache_key, out_resp,
+                                           cond_etag, sizeof(cond_etag),
+                                           cond_lastmod, sizeof(cond_lastmod),
+                                           &has_cond_validator)) {
                 arcr_str_copy(out_resp->final_url, sizeof(out_resp->final_url), current_url);
+                out_resp->redirected = (hop > 0);
                 free(cache_key);
                 free(parsed);
                 free(current_url);
@@ -3566,10 +3965,13 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
         for (int attempt = 0; attempt < 2; ++attempt) {
             if (!stream) {
                 reused_from_pool = false;
+                bool conn_cancelled = false;
                 stream = stream_connect_new(parsed->host, parsed->port, use_tls,
+                                            req->cancel_flag, &conn_cancelled,
                                             &out_resp->security, out_resp->detail,
                                             sizeof(out_resp->detail));
                 if (!stream) {
+                    if (conn_cancelled) out_resp->cancelled = true;
                     free(cache_key);
                     free(parsed);
                     free(current_url);
@@ -3577,7 +3979,9 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
                     return false;
                 }
             } else {
-                out_resp->security = stream->security;
+                stream->cancel_flag   = req->cancel_flag;
+                stream->was_cancelled = false;
+                out_resp->security    = stream->security;
                 arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), stream->detail);
             }
 
@@ -3585,6 +3989,7 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             size_t req_wire_len = 0u;
             if (!build_http_request_wire(parsed, use_tls, stream, method,
                                          post_body, post_len, req,
+                                         allow_cookies, cond_etag, cond_lastmod,
                                          &req_wire, &req_wire_len)) {
                 stream_destroy(stream);
                 free(cache_key);
@@ -3601,12 +4006,15 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             }
 
             if (!write_ok) {
+                bool was_canc = stream->was_cancelled;
                 stream_destroy(stream);
                 stream = NULL;
-                if (reused_from_pool && attempt == 0) {
+                if (!was_canc && reused_from_pool && attempt == 0) {
                     continue; /* Transparently retry once on a fresh connection! */
                 }
-                arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "HTTP 요청 전송 실패");
+                if (was_canc) out_resp->cancelled = true;
+                arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
+                              was_canc ? "요청 취소됨" : "HTTP 요청 전송 실패");
                 free(cache_key);
                 free(parsed);
                 free(current_url);
@@ -3619,13 +4027,16 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
                 break;
             }
 
+            bool was_canc = stream->was_cancelled;
             stream_destroy(stream);
             stream = NULL;
-            if (reused_from_pool && !got_any_byte && attempt == 0) {
+            if (!was_canc && reused_from_pool && !got_any_byte && attempt == 0) {
                 continue; /* Server closed idle Keep-Alive socket right as we wrote; retry fresh! */
             }
 
-            arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "HTTP 응답 헤더 수신 실패");
+            if (was_canc) out_resp->cancelled = true;
+            arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
+                          was_canc ? "요청 취소됨" : "HTTP 응답 헤더 수신 실패");
             free(cache_key);
             free(parsed);
             free(current_url);
@@ -3645,10 +4056,17 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             return false;
         }
 
-        bool hdr_ok = false;
+        char  *resp_raw_headers     = NULL;
+        size_t resp_raw_headers_len = 0u;
+        bool   hdr_ok               = false;
         for (int info_hop = 0; info_hop < 8; ++info_hop) {
+            free(resp_raw_headers);
+            resp_raw_headers     = NULL;
+            resp_raw_headers_len = 0u;
+
             if (!parse_http_header_block(hdr_block, hdr_block_len, parsed->host, parsed->path,
-                                         !req->private_browsing, ph)) {
+                                         allow_cookies, ph,
+                                         &resp_raw_headers, &resp_raw_headers_len)) {
                 free(hdr_block);
                 hdr_block = NULL;
                 break;
@@ -3668,9 +4086,12 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
         }
 
         if (!hdr_ok) {
+            if (stream->was_cancelled) out_resp->cancelled = true;
+            free(resp_raw_headers);
             free(ph);
             stream_destroy(stream);
-            arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "잘못된 HTTP 응답 상태줄·헤더");
+            arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
+                          out_resp->cancelled ? "요청 취소됨" : "잘못된 HTTP 응답 상태줄·헤더");
             free(cache_key);
             free(parsed);
             free(current_url);
@@ -3695,8 +4116,15 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
         } else if (ph->is_chunked) {
             body_ok = stream_read_chunked_body(stream, &final_body, &final_len, &framing_clean);
             if (!body_ok) {
-                arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
-                              "HTTP chunked 본문 스트림 디코딩 실패");
+                if (stream->was_cancelled) {
+                    out_resp->cancelled = true;
+                    arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "요청 취소됨");
+                } else {
+                    out_resp->length_mismatch = true;
+                    out_resp->status_code     = ph->status_code;
+                    arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
+                                  "HTTP chunked 본문 스트림 디코딩 실패");
+                }
             }
         } else if (ph->has_content_length) {
             if (ph->content_length > ARCR_NET_MAX_RESPONSE_BYTES) {
@@ -3715,8 +4143,15 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
                     } else {
                         free(final_body);
                         final_body = NULL;
-                        arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
-                                      "HTTP Content-Length 본문 수신 중 연결 끊김");
+                        if (stream->was_cancelled) {
+                            out_resp->cancelled = true;
+                            arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "요청 취소됨");
+                        } else {
+                            out_resp->length_mismatch = true;
+                            out_resp->status_code     = ph->status_code;
+                            arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
+                                          "HTTP Content-Length 본문 길이 불일치(수신 중 연결 끊김)");
+                        }
                     }
                 }
             }
@@ -3724,11 +4159,13 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             body_ok = stream_read_until_eof(stream, &final_body, &final_len);
             framing_clean = false; /* EOF-delimited stream cannot be pooled */
             if (!body_ok) {
-                arcr_str_copy(out_resp->detail, sizeof(out_resp->detail), "HTTP 응답 본문 수신 실패");
+                if (stream->was_cancelled) out_resp->cancelled = true;
+                arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
+                              out_resp->cancelled ? "요청 취소됨" : "HTTP 응답 본문 수신 실패");
             }
         }
 
-        bool can_keep_alive = framing_clean && !ph->conn_close &&
+        bool can_keep_alive = framing_clean && !ph->conn_close && !stream->was_cancelled &&
                               (!ph->is_http10 || ph->conn_keep_alive);
         if (body_ok && can_keep_alive) {
             ka_pool_release(stream, parsed->host, parsed->port, use_tls);
@@ -3738,6 +4175,7 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
         stream = NULL;
 
         if (!body_ok || !final_body) {
+            free(resp_raw_headers);
             free(final_body);
             free(ph);
             free(cache_key);
@@ -3751,6 +4189,7 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
         int status_code = ph->status_code;
         if ((status_code == 301 || status_code == 302 || status_code == 303 ||
              status_code == 307 || status_code == 308) && ph->location[0] != '\0') {
+            free(resp_raw_headers);
             free(final_body);
             if (hop == ARCR_NET_MAX_REDIRECTS) {
                 arcr_str_copy(out_resp->detail, sizeof(out_resp->detail),
@@ -3786,7 +4225,24 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             continue;
         }
 
+        /* 8b. Fulfill 304 Not Modified from conditional cache entry when automatically revalidated */
+        if (status_code == 304 && has_cond_validator && !caller_sent_conditional) {
+            if (cache_fulfill_304(cache_key, out_resp)) {
+                arcr_str_copy(out_resp->final_url, sizeof(out_resp->final_url), current_url);
+                out_resp->redirected = (hop > 0);
+                free(resp_raw_headers);
+                free(final_body);
+                free(ph);
+                free(cache_key);
+                free(parsed);
+                free(current_url);
+                free(next_url);
+                return true;
+            }
+        }
+
         /* 9. Decompress Content-Encoding (br, gzip, deflate) strictly — never return binary garbage! */
+        size_t wire_body_len = final_len;
         if (ph->content_encoding[0] != '\0' &&
             !arcr_str_eq_nocase(ph->content_encoding, "identity") &&
             final_len > 0u) {
@@ -3797,6 +4253,7 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
                 snprintf(out_resp->detail, sizeof(out_resp->detail),
                          "HTTP 압축 해제 실패 (Content-Encoding: %s)", ph->content_encoding);
                 out_resp->status_code = status_code;
+                free(resp_raw_headers);
                 free(final_body);
                 free(ph);
                 free(cache_key);
@@ -3808,6 +4265,7 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             uint8_t *nt = (uint8_t *)realloc(decomp, decomp_len + 1u);
             if (!nt) {
                 free(decomp);
+                free(resp_raw_headers);
                 free(final_body);
                 free(ph);
                 free(cache_key);
@@ -3822,15 +4280,23 @@ static bool net_fetch_http(const ArcrHttpRequest *req, ArcrHttpResponse *out_res
             final_len  = decomp_len;
         }
 
-        out_resp->status_code = status_code;
+        out_resp->status_code     = status_code;
         arcr_str_copy(out_resp->content_type, sizeof(out_resp->content_type), ph->content_type);
-        out_resp->body       = final_body;
-        out_resp->body_len   = final_len;
-        out_resp->from_cache = false;
+        out_resp->body            = final_body;
+        out_resp->body_len        = final_len;
+        out_resp->encoded_bytes   = wire_body_len;
+        out_resp->decoded_bytes   = final_len;
+        out_resp->raw_headers     = resp_raw_headers;
+        out_resp->raw_headers_len = resp_raw_headers ? resp_raw_headers_len : 0u;
+        out_resp->from_cache      = false;
+        out_resp->redirected      = (hop > 0);
 
         if (is_get && status_code == 200 && !req->private_browsing &&
             !header_contains_token_nocase(ph->cache_control, "no-store")) {
-            cache_insert(cache_key, out_resp);
+            bool must_reval = header_contains_token_nocase(ph->cache_control, "no-cache") ||
+                              header_contains_token_nocase(ph->cache_control, "must-revalidate") ||
+                              strstr(ph->cache_control, "max-age=0") != NULL;
+            cache_insert(cache_key, out_resp, ph->etag, ph->last_modified, must_reval);
         }
 
         free(ph);
@@ -3900,6 +4366,7 @@ static void net_fetch_batch_parallel(const ArcrHttpRequest *reqs, ArcrHttpRespon
 static void net_free_response(ArcrHttpResponse *resp) {
     if (!resp) return;
     free(resp->body);
+    free(resp->raw_headers);
     memset(resp, 0, sizeof(*resp));
 }
 
@@ -3921,6 +4388,8 @@ static bool net_load_url_resource(const char *url, char **out_utf8_body,
     if (out_detail && detail_cap > 0u) {
         arcr_str_copy(out_detail, detail_cap, resp.detail);
     }
+    free(resp.raw_headers);
+    resp.raw_headers = NULL;
     if (!ok || !resp.body) {
         free(resp.body);
         return false;

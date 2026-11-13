@@ -160,7 +160,22 @@ static bool lookup_named_entity(const char *ent, size_t elen, uint32_t *out_cp) 
         {"ucirc",    0x00FBu, false}, {"uuml",     0x00FCu, false},
         {"yacute",   0x00FDu, false}, {"yuml",     0x00FFu, false},
         {"OElig",    0x0152u, false}, {"oelig",    0x0153u, false},
-        {"Scaron",   0x0160u, false}, {"scaron",   0x0161u, false}
+        {"Scaron",   0x0160u, false}, {"scaron",   0x0161u, false},
+        {"Alpha",    0x0391u, false}, {"Beta",     0x0392u, false},
+        {"Gamma",    0x0393u, false}, {"Delta",    0x0394u, false},
+        {"Pi",       0x03A0u, false}, {"Sigma",    0x03A3u, false},
+        {"Omega",    0x03A9u, false}, {"alpha",    0x03B1u, false},
+        {"beta",     0x03B2u, false}, {"gamma",    0x03B3u, false},
+        {"delta",    0x03B4u, false}, {"epsilon",  0x03B5u, false},
+        {"lambda",   0x03BBu, false}, {"mu",       0x03BCu, false},
+        {"pi",       0x03C0u, false}, {"sigma",    0x03C3u, false},
+        {"omega",    0x03C9u, false}, {"sum",      0x2211u, false},
+        {"prod",     0x220Fu, false}, {"int",      0x222Bu, false},
+        {"part",     0x2202u, false}, {"nabla",    0x2207u, false},
+        {"isin",     0x2208u, false}, {"notin",    0x2209u, false},
+        {"cap",      0x2229u, false}, {"cup",      0x222Au, false},
+        {"there4",   0x2234u, false}, {"empty",    0x2205u, false},
+        {"circ",     0x02C6u, false}, {"tilde",    0x02DCu, false}
     };
 
     /* Pass 1: exact case-sensitive match */
@@ -204,7 +219,7 @@ static size_t decode_and_collapse_text(const char *src, size_t src_len,
 
         if (src[i] == '&') {
             size_t semi = i + 1u;
-            while (semi < src_len && semi - i <= 24u && src[semi] != ';' &&
+            while (semi < src_len && semi - i <= 40u && src[semi] != ';' &&
                    !is_space(src[semi]) && src[semi] != '<' && src[semi] != '&') {
                 ++semi;
             }
@@ -462,6 +477,59 @@ static const char *pick_lazy_img_fallback(ArcrDocument *doc, const ArcrDomNode *
     return NULL;
 }
 
+static bool is_supported_picture_mime(const char *mime) {
+    if (!mime || mime[0] == '\0') return true;
+    size_t len = 0u;
+    while (mime[len] != '\0' && mime[len] != ';') ++len;
+    const char *m = mime;
+    arcr_str_trim_view(&m, &len);
+    if (len == 0u) return true;
+    static const char *const kSupported[] = {
+        "image/png", "image/jpeg", "image/jpg", "image/webp",
+        "image/gif", "image/bmp", "image/svg+xml",
+        "image/x-icon", "image/vnd.microsoft.icon"
+    };
+    for (size_t i = 0u; i < ARCR_ARRAY_LEN(kSupported); ++i) {
+        if (arcr_str_eq_nocase_n(m, len, kSupported[i], strlen(kSupported[i]))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *pick_picture_source_url(ArcrDocument *doc, const ArcrDomNode *img_elem) {
+    if (!doc || !img_elem || !img_elem->parent || img_elem->parent->kind != ARCR_NODE_ELEMENT) {
+        return NULL;
+    }
+    const char *ptag = arcr_atom_cstr(doc->atoms, img_elem->parent->tag);
+    if (!arcr_str_eq_nocase(ptag, "picture")) return NULL;
+
+    for (const ArcrDomNode *sib = img_elem->parent->first_child;
+         sib != NULL && sib != img_elem;
+         sib = sib->next_sibling) {
+        if (sib->kind != ARCR_NODE_ELEMENT) continue;
+        const char *stag = arcr_atom_cstr(doc->atoms, sib->tag);
+        if (!arcr_str_eq_nocase(stag, "source")) continue;
+
+        const char *type_attr = arcr_dom_get_attr_cstr(doc, sib, "type");
+        if (!is_supported_picture_mime(type_attr)) continue;
+
+        const char *ss = arcr_dom_get_attr_cstr(doc, sib, "srcset");
+        if (ss && ss[0] != '\0') {
+            const char *cand = extract_srcset_url(doc, ss);
+            if (cand) return cand;
+        }
+        const char *s_src = arcr_dom_get_attr_cstr(doc, sib, "src");
+        if (s_src && !is_placeholder_img_src(s_src)) {
+            const char *tv = s_src;
+            size_t      tl = strlen(s_src);
+            arcr_str_trim_view(&tv, &tl);
+            if (tl > 0u) return arcr_arena_strdup(&doc->arena, tv, tl);
+        }
+    }
+    return NULL;
+}
+
 static void attach_decoded_image_to_node(ArcrDocument *doc, ArcrDomNode *elem, ArcrImage *img) {
     if (!doc || !elem || !img || !img->pixels || img->width <= 0 || img->height <= 0) {
         if (img) arcr_image_free(img);
@@ -482,8 +550,8 @@ static void attach_decoded_image_to_node(ArcrDocument *doc, ArcrDomNode *elem, A
 
 static void finalize_opened_element(ArcrDocument *doc, ArcrDomNode *elem,
                                     const char *tag_ptr, size_t tag_len,
-                                    size_t svg_depth) {
-    if (!doc || !elem || svg_depth > 0u) return;
+                                    size_t svg_depth, bool in_template) {
+    if (!doc || !elem || svg_depth > 0u || in_template) return;
 
     if (arcr_str_eq_nocase_n(tag_ptr, tag_len, "base", 4u)) {
         if (!doc->base_href) {
@@ -510,11 +578,15 @@ static void finalize_opened_element(ArcrDocument *doc, ArcrDomNode *elem,
             append_external_ref(doc, &doc->ext_scripts_head, src, elem);
         }
     } else if (arcr_str_eq_nocase_n(tag_ptr, tag_len, "img", 3u)) {
-        doc->has_images      = true;
-        const char *src      = arcr_dom_get_attr_cstr(doc, elem, "src");
-        const char *fallback = NULL;
+        doc->has_images          = true;
+        const char *orig_src     = arcr_dom_get_attr_cstr(doc, elem, "src");
+        const char *picture_cand = pick_picture_source_url(doc, elem);
+        const char *src          = orig_src;
+        const char *fallback     = NULL;
 
-        if (is_placeholder_img_src(src)) {
+        if (picture_cand) {
+            src = picture_cand;
+        } else if (is_placeholder_img_src(src)) {
             fallback = pick_lazy_img_fallback(doc, elem);
             if (fallback) {
                 src = fallback;
@@ -533,11 +605,11 @@ static void finalize_opened_element(ArcrDocument *doc, ArcrDomNode *elem,
                         attach_decoded_image_to_node(doc, elem, &img);
                     } else {
                         arcr_image_free(&img);
-                        if (!fallback) {
-                            fallback = pick_lazy_img_fallback(doc, elem);
-                            if (fallback && !arcr_str_starts_with_nocase(fallback, "data:")) {
-                                append_external_ref(doc, &doc->ext_images_head, fallback, elem);
-                            }
+                        const char *alt_src = (picture_cand && !is_placeholder_img_src(orig_src))
+                                                  ? orig_src
+                                                  : (fallback ? NULL : pick_lazy_img_fallback(doc, elem));
+                        if (alt_src && !arcr_str_starts_with_nocase(alt_src, "data:")) {
+                            append_external_ref(doc, &doc->ext_images_head, alt_src, elem);
                         }
                     }
                 } else {
@@ -867,11 +939,26 @@ static void rasterize_inline_svg_element(ArcrDocument *doc, ArcrDomNode *svg_nod
     target_w = ARCR_CLAMP(target_w, 1, 1024);
     target_h = ARCR_CLAMP(target_h, 1, 1024);
 
-    size_t svg_len = 0u;
-    char  *svg_xml = arcr_dom_serialize_html_alloc(doc, svg_node, true, &svg_len);
+    char       *ser_xml = NULL;
+    const char *svg_xml = svg_node->raw_svg_markup;
+    size_t      svg_len = svg_node->raw_svg_len;
+
     if (!svg_xml || svg_len == 0u) {
-        free(svg_xml);
-        return;
+        ser_xml = arcr_dom_serialize_html_alloc(doc, svg_node, true, &svg_len);
+        if (!ser_xml || svg_len == 0u) {
+            free(ser_xml);
+            return;
+        }
+        for (size_t k = 0u; k + 8u <= svg_len; ++k) {
+            if (memcmp(ser_xml + k, "viewbox=", 8u) == 0) {
+                ser_xml[k + 4u] = 'B';
+            }
+        }
+        svg_node->raw_svg_markup = arcr_arena_strdup(&doc->arena, ser_xml, svg_len);
+        svg_node->raw_svg_len    = svg_len;
+        svg_xml                  = svg_node->raw_svg_markup;
+        free(ser_xml);
+        if (!svg_xml) return;
     }
 
     uint32_t  cur_color = infer_svg_current_color(doc, svg_node);
@@ -879,11 +966,19 @@ static void rasterize_inline_svg_element(ArcrDocument *doc, ArcrDomNode *svg_nod
     if (arcr_svg_rasterize_mem(svg_xml, svg_len, target_w, target_h, cur_color, &img) &&
         img.pixels && img.width > 0 && img.height > 0) {
         attach_decoded_image_to_node(doc, svg_node, &img);
+        svg_node->svg_rendered_color = cur_color;
+        svg_node->svg_rendered_w     = img.width;
+        svg_node->svg_rendered_h     = img.height;
+        doc->has_images              = true;
     } else {
         arcr_image_free(&img);
     }
-    free(svg_xml);
 }
+
+/* -------------------------------------------------------------------------
+ * HTML5 Tree Construction, Error Recovery & Resumable Parser State Machine
+ * ------------------------------------------------------------------------- */
+#define ARCR_HTML_MAX_WRITE_BYTES (64u * 1024u * 1024u)
 
 typedef struct HtmlParseAtoms {
     ArcrAtom html;
@@ -895,6 +990,9 @@ typedef struct HtmlParseAtoms {
     ArcrAtom ol;
     ArcrAtom pre;
     ArcrAtom table;
+    ArcrAtom caption;
+    ArcrAtom colgroup;
+    ArcrAtom col;
     ArcrAtom thead;
     ArcrAtom tbody;
     ArcrAtom tfoot;
@@ -906,30 +1004,71 @@ typedef struct HtmlParseAtoms {
     ArcrAtom dd;
     ArcrAtom option;
     ArcrAtom svg;
+    ArcrAtom math;
+    ArcrAtom template_tag;
+    ArcrAtom script;
+    ArcrAtom style;
 } HtmlParseAtoms;
 
 static void init_parse_atoms(ArcrAtomTable *atoms, HtmlParseAtoms *pa) {
-    pa->html   = arcr_atom_intern_lower(atoms, "html", 4u);
-    pa->head   = arcr_atom_intern_lower(atoms, "head", 4u);
-    pa->body   = arcr_atom_intern_lower(atoms, "body", 4u);
-    pa->p      = arcr_atom_intern_lower(atoms, "p", 1u);
-    pa->li     = arcr_atom_intern_lower(atoms, "li", 2u);
-    pa->ul     = arcr_atom_intern_lower(atoms, "ul", 2u);
-    pa->ol     = arcr_atom_intern_lower(atoms, "ol", 2u);
-    pa->pre    = arcr_atom_intern_lower(atoms, "pre", 3u);
-    pa->table  = arcr_atom_intern_lower(atoms, "table", 5u);
-    pa->thead  = arcr_atom_intern_lower(atoms, "thead", 5u);
-    pa->tbody  = arcr_atom_intern_lower(atoms, "tbody", 5u);
-    pa->tfoot  = arcr_atom_intern_lower(atoms, "tfoot", 5u);
-    pa->tr     = arcr_atom_intern_lower(atoms, "tr", 2u);
-    pa->td     = arcr_atom_intern_lower(atoms, "td", 2u);
-    pa->th     = arcr_atom_intern_lower(atoms, "th", 2u);
-    pa->dl     = arcr_atom_intern_lower(atoms, "dl", 2u);
-    pa->dt     = arcr_atom_intern_lower(atoms, "dt", 2u);
-    pa->dd     = arcr_atom_intern_lower(atoms, "dd", 2u);
-    pa->option = arcr_atom_intern_lower(atoms, "option", 6u);
-    pa->svg    = arcr_atom_intern_lower(atoms, "svg", 3u);
+    pa->html         = arcr_atom_intern_lower(atoms, "html", 4u);
+    pa->head         = arcr_atom_intern_lower(atoms, "head", 4u);
+    pa->body         = arcr_atom_intern_lower(atoms, "body", 4u);
+    pa->p            = arcr_atom_intern_lower(atoms, "p", 1u);
+    pa->li           = arcr_atom_intern_lower(atoms, "li", 2u);
+    pa->ul           = arcr_atom_intern_lower(atoms, "ul", 2u);
+    pa->ol           = arcr_atom_intern_lower(atoms, "ol", 2u);
+    pa->pre          = arcr_atom_intern_lower(atoms, "pre", 3u);
+    pa->table        = arcr_atom_intern_lower(atoms, "table", 5u);
+    pa->caption      = arcr_atom_intern_lower(atoms, "caption", 7u);
+    pa->colgroup     = arcr_atom_intern_lower(atoms, "colgroup", 8u);
+    pa->col          = arcr_atom_intern_lower(atoms, "col", 3u);
+    pa->thead        = arcr_atom_intern_lower(atoms, "thead", 5u);
+    pa->tbody        = arcr_atom_intern_lower(atoms, "tbody", 5u);
+    pa->tfoot        = arcr_atom_intern_lower(atoms, "tfoot", 5u);
+    pa->tr           = arcr_atom_intern_lower(atoms, "tr", 2u);
+    pa->td           = arcr_atom_intern_lower(atoms, "td", 2u);
+    pa->th           = arcr_atom_intern_lower(atoms, "th", 2u);
+    pa->dl           = arcr_atom_intern_lower(atoms, "dl", 2u);
+    pa->dt           = arcr_atom_intern_lower(atoms, "dt", 2u);
+    pa->dd           = arcr_atom_intern_lower(atoms, "dd", 2u);
+    pa->option       = arcr_atom_intern_lower(atoms, "option", 6u);
+    pa->svg          = arcr_atom_intern_lower(atoms, "svg", 3u);
+    pa->math         = arcr_atom_intern_lower(atoms, "math", 4u);
+    pa->template_tag = arcr_atom_intern_lower(atoms, "template", 8u);
+    pa->script       = arcr_atom_intern_lower(atoms, "script", 6u);
+    pa->style        = arcr_atom_intern_lower(atoms, "style", 5u);
 }
+
+struct ArcrHtmlParser {
+    ArcrDocument  *doc;
+    HtmlParseAtoms pa;
+    char          *buf;
+    size_t         len;
+    size_t         cap;
+    size_t         pos;
+    size_t         write_cursor;
+    size_t         written_total;
+
+    ArcrDomNode  **stack;
+    size_t         stack_cap;
+    size_t         depth;
+
+    ArcrDomNode   *html_el;
+    ArcrDomNode   *body_el;
+    ArcrDomNode   *svg_open_node;
+    size_t         svg_open_offset;
+
+    size_t         svg_depth;
+    size_t         math_depth;
+    size_t         template_depth;
+
+    bool           scripting_enabled;
+    bool           pauses_enabled;
+    bool           is_fragment;
+    bool           seen_doctype;
+    bool           done;
+};
 
 static bool push_open_element(ArcrDomNode ***inout_stack, size_t *inout_cap,
                               size_t *inout_depth, ArcrDomNode *node) {
@@ -947,12 +1086,232 @@ static bool push_open_element(ArcrDomNode ***inout_stack, size_t *inout_cap,
     return true;
 }
 
-static size_t count_open_svg_depth(ArcrDomNode *const *stack, size_t depth, ArcrAtom svg_atom) {
+static size_t count_open_tag_depth(ArcrDomNode *const *stack, size_t depth, ArcrAtom target_atom) {
     size_t cnt = 0u;
     for (size_t k = 1u; k < depth; ++k) {
-        if (stack[k]->tag == svg_atom) ++cnt;
+        if (stack[k]->kind == ARCR_NODE_ELEMENT && stack[k]->tag == target_atom) ++cnt;
     }
     return cnt;
+}
+
+static bool is_formatting_tag_cstr(const char *t) {
+    if (!t) return false;
+    static const char *const kFmt[] = {
+        "a", "b", "big", "code", "em", "font", "i",
+        "nobr", "s", "small", "strike", "strong", "tt", "u"
+    };
+    for (size_t i = 0u; i < ARCR_ARRAY_LEN(kFmt); ++i) {
+        if (strcmp(t, kFmt[i]) == 0) return true;
+    }
+    return false;
+}
+
+static bool is_formatting_node(const ArcrDocument *doc, const ArcrDomNode *n) {
+    if (!n || n->kind != ARCR_NODE_ELEMENT) return false;
+    return is_formatting_tag_cstr(arcr_atom_cstr(doc->atoms, n->tag));
+}
+
+static bool is_scope_boundary_node(const ArcrDomNode *n, const HtmlParseAtoms *pa) {
+    if (!n) return true;
+    if (n->kind == ARCR_NODE_DOCUMENT) return true; /* root or <template> fragment boundary */
+    ArcrAtom t = n->tag;
+    return t == pa->html || t == pa->body || t == pa->table || t == pa->thead ||
+           t == pa->tbody || t == pa->tfoot || t == pa->tr || t == pa->td ||
+           t == pa->th || t == pa->caption || t == pa->template_tag ||
+           t == pa->svg || t == pa->math;
+}
+
+static ArcrDomNode *clone_element_shallow(ArcrDocument *doc, const ArcrDomNode *src) {
+    if (!doc || !src || src->kind != ARCR_NODE_ELEMENT) return NULL;
+    const char *tname = arcr_atom_cstr(doc->atoms, src->tag);
+    if (!tname) return NULL;
+    ArcrDomNode *clone = arcr_dom_create_element(doc, tname, strlen(tname));
+    if (!clone) return NULL;
+    for (const ArcrAttr *a = src->first_attr; a != NULL; a = a->next) {
+        const char *aname = arcr_atom_cstr(doc->atoms, a->name);
+        const char *aval  = a->value ? a->value : "";
+        if (aname) {
+            arcr_dom_set_attr(doc, clone, aname, strlen(aname), aval, strlen(aval));
+        }
+    }
+    return clone;
+}
+
+static bool is_table_foster_parent(const ArcrDomNode *n, const HtmlParseAtoms *pa) {
+    if (!n || n->kind != ARCR_NODE_ELEMENT) return false;
+    ArcrAtom t = n->tag;
+    return t == pa->table || t == pa->thead || t == pa->tbody ||
+           t == pa->tfoot || t == pa->tr;
+}
+
+static bool is_allowed_in_table_context(const ArcrDomNode *parent, const ArcrDomNode *child,
+                                        const HtmlParseAtoms *pa) {
+    if (!parent || !child) return true;
+    if (child->kind == ARCR_NODE_COMMENT) return true;
+    if (child->kind != ARCR_NODE_ELEMENT) return false; /* Text in table/row is foster-parented */
+
+    ArcrAtom ct = child->tag;
+    if (ct == pa->script || ct == pa->style || ct == pa->template_tag) return true;
+
+    ArcrAtom pt = parent->tag;
+    if (pt == pa->table) {
+        return ct == pa->caption || ct == pa->colgroup || ct == pa->col ||
+               ct == pa->thead || ct == pa->tbody || ct == pa->tfoot ||
+               ct == pa->tr || ct == pa->td || ct == pa->th;
+    }
+    if (pt == pa->thead || pt == pa->tbody || pt == pa->tfoot) {
+        return ct == pa->tr || ct == pa->td || ct == pa->th;
+    }
+    if (pt == pa->tr) {
+        return ct == pa->td || ct == pa->th;
+    }
+    return true;
+}
+
+/* WHATWG HTML5 §13.2.6.1 Foster Parenting insertion into current open element */
+static void insert_node_foster_aware(ArcrHtmlParser *p, ArcrDomNode *cur_parent,
+                                     ArcrDomNode *child) {
+    if (!p || !cur_parent || !child) return;
+    if (p->svg_depth == 0u && p->math_depth == 0u &&
+        is_table_foster_parent(cur_parent, &p->pa) &&
+        !is_allowed_in_table_context(cur_parent, child, &p->pa)) {
+        /* Find nearest open <table> in current template/document scope */
+        ArcrDomNode *table_el = NULL;
+        for (size_t k = p->depth; k > 0u; --k) {
+            ArcrDomNode *sn = p->stack[k - 1u];
+            if (sn->kind == ARCR_NODE_DOCUMENT) break;
+            if (sn->tag == p->pa.table) {
+                table_el = sn;
+                break;
+            }
+        }
+        if (table_el && table_el->parent) {
+            arcr_dom_insert_before(table_el->parent, child, table_el);
+            return;
+        }
+    }
+    arcr_dom_append_child(cur_parent, child);
+}
+
+static bool contains_ascii_nocase(const char *hay, size_t hlen, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0u || hlen < nlen) return false;
+    for (size_t i = 0u; i + nlen <= hlen; ++i) {
+        if (arcr_str_eq_nocase_n(hay + i, nlen, needle, nlen)) return true;
+    }
+    return false;
+}
+
+/* WHATWG HTML5 §13.2.5.52-67 & §13.2.6.4.1 DOCTYPE Quirks Mode determination */
+static ArcrQuirksMode classify_doctype_quirks(const char *s, size_t len) {
+    /* `s[0..len)` is inside `<! ... >` after `<!` */
+    size_t i = 0u;
+    while (i < len && is_space(s[i])) ++i;
+    if (i + 7u > len || !arcr_str_eq_nocase_n(s + i, 7u, "doctype", 7u)) {
+        return ARCR_QUIRKS_FULL_QUIRKS;
+    }
+    i += 7u;
+    if (i < len && !is_space(s[i])) {
+        return ARCR_QUIRKS_FULL_QUIRKS;
+    }
+    while (i < len && is_space(s[i])) ++i;
+    if (i >= len) {
+        return ARCR_QUIRKS_FULL_QUIRKS; /* `<!DOCTYPE>` without name -> quirks */
+    }
+
+    size_t nstart = i;
+    while (i < len && !is_space(s[i])) ++i;
+    size_t nlen = i - nstart;
+    if (!arcr_str_eq_nocase_n(s + nstart, nlen, "html", 4u)) {
+        return ARCR_QUIRKS_FULL_QUIRKS;
+    }
+
+    while (i < len && is_space(s[i])) ++i;
+    if (i >= len) {
+        return ARCR_QUIRKS_NO_QUIRKS; /* Standard `<!DOCTYPE html>` */
+    }
+
+    bool        has_pub = false;
+    bool        has_sys = false;
+    const char *pub_ptr = "";
+    size_t      pub_len = 0u;
+    const char *sys_ptr = "";
+    size_t      sys_len = 0u;
+
+    if (i + 6u <= len && arcr_str_eq_nocase_n(s + i, 6u, "public", 6u)) {
+        has_pub = true;
+        i += 6u;
+        while (i < len && is_space(s[i])) ++i;
+        if (i < len && (s[i] == '"' || s[i] == '\'')) {
+            char q = s[i++];
+            size_t ps = i;
+            while (i < len && s[i] != q) ++i;
+            pub_ptr = s + ps;
+            pub_len = i - ps;
+            if (i < len) ++i;
+        } else {
+            return ARCR_QUIRKS_FULL_QUIRKS;
+        }
+        while (i < len && is_space(s[i])) ++i;
+        if (i < len && (s[i] == '"' || s[i] == '\'')) {
+            has_sys = true;
+            char q = s[i++];
+            size_t ss = i;
+            while (i < len && s[i] != q) ++i;
+            sys_ptr = s + ss;
+            sys_len = i - ss;
+            if (i < len) ++i;
+        }
+    } else if (i + 6u <= len && arcr_str_eq_nocase_n(s + i, 6u, "system", 6u)) {
+        has_sys = true;
+        i += 6u;
+        while (i < len && is_space(s[i])) ++i;
+        if (i < len && (s[i] == '"' || s[i] == '\'')) {
+            char q = s[i++];
+            size_t ss = i;
+            while (i < len && s[i] != q) ++i;
+            sys_ptr = s + ss;
+            sys_len = i - ss;
+            if (i < len) ++i;
+        } else {
+            return ARCR_QUIRKS_FULL_QUIRKS;
+        }
+    } else {
+        /* Bogus token after `<!DOCTYPE html ...` */
+        return ARCR_QUIRKS_FULL_QUIRKS;
+    }
+
+    if (has_sys && arcr_str_eq_nocase_n(
+                       sys_ptr, sys_len,
+                       "http://www.ibm.com/data/dtd/v11/ibmxhtml1-transitional.dtd", 58u)) {
+        return ARCR_QUIRKS_FULL_QUIRKS;
+    }
+
+    if (has_pub) {
+        if (contains_ascii_nocase(pub_ptr, pub_len, "xhtml 1.0 transitional") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "xhtml 1.0 frameset")) {
+            return ARCR_QUIRKS_LIMITED_QUIRKS;
+        }
+        if (contains_ascii_nocase(pub_ptr, pub_len, "html 4.01 transitional") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "html 4.01 frameset")) {
+            return has_sys ? ARCR_QUIRKS_LIMITED_QUIRKS : ARCR_QUIRKS_FULL_QUIRKS;
+        }
+        if (contains_ascii_nocase(pub_ptr, pub_len, "dtd html 2.") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "dtd html 3.") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "dtd html 4.0 ") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "dtd html 4.0/") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "dtd html//") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "+//silmaril//") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "-//microsoft//") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "-//netscape") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "-//ietf//") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "-//softquad") ||
+            contains_ascii_nocase(pub_ptr, pub_len, "-//webtechs//")) {
+            return ARCR_QUIRKS_FULL_QUIRKS;
+        }
+    }
+
+    return ARCR_QUIRKS_NO_QUIRKS;
 }
 
 static void auto_close_implicit_tags(ArcrDomNode **stack, size_t *inout_depth,
@@ -961,52 +1320,59 @@ static void auto_close_implicit_tags(ArcrDomNode **stack, size_t *inout_depth,
                                      ArcrAtom tag_atom) {
     size_t depth = *inout_depth;
 
-    /* 1. Block tags auto-close open <p> */
+    /* 1. Block tags auto-close open <p> in button scope */
     if (closes_open_paragraph(tag_ptr, tag_len)) {
         for (size_t k = depth; k > 1u; --k) {
+            if (stack[k - 1u]->kind == ARCR_NODE_DOCUMENT) break;
             ArcrAtom st = stack[k - 1u]->tag;
             if (st == pa->p) {
                 depth = k - 1u;
                 break;
             }
-            if (st == pa->body || st == pa->td || st == pa->th || st == pa->svg) break;
+            if (st == pa->body || st == pa->table || st == pa->td || st == pa->th ||
+                st == pa->template_tag || st == pa->svg || st == pa->math) {
+                break;
+            }
         }
     }
 
     /* 2. <li> auto-closes open <li> inside same list */
     if (tag_atom == pa->li) {
         for (size_t k = depth; k > 1u; --k) {
+            if (stack[k - 1u]->kind == ARCR_NODE_DOCUMENT) break;
             ArcrAtom st = stack[k - 1u]->tag;
             if (st == pa->li) {
                 depth = k - 1u;
                 break;
             }
-            if (st == pa->ul || st == pa->ol || st == pa->body) break;
+            if (st == pa->ul || st == pa->ol || st == pa->body || st == pa->template_tag) break;
         }
     }
 
     /* 3. <td> / <th> auto-closes open <td> / <th> inside same row */
     if (tag_atom == pa->td || tag_atom == pa->th) {
         for (size_t k = depth; k > 1u; --k) {
+            if (stack[k - 1u]->kind == ARCR_NODE_DOCUMENT) break;
             ArcrAtom st = stack[k - 1u]->tag;
             if (st == pa->td || st == pa->th) {
                 depth = k - 1u;
                 break;
             }
-            if (st == pa->tr || st == pa->table || st == pa->body) break;
+            if (st == pa->tr || st == pa->table || st == pa->body || st == pa->template_tag) break;
         }
     }
 
     /* 4. <tr> auto-closes open <td>, <th>, and sibling <tr> */
     if (tag_atom == pa->tr) {
         for (size_t k = depth; k > 1u; --k) {
+            if (stack[k - 1u]->kind == ARCR_NODE_DOCUMENT) break;
             ArcrAtom st = stack[k - 1u]->tag;
             if (st == pa->tr) {
                 depth = k - 1u;
                 break;
             }
             if (st == pa->thead || st == pa->tbody || st == pa->tfoot ||
-                st == pa->table || st == pa->body) {
+                st == pa->table || st == pa->body || st == pa->template_tag) {
                 break;
             }
         }
@@ -1015,68 +1381,318 @@ static void auto_close_implicit_tags(ArcrDomNode **stack, size_t *inout_depth,
     /* 5. <thead> / <tbody> / <tfoot> auto-closes open cells/rows/sections */
     if (tag_atom == pa->thead || tag_atom == pa->tbody || tag_atom == pa->tfoot) {
         for (size_t k = depth; k > 1u; --k) {
+            if (stack[k - 1u]->kind == ARCR_NODE_DOCUMENT) break;
             ArcrAtom st = stack[k - 1u]->tag;
             if (st == pa->thead || st == pa->tbody || st == pa->tfoot) {
                 depth = k - 1u;
                 break;
             }
-            if (st == pa->table || st == pa->body) break;
+            if (st == pa->table || st == pa->body || st == pa->template_tag) break;
         }
     }
 
     /* 6. <dt> / <dd> and <option> */
     if (tag_atom == pa->dt || tag_atom == pa->dd) {
         for (size_t k = depth; k > 1u; --k) {
+            if (stack[k - 1u]->kind == ARCR_NODE_DOCUMENT) break;
             ArcrAtom st = stack[k - 1u]->tag;
             if (st == pa->dt || st == pa->dd) {
                 depth = k - 1u;
                 break;
             }
-            if (st == pa->dl || st == pa->body) break;
+            if (st == pa->dl || st == pa->body || st == pa->template_tag) break;
         }
     }
-    if (tag_atom == pa->option && depth > 1u && stack[depth - 1u]->tag == pa->option) {
+    if (tag_atom == pa->option && depth > 1u &&
+        stack[depth - 1u]->kind == ARCR_NODE_ELEMENT &&
+        stack[depth - 1u]->tag == pa->option) {
         --depth;
     }
 
     *inout_depth = depth;
 }
 
-static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
-                            const char *utf8_html, size_t len, bool is_fragment) {
-    HtmlParseAtoms pa;
-    init_parse_atoms(doc->atoms, &pa);
+static void handle_close_tag(ArcrHtmlParser *p, ArcrAtom close_atom) {
+    ArcrDocument *doc = p->doc;
 
-    size_t        stack_cap = ARCR_HTML_INIT_STACK_CAP;
-    ArcrDomNode **stack     = (ArcrDomNode **)malloc(stack_cap * sizeof(ArcrDomNode *));
-    if (!stack) return;
+    /* Closing </template>: pop inert template_content fragment and <template> element */
+    if (p->svg_depth == 0u && p->math_depth == 0u && close_atom == p->pa.template_tag) {
+        for (size_t k = p->depth; k > 1u; --k) {
+            if (p->stack[k - 1u]->kind == ARCR_NODE_ELEMENT &&
+                p->stack[k - 1u]->tag == p->pa.template_tag) {
+                p->depth = k - 1u;
+                if (p->template_depth > 0u) --p->template_depth;
+                p->svg_depth  = count_open_tag_depth(p->stack, p->depth, p->pa.svg);
+                p->math_depth = count_open_tag_depth(p->stack, p->depth, p->pa.math);
+                return;
+            }
+        }
+        return;
+    }
 
-    size_t depth   = 0u;
-    stack[depth++] = root_container;
+    /* Search stack up to current scope boundary */
+    size_t match_idx = (size_t)-1;
+    for (size_t k = p->depth; k > 1u; --k) {
+        ArcrDomNode *sn = p->stack[k - 1u];
+        if (sn->kind == ARCR_NODE_DOCUMENT) break; /* Never pop across <template> fragment! */
+        if (sn->tag == close_atom) {
+            match_idx = k - 1u;
+            break;
+        }
+        if (p->svg_depth == 0u && p->math_depth == 0u &&
+            close_atom != p->pa.table && close_atom != p->pa.tr &&
+            close_atom != p->pa.td && close_atom != p->pa.th &&
+            close_atom != p->pa.tbody && close_atom != p->pa.thead &&
+            close_atom != p->pa.tfoot &&
+            (sn->tag == p->pa.table || sn->tag == p->pa.td || sn->tag == p->pa.th)) {
+            /* Do not pop across table/cell scoping boundaries for unrelated close tags */
+            break;
+        }
+    }
+    if (match_idx == (size_t)-1) return;
 
-    size_t svg_depth = 0u;
-    for (const ArcrDomNode *anc = root_container; anc != NULL; anc = anc->parent) {
-        if (anc->kind == ARCR_NODE_ELEMENT && anc->tag == pa.svg) {
-            ++svg_depth;
+    ArcrDomNode *closed_el = p->stack[match_idx];
+
+    /*
+     * Misnested Formatting Element Recovery (WHATWG Adoption Agency core):
+     * e.g. `<b><i>bold-italic</b>italic</i>` -> close `<i>` & `<b>` and reopen a cloned `<i>`
+     * so trailing `"italic"` remains italicized without corrupting sibling hierarchy!
+     */
+    if (p->svg_depth == 0u && p->math_depth == 0u &&
+        match_idx + 1u < p->depth && is_formatting_node(doc, closed_el)) {
+        bool all_fmt_above    = true;
+        size_t furthest_block = (size_t)-1;
+        for (size_t m = match_idx + 1u; m < p->depth; ++m) {
+            if (is_scope_boundary_node(p->stack[m], &p->pa)) {
+                all_fmt_above  = false;
+                furthest_block = (size_t)-1;
+                break;
+            }
+            if (!is_formatting_node(doc, p->stack[m])) {
+                all_fmt_above = false;
+                if (furthest_block == (size_t)-1) furthest_block = m;
+            }
+        }
+
+        if (all_fmt_above) {
+            size_t count_above = p->depth - (match_idx + 1u);
+            if (count_above <= 8u) {
+                ArcrDomNode *to_reopen[8];
+                for (size_t m = 0u; m < count_above; ++m) {
+                    to_reopen[m] = p->stack[match_idx + 1u + m];
+                }
+                p->depth = match_idx;
+                for (size_t m = 0u; m < count_above; ++m) {
+                    ArcrDomNode *reopened = clone_element_shallow(doc, to_reopen[m]);
+                    if (reopened) {
+                        insert_node_foster_aware(p, p->stack[p->depth - 1u], reopened);
+                        (void)push_open_element(&p->stack, &p->stack_cap, &p->depth, reopened);
+                    }
+                }
+                return;
+            }
+        } else if (furthest_block != (size_t)-1 && closed_el->parent) {
+            /* `<b><div>bold-div</b>after</div>` adoption agency reparenting */
+            ArcrDomNode *fb       = p->stack[furthest_block];
+            ArcrDomNode *fmt_copy = clone_element_shallow(doc, closed_el);
+            if (fmt_copy) {
+                while (fb->first_child) {
+                    ArcrDomNode *ch = fb->first_child;
+                    arcr_dom_append_child(fmt_copy, ch);
+                }
+                arcr_dom_append_child(fb, fmt_copy);
+                arcr_dom_insert_before(closed_el->parent, fb, closed_el->next_sibling);
+                for (size_t m = match_idx; m + 1u < p->depth; ++m) {
+                    p->stack[m] = p->stack[m + 1u];
+                }
+                p->depth--;
+                return;
+            }
         }
     }
 
-    ArcrDomNode *html_el = NULL;
-    ArcrDomNode *body_el = NULL;
+    if (p->is_fragment || (close_atom != p->pa.html && close_atom != p->pa.body)) {
+        p->depth = match_idx;
+    }
 
-    size_t i = 0u;
-    while (i < len) {
+    if (p->svg_depth > 0u) {
+        size_t new_svg_depth = count_open_tag_depth(p->stack, p->depth, p->pa.svg);
+        if (new_svg_depth == 0u && closed_el->tag == p->pa.svg) {
+            if (closed_el == p->svg_open_node && p->pos >= p->svg_open_offset) {
+                size_t raw_svg_len       = p->pos - p->svg_open_offset;
+                closed_el->raw_svg_markup = arcr_arena_strdup(&doc->arena,
+                                                              p->buf + p->svg_open_offset,
+                                                              raw_svg_len);
+                closed_el->raw_svg_len    = raw_svg_len;
+            }
+            p->svg_open_node = NULL;
+            if (p->template_depth == 0u) {
+                rasterize_inline_svg_element(doc, closed_el);
+            }
+        }
+        p->svg_depth = new_svg_depth;
+    }
+    if (p->math_depth > 0u) {
+        p->math_depth = count_open_tag_depth(p->stack, p->depth, p->pa.math);
+    }
+}
+
+static void finalize_parser_eof(ArcrHtmlParser *p) {
+    if (!p || p->done) return;
+    p->done = true;
+    ArcrDocument *doc = p->doc;
+
+    /* Recover any unclosed top-level <svg> at EOF */
+    if (p->svg_depth > 0u && p->template_depth == 0u) {
+        for (size_t k = 1u; k < p->depth; ++k) {
+            if (p->stack[k]->kind == ARCR_NODE_ELEMENT && p->stack[k]->tag == p->pa.svg) {
+                rasterize_inline_svg_element(doc, p->stack[k]);
+                break;
+            }
+        }
+    }
+
+    if (!p->is_fragment && !p->seen_doctype) {
+        doc->quirks_mode = ARCR_QUIRKS_FULL_QUIRKS;
+        p->seen_doctype  = true;
+    }
+
+    if (!p->is_fragment && !doc->body) {
+        if (!p->html_el) {
+            p->html_el = arcr_dom_create_element(doc, "html", 4u);
+            if (p->html_el) arcr_dom_append_child(doc->root, p->html_el);
+        }
+        if (p->html_el) {
+            p->body_el = arcr_dom_create_element(doc, "body", 4u);
+            doc->body  = p->body_el;
+            if (p->body_el) arcr_dom_append_child(p->html_el, p->body_el);
+        }
+    }
+}
+
+static ArcrHtmlParser *create_parser_internal(ArcrDocument *doc, ArcrDomNode *root_container,
+                                              const char *utf8_html, size_t len,
+                                              bool scripting_enabled, bool pauses_enabled,
+                                              bool is_fragment) {
+    if (!doc || !root_container) return NULL;
+    ArcrHtmlParser *p = (ArcrHtmlParser *)calloc(1u, sizeof(ArcrHtmlParser));
+    if (!p) return NULL;
+
+    p->doc               = doc;
+    p->scripting_enabled = scripting_enabled;
+    p->pauses_enabled    = pauses_enabled;
+    p->is_fragment       = is_fragment;
+    init_parse_atoms(doc->atoms, &p->pa);
+
+    size_t init_cap = len + 1u;
+    if (init_cap < 64u) init_cap = 64u;
+    p->buf = (char *)malloc(init_cap);
+    if (!p->buf) {
+        free(p);
+        return NULL;
+    }
+    if (utf8_html && len > 0u) {
+        memcpy(p->buf, utf8_html, len);
+    }
+    p->buf[len]     = '\0';
+    p->len          = len;
+    p->cap          = init_cap;
+    p->pos          = 0u;
+    p->write_cursor = 0u;
+
+    p->stack_cap = ARCR_HTML_INIT_STACK_CAP;
+    p->stack     = (ArcrDomNode **)malloc(p->stack_cap * sizeof(ArcrDomNode *));
+    if (!p->stack) {
+        free(p->buf);
+        free(p);
+        return NULL;
+    }
+    p->stack[p->depth++] = root_container;
+
+    for (const ArcrDomNode *anc = root_container; anc != NULL; anc = anc->parent) {
+        if (anc->kind == ARCR_NODE_ELEMENT) {
+            if (anc->tag == p->pa.svg)  ++p->svg_depth;
+            if (anc->tag == p->pa.math) ++p->math_depth;
+        }
+    }
+    return p;
+}
+
+ArcrHtmlParser *arcr_html_parser_begin(ArcrAtomTable *atoms, const char *utf8_html,
+                                       size_t len, bool scripting_enabled) {
+    ArcrDocument *doc = arcr_dom_document_create(atoms);
+    if (!doc) return NULL;
+    ArcrHtmlParser *p = create_parser_internal(doc, doc->root,
+                                               utf8_html ? utf8_html : "",
+                                               utf8_html ? len : 0u,
+                                               scripting_enabled, true, false);
+    if (!p) {
+        arcr_dom_document_destroy(doc);
+        return NULL;
+    }
+    return p;
+}
+
+ArcrDocument *arcr_html_parser_document(ArcrHtmlParser *parser) {
+    return parser ? parser->doc : NULL;
+}
+
+bool arcr_html_parser_document_write(ArcrHtmlParser *parser,
+                                     const char *utf8_chunk, size_t chunk_len) {
+    if (!parser || parser->done) return false;
+    if (!utf8_chunk || chunk_len == 0u) return true;
+    if (chunk_len > ARCR_HTML_MAX_WRITE_BYTES ||
+        parser->written_total + chunk_len > ARCR_HTML_MAX_WRITE_BYTES) {
+        return false;
+    }
+
+    size_t insert_at = parser->write_cursor;
+    if (insert_at < parser->pos) insert_at = parser->pos;
+    if (insert_at > parser->len) insert_at = parser->len;
+
+    size_t needed = parser->len + chunk_len + 1u;
+    if (needed > parser->cap) {
+        size_t ncap = parser->cap * 2u;
+        while (ncap < needed) ncap *= 2u;
+        char *nbuf = (char *)realloc(parser->buf, ncap);
+        if (!nbuf) return false;
+        parser->buf = nbuf;
+        parser->cap = ncap;
+    }
+
+    memmove(parser->buf + insert_at + chunk_len,
+            parser->buf + insert_at,
+            parser->len - insert_at);
+    memcpy(parser->buf + insert_at, utf8_chunk, chunk_len);
+    parser->len           += chunk_len;
+    parser->buf[parser->len] = '\0';
+    parser->write_cursor   = insert_at + chunk_len;
+    parser->written_total += chunk_len;
+    return true;
+}
+
+ArcrHtmlPauseReason arcr_html_parser_resume(ArcrHtmlParser *p, ArcrDomNode **out_node) {
+    if (out_node) *out_node = NULL;
+    if (!p || p->done) return ARCR_HTML_PARSE_DONE;
+
+    ArcrDocument *doc = p->doc;
+
+    while (p->pos < p->len) {
+        const char *utf8_html = p->buf;
+        size_t      len       = p->len;
+        size_t      i         = p->pos;
+
         if (utf8_html[i] == '<') {
-            /* 1a. CDATA Section <![CDATA[ ... ]]> (common inside inline <svg>) */
+            /* 1a. CDATA Section <![CDATA[ ... ]]> (foreign content SVG/MathML) */
             if (i + 9u <= len && memcmp(utf8_html + i, "<![CDATA[", 9u) == 0) {
                 size_t cstart = i + 9u;
                 size_t j      = cstart;
                 while (j + 3u <= len && memcmp(utf8_html + j, "]]>", 3u) != 0) ++j;
-                if (j > cstart && depth > 0u) {
+                if (j > cstart && p->depth > 0u) {
                     ArcrDomNode *tn = arcr_dom_create_text(doc, utf8_html + cstart, j - cstart);
-                    if (tn) arcr_dom_append_child(stack[depth - 1u], tn);
+                    if (tn) insert_node_foster_aware(p, p->stack[p->depth - 1u], tn);
                 }
-                i = (j + 3u <= len) ? (j + 3u) : len;
+                p->pos = (j + 3u <= len) ? (j + 3u) : len;
                 continue;
             }
 
@@ -1084,11 +1700,11 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
             if (i + 4u <= len && memcmp(utf8_html + i, "<!--", 4u) == 0) {
                 size_t j = i + 4u;
                 if (j < len && utf8_html[j] == '>') {
-                    i = j + 1u;
+                    p->pos = j + 1u;
                     continue;
                 }
                 if (j + 1u < len && utf8_html[j] == '-' && utf8_html[j + 1u] == '>') {
-                    i = j + 2u;
+                    p->pos = j + 2u;
                     continue;
                 }
                 while (j < len) {
@@ -1102,7 +1718,7 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
                     }
                     ++j;
                 }
-                i = j;
+                p->pos = j;
                 continue;
             }
 
@@ -1110,21 +1726,24 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
             if (i + 2u <= len && (utf8_html[i + 1u] == '!' || utf8_html[i + 1u] == '?')) {
                 size_t j = i + 2u;
                 while (j < len && utf8_html[j] != '>') ++j;
-                i = (j < len) ? (j + 1u) : len;
+                if (!p->is_fragment && !p->seen_doctype && utf8_html[i + 1u] == '!') {
+                    doc->quirks_mode = classify_doctype_quirks(utf8_html + i + 2u, j - (i + 2u));
+                    p->seen_doctype  = true;
+                }
+                p->pos = (j < len) ? (j + 1u) : len;
                 continue;
             }
 
             /* 3. Closing tag </tag> (or bogus close tag `</>` / `</123>`) */
             if (i + 2u < len && utf8_html[i + 1u] == '/') {
                 if (utf8_html[i + 2u] == '>') {
-                    i += 3u;
+                    p->pos = i + 3u;
                     continue;
                 }
                 if (!is_ascii_alpha(utf8_html[i + 2u])) {
-                    /* WHATWG bogus comment state: skip up to '>' */
                     size_t j = i + 2u;
                     while (j < len && utf8_html[j] != '>') ++j;
-                    i = (j < len) ? (j + 1u) : len;
+                    p->pos = (j < len) ? (j + 1u) : len;
                     continue;
                 }
 
@@ -1133,100 +1752,103 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
                 while (j < len && is_tag_char(utf8_html[j])) ++j;
                 size_t tend = j;
                 while (j < len && utf8_html[j] != '>') ++j;
-                i = (j < len) ? (j + 1u) : len;
+                p->pos = (j < len) ? (j + 1u) : len;
 
                 if (tend > tstart) {
                     ArcrAtom close_atom = arcr_atom_intern_lower(
                         doc->atoms, utf8_html + tstart, tend - tstart);
-                    for (size_t k = depth; k > 1u; --k) {
-                        if (stack[k - 1u]->tag == close_atom) {
-                            ArcrDomNode *closed_el = stack[k - 1u];
-                            if (is_fragment || (close_atom != pa.html && close_atom != pa.body)) {
-                                depth = k - 1u;
-                            }
-                            if (svg_depth > 0u) {
-                                size_t new_svg_depth = count_open_svg_depth(stack, depth, pa.svg);
-                                if (svg_depth > 0u && new_svg_depth == 0u &&
-                                    closed_el->tag == pa.svg) {
-                                    rasterize_inline_svg_element(doc, closed_el);
-                                }
-                                svg_depth = new_svg_depth;
-                            }
-                            break;
-                        }
-                    }
+                    handle_close_tag(p, close_atom);
                 }
                 continue;
             }
 
             /* 4. Opening tag <tag attr="val"> (MUST start with ASCII letter per HTML5 spec!) */
             if (i + 1u < len && is_ascii_alpha(utf8_html[i + 1u])) {
-                size_t j      = i + 1u;
-                size_t tstart = j;
+                size_t tag_lt_pos = i;
+                size_t j          = i + 1u;
+                size_t tstart     = j;
                 while (j < len && is_tag_char(utf8_html[j])) ++j;
                 const char *tag_ptr = utf8_html + tstart;
                 size_t      tag_len = j - tstart;
 
+                if (!p->is_fragment && !p->seen_doctype) {
+                    doc->quirks_mode = ARCR_QUIRKS_FULL_QUIRKS;
+                    p->seen_doctype  = true;
+                }
+
                 /*
-                 * <noscript>...</noscript>: skip raw inner markup when JS engine is active so
-                 * `<noscript><style>body{display:none}</style></noscript>` NEVER hides the page!
+                 * <noscript>...</noscript>: when scripting_enabled is true, parse inner
+                 * markup as rawtext/ignored so fallback DOM/styles never execute or match!
                  */
-                if (svg_depth == 0u && arcr_str_eq_nocase_n(tag_ptr, tag_len, "noscript", 8u)) {
+                if (p->scripting_enabled && p->svg_depth == 0u && p->math_depth == 0u &&
+                    arcr_str_eq_nocase_n(tag_ptr, tag_len, "noscript", 8u)) {
                     while (j < len && utf8_html[j] != '>') ++j;
                     bool self_close_ns = (j > i + 1u && j < len && utf8_html[j - 1u] == '/');
-                    i = (j < len) ? (j + 1u) : len;
+                    size_t after_open  = (j < len) ? (j + 1u) : len;
                     if (!self_close_ns) {
-                        size_t ns_end = find_raw_end_tag(utf8_html, len, i, "noscript", 8u);
+                        size_t ns_end = find_raw_end_tag(utf8_html, len, after_open, "noscript", 8u);
                         size_t gt     = ns_end;
                         while (gt < len && utf8_html[gt] != '>') ++gt;
-                        i = (gt < len) ? (gt + 1u) : len;
+                        p->pos = (gt < len) ? (gt + 1u) : len;
+                    } else {
+                        p->pos = after_open;
                     }
                     continue;
                 }
 
                 ArcrAtom tag_atom = arcr_atom_intern_lower(doc->atoms, tag_ptr, tag_len);
-                if (svg_depth == 0u) {
-                    auto_close_implicit_tags(stack, &depth, &pa, tag_ptr, tag_len, tag_atom);
+                bool in_foreign   = (p->svg_depth > 0u || p->math_depth > 0u);
+                bool in_template  = (p->template_depth > 0u);
+
+                if (!in_foreign) {
+                    auto_close_implicit_tags(p->stack, &p->depth, &p->pa,
+                                             tag_ptr, tag_len, tag_atom);
                 }
 
-                if (!is_fragment && svg_depth == 0u) {
-                    if (!html_el && tag_atom != pa.html) {
-                        html_el = arcr_dom_create_element(doc, "html", 4u);
-                        arcr_dom_append_child(doc->root, html_el);
-                        (void)push_open_element(&stack, &stack_cap, &depth, html_el);
+                if (!p->is_fragment && !in_foreign && !in_template) {
+                    if (!p->html_el && tag_atom != p->pa.html) {
+                        p->html_el = arcr_dom_create_element(doc, "html", 4u);
+                        arcr_dom_append_child(doc->root, p->html_el);
+                        (void)push_open_element(&p->stack, &p->stack_cap, &p->depth, p->html_el);
                     }
-                    if (!body_el && tag_atom != pa.html && tag_atom != pa.head &&
+                    if (!p->body_el && tag_atom != p->pa.html && tag_atom != p->pa.head &&
+                        tag_atom != p->pa.template_tag &&
                         !arcr_str_eq_nocase_n(tag_ptr, tag_len, "meta", 4u) &&
                         !arcr_str_eq_nocase_n(tag_ptr, tag_len, "title", 5u) &&
                         !arcr_str_eq_nocase_n(tag_ptr, tag_len, "style", 5u) &&
                         !arcr_str_eq_nocase_n(tag_ptr, tag_len, "link", 4u) &&
                         !arcr_str_eq_nocase_n(tag_ptr, tag_len, "base", 4u) &&
-                        !(depth > 1u && stack[depth - 1u]->tag == pa.head &&
-                          arcr_str_eq_nocase_n(tag_ptr, tag_len, "script", 6u))) {
-                        if (depth > 1u && stack[depth - 1u]->tag == pa.head) {
-                            --depth;
+                        !arcr_str_eq_nocase_n(tag_ptr, tag_len, "noscript", 8u) &&
+                        !(p->depth > 1u && p->stack[p->depth - 1u]->tag == p->pa.head &&
+                          tag_atom == p->pa.script)) {
+                        if (p->depth > 1u && p->stack[p->depth - 1u]->tag == p->pa.head) {
+                            --p->depth;
                         }
-                        if (tag_atom != pa.body) {
-                            body_el   = arcr_dom_create_element(doc, "body", 4u);
-                            doc->body = body_el;
-                            arcr_dom_append_child(html_el, body_el);
-                            (void)push_open_element(&stack, &stack_cap, &depth, body_el);
+                        if (tag_atom != p->pa.body) {
+                            p->body_el = arcr_dom_create_element(doc, "body", 4u);
+                            doc->body  = p->body_el;
+                            arcr_dom_append_child(p->html_el, p->body_el);
+                            (void)push_open_element(&p->stack, &p->stack_cap, &p->depth, p->body_el);
                         }
                     }
                 }
 
                 ArcrDomNode *elem = NULL;
-                if (!is_fragment && svg_depth == 0u && tag_atom == pa.html && html_el) {
-                    elem = html_el;
-                } else if (!is_fragment && svg_depth == 0u && tag_atom == pa.body && body_el) {
-                    elem = body_el;
+                if (!p->is_fragment && !in_foreign && !in_template &&
+                    tag_atom == p->pa.html && p->html_el) {
+                    elem = p->html_el;
+                } else if (!p->is_fragment && !in_foreign && !in_template &&
+                           tag_atom == p->pa.body && p->body_el) {
+                    elem = p->body_el;
                 } else {
                     elem = arcr_dom_create_element(doc, tag_ptr, tag_len);
-                    arcr_dom_append_child(stack[depth - 1u], elem);
-                    if (!is_fragment && svg_depth == 0u && tag_atom == pa.html) html_el = elem;
-                    if (!is_fragment && svg_depth == 0u && tag_atom == pa.body) {
-                        body_el   = elem;
-                        doc->body = elem;
+                    insert_node_foster_aware(p, p->stack[p->depth - 1u], elem);
+                    if (!p->is_fragment && !in_foreign && !in_template && tag_atom == p->pa.html) {
+                        p->html_el = elem;
+                    }
+                    if (!p->is_fragment && !in_foreign && !in_template && tag_atom == p->pa.body) {
+                        p->body_el = elem;
+                        doc->body  = elem;
                     }
                 }
 
@@ -1301,26 +1923,45 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
                         ++j;
                     }
                 }
-                i = j;
+                p->pos = j;
 
-                finalize_opened_element(doc, elem, tag_ptr, tag_len, svg_depth);
+                /* Note: in HTML (outside SVG/MathML), `/>` on non-void tags is NOT self-closing! */
+                bool effective_self_close = self_closing &&
+                                            (in_foreign || tag_atom == p->pa.svg ||
+                                             tag_atom == p->pa.math ||
+                                             is_void_element(tag_ptr, tag_len));
+
+                finalize_opened_element(doc, elem, tag_ptr, tag_len, p->svg_depth, in_template);
+
+                /* Optional stylesheet barrier for <link rel="stylesheet" href="..."> */
+                if (p->pauses_enabled && !in_foreign && !in_template && elem &&
+                    arcr_str_eq_nocase_n(tag_ptr, tag_len, "link", 4u)) {
+                    const char *rel  = arcr_dom_get_attr_cstr(doc, elem, "rel");
+                    const char *href = arcr_dom_get_attr_cstr(doc, elem, "href");
+                    if (rel_contains_stylesheet(rel) && href && href[0] != '\0') {
+                        p->write_cursor = p->pos;
+                        if (out_node) *out_node = elem;
+                        return ARCR_HTML_PARSE_PAUSE_STYLE;
+                    }
+                }
 
                 /* Raw/RCDATA text elements: <style>, <script>, <title>, <textarea> */
-                bool is_style    = arcr_str_eq_nocase_n(tag_ptr, tag_len, "style", 5u);
-                bool is_script   = arcr_str_eq_nocase_n(tag_ptr, tag_len, "script", 6u);
+                bool is_style    = (tag_atom == p->pa.style);
+                bool is_script   = (tag_atom == p->pa.script);
                 bool is_title    = arcr_str_eq_nocase_n(tag_ptr, tag_len, "title", 5u);
-                bool is_textarea = (svg_depth == 0u) &&
+                bool is_textarea = !in_foreign &&
                                    arcr_str_eq_nocase_n(tag_ptr, tag_len, "textarea", 8u);
 
-                if (!self_closing && (is_style || is_script || is_title || is_textarea)) {
-                    size_t raw_end = is_script
-                                         ? find_script_end_tag(utf8_html, len, i)
-                                         : find_raw_end_tag(utf8_html, len, i, tag_ptr, tag_len);
-                    const char *raw_ptr = utf8_html + i;
-                    size_t      raw_len = raw_end - i;
+                if (!effective_self_close && (is_style || is_script || is_title || is_textarea)) {
+                    size_t raw_start = p->pos;
+                    size_t raw_end   = is_script
+                                           ? find_script_end_tag(utf8_html, len, raw_start)
+                                           : find_raw_end_tag(utf8_html, len, raw_start, tag_ptr, tag_len);
+                    const char *raw_ptr = utf8_html + raw_start;
+                    size_t      raw_len = raw_end - raw_start;
 
                     if (is_style && raw_len > 0u) {
-                        if (svg_depth == 0u) {
+                        if (!in_foreign && !in_template) {
                             arcr_dom_append_style_block(doc, raw_ptr, raw_len);
                         }
                         if (elem) {
@@ -1335,7 +1976,8 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
                             const char *tv = tbuf;
                             size_t      tl = dlen;
                             arcr_str_trim_view(&tv, &tl);
-                            if (svg_depth == 0u && !is_fragment) {
+                            if ((!doc->title || doc->title[0] == '\0') &&
+                                !in_foreign && !in_template && !p->is_fragment) {
                                 doc->title = arcr_arena_strdup(&doc->arena, tv, tl);
                             }
                             if (elem) {
@@ -1363,20 +2005,53 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
 
                     size_t close_gt = raw_end;
                     while (close_gt < len && utf8_html[close_gt] != '>') ++close_gt;
-                    i = (close_gt < len) ? (close_gt + 1u) : len;
+                    p->pos = (close_gt < len) ? (close_gt + 1u) : len;
+
+                    if (is_script && p->pauses_enabled && p->scripting_enabled &&
+                        !in_foreign && !in_template && elem) {
+                        p->write_cursor = p->pos;
+                        if (out_node) *out_node = elem;
+                        return ARCR_HTML_PARSE_PAUSE_SCRIPT;
+                    }
                     continue;
                 }
 
-                if (tag_atom == pa.svg && self_closing && svg_depth == 0u && elem) {
-                    rasterize_inline_svg_element(doc, elem);
+                if (tag_atom == p->pa.svg && effective_self_close && p->svg_depth == 0u && elem) {
+                    size_t raw_svg_len   = p->pos - tag_lt_pos;
+                    elem->raw_svg_markup = arcr_arena_strdup(&doc->arena,
+                                                             utf8_html + tag_lt_pos,
+                                                             raw_svg_len);
+                    elem->raw_svg_len    = raw_svg_len;
+                    if (!in_template) {
+                        rasterize_inline_svg_element(doc, elem);
+                    }
                     continue;
                 }
 
-                bool is_void = (svg_depth == 0u) && is_void_element(tag_ptr, tag_len);
-                if (!self_closing && !is_void && elem && stack[depth - 1u] != elem) {
-                    if (push_open_element(&stack, &stack_cap, &depth, elem)) {
-                        if (tag_atom == pa.svg) {
-                            ++svg_depth;
+                /* <template>: push <template> AND its inert template_content fragment */
+                if (!in_foreign && tag_atom == p->pa.template_tag && elem && elem->template_content) {
+                    if (push_open_element(&p->stack, &p->stack_cap, &p->depth, elem)) {
+                        if (push_open_element(&p->stack, &p->stack_cap, &p->depth,
+                                              elem->template_content)) {
+                            ++p->template_depth;
+                        } else {
+                            --p->depth;
+                        }
+                    }
+                    continue;
+                }
+
+                bool is_void = !in_foreign && is_void_element(tag_ptr, tag_len);
+                if (!effective_self_close && !is_void && elem && p->stack[p->depth - 1u] != elem) {
+                    if (push_open_element(&p->stack, &p->stack_cap, &p->depth, elem)) {
+                        if (tag_atom == p->pa.svg) {
+                            if (p->svg_depth == 0u) {
+                                p->svg_open_node   = elem;
+                                p->svg_open_offset = tag_lt_pos;
+                            }
+                            ++p->svg_depth;
+                        } else if (tag_atom == p->pa.math) {
+                            ++p->math_depth;
                         }
                     }
                 }
@@ -1384,12 +2059,7 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
             }
         }
 
-        /*
-         * 5. Character data / Text node:
-         * Note: if `utf8_html[i] == '<'` reached here (e.g. `x < 0`, `a<-b`, or trailing `"</"`
-         * at EOF), it is NOT a valid tag/comment/declaration, so consume `'<'` as literal text
-         * and guarantee `i` strictly advances!
-         */
+        /* 5. Character data / Text node */
         size_t tstart = i;
         if (utf8_html[i] == '<') {
             ++i;
@@ -1406,9 +2076,10 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
         }
         size_t raw_len = i - tstart;
         if (raw_len == 0u) {
-            ++i;
+            p->pos = i + 1u;
             continue;
         }
+        p->pos = i;
 
         bool all_ws = true;
         for (size_t k = 0u; k < raw_len; ++k) {
@@ -1417,97 +2088,123 @@ static void parse_html_core(ArcrDocument *doc, ArcrDomNode *root_container,
                 break;
             }
         }
-        ArcrDomNode *cur_parent = stack[depth - 1u];
+
+        if (!all_ws && !p->is_fragment && !p->seen_doctype) {
+            doc->quirks_mode = ARCR_QUIRKS_FULL_QUIRKS;
+            p->seen_doctype  = true;
+        }
+
+        ArcrDomNode *cur_parent = p->stack[p->depth - 1u];
         bool in_pre = false;
-        for (size_t k = depth; k > 0u; --k) {
-            if (stack[k - 1u]->tag == pa.pre) {
+        for (size_t k = p->depth; k > 0u; --k) {
+            if (p->stack[k - 1u]->kind == ARCR_NODE_DOCUMENT) break;
+            if (p->stack[k - 1u]->tag == p->pa.pre) {
                 in_pre = true;
                 break;
             }
         }
         for (const ArcrDomNode *anc = cur_parent; anc != NULL && !in_pre; anc = anc->parent) {
-            if (anc->tag == pa.pre) {
+            if (anc->tag == p->pa.pre) {
                 in_pre = true;
                 break;
             }
         }
 
         if (all_ws && !in_pre) {
-            if (svg_depth > 0u || !cur_parent->first_child ||
-                (!is_fragment && (cur_parent == doc->root || cur_parent == html_el ||
-                                  cur_parent->tag == pa.head)) ||
-                cur_parent->tag == pa.table || cur_parent->tag == pa.thead ||
-                cur_parent->tag == pa.tbody || cur_parent->tag == pa.tfoot ||
-                cur_parent->tag == pa.tr || cur_parent->tag == pa.ul ||
-                cur_parent->tag == pa.ol) {
+            if (p->svg_depth > 0u || p->math_depth > 0u || !cur_parent->first_child ||
+                (!p->is_fragment && p->template_depth == 0u &&
+                 (cur_parent == doc->root || cur_parent == p->html_el ||
+                  cur_parent->tag == p->pa.head)) ||
+                cur_parent->tag == p->pa.table || cur_parent->tag == p->pa.thead ||
+                cur_parent->tag == p->pa.tbody || cur_parent->tag == p->pa.tfoot ||
+                cur_parent->tag == p->pa.tr || cur_parent->tag == p->pa.ul ||
+                cur_parent->tag == p->pa.ol) {
                 continue;
             }
         }
 
-        if (!is_fragment && svg_depth == 0u && !body_el) {
-            if (!html_el) {
-                html_el = arcr_dom_create_element(doc, "html", 4u);
-                arcr_dom_append_child(doc->root, html_el);
-                (void)push_open_element(&stack, &stack_cap, &depth, html_el);
+        if (!p->is_fragment && p->svg_depth == 0u && p->math_depth == 0u &&
+            p->template_depth == 0u && !p->body_el) {
+            if (!p->html_el) {
+                p->html_el = arcr_dom_create_element(doc, "html", 4u);
+                arcr_dom_append_child(doc->root, p->html_el);
+                (void)push_open_element(&p->stack, &p->stack_cap, &p->depth, p->html_el);
             }
-            body_el   = arcr_dom_create_element(doc, "body", 4u);
-            doc->body = body_el;
-            arcr_dom_append_child(html_el, body_el);
-            (void)push_open_element(&stack, &stack_cap, &depth, body_el);
-            cur_parent = body_el;
+            if (p->depth > 1u && p->stack[p->depth - 1u]->tag == p->pa.head) {
+                --p->depth;
+            }
+            p->body_el = arcr_dom_create_element(doc, "body", 4u);
+            doc->body  = p->body_el;
+            arcr_dom_append_child(p->html_el, p->body_el);
+            (void)push_open_element(&p->stack, &p->stack_cap, &p->depth, p->body_el);
+            cur_parent = p->body_el;
         }
 
         size_t decoded_len = decode_and_collapse_text(utf8_html + tstart, raw_len, NULL, !in_pre);
         if (decoded_len > 0u) {
-            char *buf = (char *)arcr_arena_alloc(&doc->arena, decoded_len + 1u, 1u);
-            if (buf) {
-                decode_and_collapse_text(utf8_html + tstart, raw_len, buf, !in_pre);
-                ArcrDomNode *tn = arcr_dom_create_text(doc, buf, decoded_len);
+            char *tbuf = (char *)arcr_arena_alloc(&doc->arena, decoded_len + 1u, 1u);
+            if (tbuf) {
+                decode_and_collapse_text(utf8_html + tstart, raw_len, tbuf, !in_pre);
+                ArcrDomNode *tn = arcr_dom_create_text(doc, tbuf, decoded_len);
                 if (tn) {
-                    arcr_dom_append_child(cur_parent, tn);
+                    insert_node_foster_aware(p, cur_parent, tn);
                 }
             }
         }
     }
 
-    /* Recover any unclosed top-level <svg> at EOF */
-    if (svg_depth > 0u) {
-        for (size_t k = 1u; k < depth; ++k) {
-            if (stack[k]->tag == pa.svg) {
-                rasterize_inline_svg_element(doc, stack[k]);
-                break;
-            }
-        }
-    }
+    finalize_parser_eof(p);
+    return ARCR_HTML_PARSE_DONE;
+}
 
-    free(stack);
-
-    if (!is_fragment && !doc->body) {
-        if (!html_el) {
-            html_el = arcr_dom_create_element(doc, "html", 4u);
-            if (html_el) arcr_dom_append_child(doc->root, html_el);
-        }
-        if (html_el) {
-            body_el   = arcr_dom_create_element(doc, "body", 4u);
-            doc->body = body_el;
-            if (body_el) arcr_dom_append_child(html_el, body_el);
-        }
+ArcrDocument *arcr_html_parser_finish(ArcrHtmlParser *parser) {
+    if (!parser) return NULL;
+    if (!parser->done) {
+        finalize_parser_eof(parser);
     }
+    ArcrDocument *doc = parser->doc;
+    if (doc && !parser->is_fragment) {
+        doc->dom_dirty = false;
+    }
+    free(parser->stack);
+    free(parser->buf);
+    free(parser);
+    return doc;
 }
 
 ArcrDocument *arcr_html_parse(ArcrAtomTable *atoms, const char *utf8_html, size_t len) {
     ArcrDocument *doc = arcr_dom_document_create(atoms);
     if (!doc) return NULL;
-    parse_html_core(doc, doc->root, utf8_html ? utf8_html : "", utf8_html ? len : 0u, false);
-    doc->dom_dirty = false;
-    return doc;
+    ArcrHtmlParser *p = create_parser_internal(doc, doc->root,
+                                               utf8_html ? utf8_html : "",
+                                               utf8_html ? len : 0u,
+                                               true, false, false);
+    if (!p) {
+        arcr_dom_document_destroy(doc);
+        return NULL;
+    }
+    (void)arcr_html_parser_resume(p, NULL);
+    return arcr_html_parser_finish(p);
 }
 
 bool arcr_html_parse_fragment(ArcrDocument *doc, ArcrDomNode *target_parent,
                               const char *utf8_html, size_t len) {
     if (!doc || !target_parent) return false;
     if (!utf8_html || len == 0u) return true;
-    parse_html_core(doc, target_parent, utf8_html, len, true);
+
+    ArcrDomNode *dest = target_parent;
+    if (target_parent->kind == ARCR_NODE_ELEMENT && target_parent->template_content &&
+        arcr_str_eq_nocase(arcr_atom_cstr(doc->atoms, target_parent->tag), "template")) {
+        dest = target_parent->template_content;
+    }
+
+    ArcrHtmlParser *p = create_parser_internal(doc, dest, utf8_html, len, true, false, true);
+    if (!p) return false;
+    if (dest != target_parent) {
+        p->template_depth = 1u;
+    }
+    (void)arcr_html_parser_resume(p, NULL);
+    (void)arcr_html_parser_finish(p);
     doc->dom_dirty = true;
     return true;
 }

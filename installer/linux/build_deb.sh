@@ -57,8 +57,11 @@ mkdir -p \
     "${STAGE_DIR}/usr/share/icons/hicolor/scalable/apps" \
     "${STAGE_DIR}/usr/share/doc/waterscape"
 
-# 1. Stage main binary, dynamic Pure C11 modules, plugins, and .wsx addons
+# 1. Stage main binary, standalone ArcradientJS CLI, dynamic Pure C11 modules, plugins, and .wsx addons
 install -m 0755 "${MAIN_BIN}" "${STAGE_DIR}/usr/lib/waterscape/waterscape"
+if [[ -f "${BUILD_DIR}/arcr_js" ]]; then
+    install -m 0755 "${BUILD_DIR}/arcr_js" "${STAGE_DIR}/usr/lib/waterscape/arcr_js"
+fi
 
 shopt -s nullglob
 for so_file in "${BUILD_DIR}"/libarcr_*.so* "${BUILD_DIR}"/libws_plugin_*.so*; do
@@ -74,7 +77,7 @@ for wsx_file in "${BUILD_DIR}"/addons/*.wsx "${BUILD_DIR}"/*.wsx; do
 done
 shopt -u nullglob
 
-# 2. Stage /usr/bin/waterscape launcher wrapper
+# 2. Stage /usr/bin/waterscape and /usr/bin/arcr_js launcher wrappers
 cat > "${STAGE_DIR}/usr/bin/waterscape" <<'EOF'
 #!/bin/sh
 set -eu
@@ -83,6 +86,15 @@ export LD_LIBRARY_PATH="${WS_LIB}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 exec "${WS_LIB}/waterscape" --module-dir "${WS_LIB}" "$@"
 EOF
 chmod 0755 "${STAGE_DIR}/usr/bin/waterscape"
+
+if [[ -f "${STAGE_DIR}/usr/lib/waterscape/arcr_js" ]]; then
+    cat > "${STAGE_DIR}/usr/bin/arcr_js" <<'EOF'
+#!/bin/sh
+set -eu
+exec "/usr/lib/waterscape/arcr_js" "$@"
+EOF
+    chmod 0755 "${STAGE_DIR}/usr/bin/arcr_js"
+fi
 
 # 3. Locate or procedurally generate Waterscape brand icons (256, 48, SVG)
 BRAND_SRC=""
@@ -157,8 +169,9 @@ Homepage: https://arcradient.org
 Depends: libc6, libfreetype6, libpng16-16, libssl3 | libssl1.1, libx11-6, libxext6
 Description: Waterscape 2.0 hardware-accelerated Pure C11 modern web browser
  Waterscape 2.0 is a lightweight modern 2026 web browser powered by the
- Arcradient (MSHTML-Next) Pure C11 engine with QuickJS-NG ES2026, Brotli/WebP/SVG,
- Tailwind v4/oklch/60FPS CSS animations, anti-aliased CJK typography, and multi-core SIMD tiles.
+ Arcradient (MSHTML-Next) Pure C11 engine with clean-room ArcradientJS ES2026,
+ Brotli/WebP/SVG, Tailwind v4/oklch/60FPS CSS animations, anti-aliased CJK typography,
+ and multi-core SIMD tiles.
 EOF
 chmod 0644 "${STAGE_DIR}/DEBIAN/control"
 

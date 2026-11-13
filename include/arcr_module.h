@@ -21,9 +21,10 @@ extern "C" {
 #  define ARCR_API
 #endif
 
-#define ARCR_MODULE_MAGIC    0x52435241u /* "ARCR" little-endian */
-#define ARCR_ABI_VERSION     0x00010000u /* v1.0 */
-#define ARCR_ENGINE_BUILD_ID 0x20261112u
+#define ARCR_MODULE_MAGIC      0x52435241u /* "ARCR" little-endian */
+#define ARCR_ABI_VERSION       0x00010000u /* v1.0 */
+#define ARCR_JS_VTABLE_VERSION 0x00020000u /* v2.0 separated VM + Web Host contract */
+#define ARCR_ENGINE_BUILD_ID   0x20261113u
 
 /* OS major/minor encoded as (major << 8) | minor */
 #define ARCR_OS_WIN2000      0x0500u

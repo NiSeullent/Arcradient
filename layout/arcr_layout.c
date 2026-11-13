@@ -71,12 +71,18 @@ static const ArcrComputedStyle *zoom_style_if_needed(ArcrArena *arena,
     *zs = *src;
 
     zs->font_px         = ARCR_MAX(8, zpx(src->font_px, zoom));
+    if (src->line_height_px > 0) zs->line_height_px = zpx(src->line_height_px, zoom);
     zs->border_radius   = (src->border_radius >= 999) ? src->border_radius : zpx(src->border_radius, zoom);
     zs->shadow_blur     = zpx(src->shadow_blur, zoom);
     zs->shadow_offset_y = zpx(src->shadow_offset_y, zoom);
     zs->gap_px          = zpx(src->gap_px, zoom);
     zs->row_gap_px      = zpx(src->row_gap_px, zoom);
     if (src->grid_min_col_px > 0) zs->grid_min_col_px = zpx(src->grid_min_col_px, zoom);
+    for (uint8_t t = 0u; t < src->grid_track_count && t < ARCR_MAX_GRID_TRACKS; ++t) {
+        if (src->grid_track_specs[t] > 0) {
+            zs->grid_track_specs[t] = zpx(src->grid_track_specs[t], zoom);
+        }
+    }
 
     zs->margin.top    = zpx(src->margin.top, zoom);
     zs->margin.right  = zpx(src->margin.right, zoom);
@@ -209,14 +215,52 @@ static uint32_t apply_text_transform_cp(uint32_t cp, uint8_t tt) {
     return cp;
 }
 
+static int32_t compute_style_line_h(const ArcrComputedStyle *s) {
+    if (!s) return 18;
+    if (s->line_height_px > 0) return ARCR_MAX(1, s->line_height_px);
+    int32_t lh_pct = (s->line_height_pct >= 90) ? s->line_height_pct : 145;
+    return ARCR_MAX(14, (s->font_px * lh_pct) / 100);
+}
+
+static int32_t natural_glyph_floor_px(uint32_t mcp, int32_t font_px, bool monospace) {
+    if (monospace) {
+        return ARCR_MAX(4, (font_px * 52 + 50) / 100);
+    }
+    if (mcp == ' ' || mcp == 'i' || mcp == 'l' || mcp == 'j' || mcp == 'I' ||
+        mcp == '!' || mcp == '|' || mcp == '.' || mcp == ',' || mcp == ':' ||
+        mcp == ';' || mcp == '\'' || mcp == '`') {
+        return ARCR_MAX(3, (font_px * 26 + 50) / 100);
+    }
+    if (mcp == 't' || mcp == 'f' || mcp == 'r' || mcp == '(' || mcp == ')' ||
+        mcp == '[' || mcp == ']' || mcp == '-') {
+        return ARCR_MAX(4, (font_px * 35 + 50) / 100);
+    }
+    if (mcp == 'W' || mcp == 'M' || mcp == 'w' || mcp == 'm' || mcp == '@' || mcp == '%') {
+        return ARCR_MAX(6, (font_px * 68 + 50) / 100);
+    }
+    if (mcp >= 'A' && mcp <= 'Z') {
+        return ARCR_MAX(5, (font_px * 58 + 50) / 100);
+    }
+    if (mcp > 0x20u && mcp < 0x7Fu) {
+        return ARCR_MAX(5, (font_px * 52 + 50) / 100);
+    }
+    if ((mcp >= 0x1100u && mcp <= 0x11FFu) || (mcp >= 0x2E80u && mcp <= 0x9FFFu) ||
+        (mcp >= 0xAC00u && mcp <= 0xD7AFu) || (mcp >= 0xF900u && mcp <= 0xFAFFu) ||
+        (mcp >= 0xFF01u && mcp <= 0xFF60u)) {
+        return ARCR_MAX(8, (font_px * 92 + 50) / 100);
+    }
+    return 1;
+}
+
 static int32_t measure_codepoint_adv(ArcrFontSystem *fonts, uint32_t cp,
                                      int32_t font_px, bool bold, bool monospace) {
-    uint32_t mcp = (cp == 0x00A0u) ? (uint32_t)' ' : cp;
+    uint32_t mcp     = (cp == 0x00A0u) ? (uint32_t)' ' : cp;
+    int32_t  min_adv = natural_glyph_floor_px(mcp, font_px, monospace);
     ArcrGlyphMetrics gm;
     if (arcr_font_measure_glyph_ex(fonts, mcp, font_px, bold, monospace, &gm)) {
-        return ARCR_MAX(1, gm.advance_px);
+        return ARCR_MAX(min_adv, gm.advance_px);
     }
-    return ARCR_MAX(4, font_px / 2);
+    return ARCR_MAX(min_adv, ARCR_MAX(4, font_px / 2));
 }
 
 static int32_t measure_utf8_string_px_ex(ArcrFontSystem *fonts, const char *s, size_t len,
@@ -285,7 +329,7 @@ static void query_svg_or_media_intrinsic(const ArcrDocument *doc, const ArcrDomN
     int32_t nw = is_video ? 480 : (is_canvas ? 300 : (is_svg ? 24 : 120));
     int32_t nh = is_video ? 270 : (is_canvas ? 150 : (is_svg ? 24 : 80));
 
-    if (node->surface && node->surface->width > 0 && node->surface->height > 0) {
+    if (!is_svg && node->surface && node->surface->width > 0 && node->surface->height > 0) {
         nw = node->surface->width;
         nh = node->surface->height;
     } else {
@@ -329,7 +373,14 @@ static void query_svg_or_media_intrinsic(const ArcrDocument *doc, const ArcrDomN
                     } else if (!got_w && got_h) {
                         nw = ARCR_MAX(1, (int32_t)(((int64_t)nh * vbw) / vbh));
                     }
+                    got_w = true;
+                    got_h = true;
                 }
+            }
+            if (!got_w && !got_h && node->svg_rendered_w == 0 &&
+                node->surface && node->surface->width > 0 && node->surface->height > 0) {
+                nw = node->surface->width;
+                nh = node->surface->height;
             }
         }
     }
@@ -352,7 +403,12 @@ static void measure_children_into(LayoutCtx *ctx, const ArcrDomNode *parent,
                                   bool is_flex_row, int32_t flex_gap,
                                   int32_t *inout_cur_line, int32_t *inout_best_w,
                                   int32_t *inout_flex_cnt) {
-    for (const ArcrDomNode *ch = parent->first_child; ch != NULL; ch = ch->next_sibling) {
+    const ArcrDomNode *tree_parent =
+        (parent && parent->kind == ARCR_NODE_ELEMENT && parent->shadow_root)
+            ? parent->shadow_root
+            : parent;
+    for (const ArcrDomNode *ch = tree_parent ? tree_parent->first_child : NULL;
+         ch != NULL; ch = ch->next_sibling) {
         if (ch->kind == ARCR_NODE_TEXT) {
             if (is_flex_row) continue;
             int32_t font_px = ARCR_MAX(8, zpx(container_st->font_px, zoom));
@@ -652,6 +708,7 @@ static void collect_inline_items(LayoutCtx *ctx, const ArcrDomNode *node,
                                                                  node->computed_style,
                                                                  ctx->tree->zoom_percent)
                                           : cur_style;
+        if (st->sr_only_clip) return;
 
         if (arcr_str_eq_nocase(tname, "a")) {
             const char *href = arcr_dom_get_attr_cstr(ctx->doc, node, "href");
@@ -661,8 +718,9 @@ static void collect_inline_items(LayoutCtx *ctx, const ArcrDomNode *node,
             }
         }
 
+        const ArcrDomNode *inl_parent = node->shadow_root ? node->shadow_root : node;
         if (st->display == ARCR_DISPLAY_CONTENTS) {
-            for (const ArcrDomNode *ch = node->first_child; ch != NULL; ch = ch->next_sibling) {
+            for (const ArcrDomNode *ch = inl_parent->first_child; ch != NULL; ch = ch->next_sibling) {
                 collect_inline_items(ctx, ch, pos_owner, st, active_link, active_href,
                                      line_max_w, buf);
             }
@@ -689,7 +747,7 @@ static void collect_inline_items(LayoutCtx *ctx, const ArcrDomNode *node,
                 0x200Bu, st->padding.left, st, active_link, active_href, NULL, false
             });
         }
-        for (const ArcrDomNode *ch = node->first_child; ch != NULL; ch = ch->next_sibling) {
+        for (const ArcrDomNode *ch = inl_parent->first_child; ch != NULL; ch = ch->next_sibling) {
             if (is_inline_flow_child(ctx->doc->atoms, ch) || is_out_of_flow_el(ch)) {
                 collect_inline_items(ctx, ch, pos_owner, st, active_link, active_href,
                                      line_max_w, buf);
@@ -775,8 +833,7 @@ static int32_t layout_inline_run(LayoutCtx *ctx, ArcrLayoutBox *box,
         &ctx->tree->arena, (buf->count + 4u) * sizeof(ArcrPositionedGlyph), sizeof(void *));
     if (!out_g) return 0;
 
-    int32_t lh_pct      = (box->style->line_height_pct >= 90) ? box->style->line_height_pct : 145;
-    int32_t base_line_h = ARCR_MAX(14, (box->style->font_px * lh_pct) / 100);
+    int32_t base_line_h = compute_style_line_h(box->style);
     bool    allow_wrap  = !box->style->white_space_pre && !box->style->white_space_nowrap;
 
     uint32_t gcount       = 0u;
@@ -826,8 +883,7 @@ static int32_t layout_inline_run(LayoutCtx *ctx, ArcrLayoutBox *box,
                                        ib->border_rect.height + ib->style->margin.bottom);
             if (ib_h > cluster_max_lh) cluster_max_lh = ib_h;
         } else {
-            int32_t ilh = (buf->items[i].style->font_px *
-                           ARCR_MAX(90, buf->items[i].style->line_height_pct)) / 100;
+            int32_t ilh = compute_style_line_h(buf->items[i].style);
             if (ilh > cluster_max_lh) cluster_max_lh = ilh;
 
             while (cend < buf->count && !buf->items[cend].forced_break &&
@@ -843,8 +899,7 @@ static int32_t layout_inline_run(LayoutCtx *ctx, ArcrLayoutBox *box,
                     break;
                 }
                 cluster_w = clamp_coord((int64_t)cluster_w + buf->items[cend].adv_px);
-                int32_t clh = (buf->items[cend].style->font_px *
-                               ARCR_MAX(90, buf->items[cend].style->line_height_pct)) / 100;
+                int32_t clh = compute_style_line_h(buf->items[cend].style);
                 if (clh > cluster_max_lh) cluster_max_lh = clh;
                 ++cend;
             }
@@ -1095,7 +1150,12 @@ static void collect_flow_element_children(LayoutCtx *ctx, const ArcrDomNode *par
                                           ArcrLayoutBox *pos_owner,
                                           int32_t static_x, int32_t static_y, int32_t avail_w,
                                           DomNodeVec *out_vec) {
-    for (const ArcrDomNode *ch = parent->first_child; ch != NULL; ch = ch->next_sibling) {
+    const ArcrDomNode *src_parent =
+        (parent && parent->kind == ARCR_NODE_ELEMENT && parent->shadow_root)
+            ? parent->shadow_root
+            : parent;
+    for (const ArcrDomNode *ch = src_parent ? src_parent->first_child : NULL;
+         ch != NULL; ch = ch->next_sibling) {
         if (ch->kind != ARCR_NODE_ELEMENT || !ch->computed_style) continue;
         if (ch->computed_style->display == ARCR_DISPLAY_NONE) continue;
         if (ch->computed_style->display == ARCR_DISPLAY_CONTENTS) {
@@ -1364,10 +1424,84 @@ static int32_t layout_grid_children(LayoutCtx *ctx, const ArcrDomNode *container
     int32_t cols = 1;
     if (st->grid_min_col_px > 0) {
         cols = ARCR_CLAMP((cw + col_gap) / ARCR_MAX(1, st->grid_min_col_px + col_gap), 1, 16);
+    } else if (st->grid_track_count > 0u) {
+        cols = ARCR_CLAMP((int32_t)st->grid_track_count, 1, (int32_t)ARCR_MAX_GRID_TRACKS);
     } else if (st->grid_columns > 0) {
         cols = ARCR_CLAMP(st->grid_columns, 1, 16);
     }
-    int32_t col_w = ARCR_MAX(16, (cw - (cols - 1) * col_gap) / cols);
+
+    int32_t track_widths[16];
+    int32_t track_xs[16];
+    int32_t total_gaps   = (cols - 1) * col_gap;
+    int32_t avail_tracks = ARCR_MAX(0, cw - total_gaps);
+
+    if (st->grid_min_col_px == 0 && st->grid_track_count > 0u &&
+        cols <= (int32_t)ARCR_MAX_GRID_TRACKS &&
+        (int32_t)st->grid_track_count == cols) {
+        int32_t fixed_sum = 0;
+        int64_t fr_sum    = 0;
+        int32_t auto_cnt  = 0;
+        int32_t last_fr   = -1;
+        for (int32_t c = 0; c < cols; ++c) {
+            int32_t sp = st->grid_track_specs[c];
+            if (sp > 0) {
+                fixed_sum += sp;
+            } else if (sp < 0) {
+                fr_sum += (int64_t)(-sp);
+                last_fr = c;
+            } else {
+                ++auto_cnt;
+            }
+        }
+        int32_t rem = ARCR_MAX(0, avail_tracks - fixed_sum);
+        if (fr_sum == 0 && auto_cnt > 0) {
+            int32_t used_auto = 0;
+            int32_t seen_auto = 0;
+            for (int32_t c = 0; c < cols; ++c) {
+                int32_t sp = st->grid_track_specs[c];
+                if (sp > 0) {
+                    track_widths[c] = sp;
+                } else {
+                    ++seen_auto;
+                    int32_t aw = (seen_auto == auto_cnt) ? (rem - used_auto) : (rem / auto_cnt);
+                    track_widths[c] = ARCR_MAX(1, aw);
+                    used_auto += track_widths[c];
+                }
+            }
+        } else {
+            int32_t auto_share = (auto_cnt > 0 && rem > 0)
+                                     ? ARCR_MIN(zpx(120, ctx->tree->zoom_percent),
+                                                rem / (auto_cnt + 2))
+                                     : 0;
+            int32_t fr_pool = ARCR_MAX(0, rem - auto_cnt * auto_share);
+            int32_t fr_used = 0;
+            for (int32_t c = 0; c < cols; ++c) {
+                int32_t sp = st->grid_track_specs[c];
+                if (sp > 0) {
+                    track_widths[c] = sp;
+                } else if (sp < 0 && fr_sum > 0) {
+                    int32_t fw = (c == last_fr)
+                                     ? (fr_pool - fr_used)
+                                     : (int32_t)(((int64_t)fr_pool * (int64_t)(-sp)) / fr_sum);
+                    track_widths[c] = ARCR_MAX(1, fw);
+                    fr_used += track_widths[c];
+                } else {
+                    track_widths[c] = ARCR_MAX(1, auto_share);
+                }
+            }
+        }
+    } else {
+        int32_t uniform_w = ARCR_MAX(16, avail_tracks / cols);
+        for (int32_t c = 0; c < cols; ++c) {
+            track_widths[c] = uniform_w;
+        }
+    }
+
+    int32_t run_x = cx;
+    for (int32_t c = 0; c < cols; ++c) {
+        track_xs[c] = run_x;
+        run_x = clamp_coord((int64_t)run_x + track_widths[c] + col_gap);
+    }
 
     DomNodeVec vec = {NULL, 0u, 0u};
     collect_flow_element_children(ctx, container, pos_owner, cx, cy, cw, &vec);
@@ -1404,11 +1538,16 @@ static int32_t layout_grid_children(LayoutCtx *ctx, const ArcrDomNode *container
             }
             if (cur_col + span > cols) span = cols - cur_col;
 
-            int32_t cell_x  = cx + cur_col * (col_w + col_gap);
-            int32_t track_w = span * col_w + (span - 1) * col_gap;
+            int32_t cell_x  = track_xs[cur_col];
+            int32_t track_w = (span - 1) * col_gap;
+            for (int32_t s = 0; s < span; ++s) {
+                track_w += track_widths[cur_col + s];
+            }
             int32_t mh      = zpx(ch->computed_style->margin.left +
                                   ch->computed_style->margin.right, ctx->tree->zoom_percent);
-            int32_t item_bw = ARCR_MAX(12, track_w - mh);
+            int32_t item_bw = (ch->computed_style && ch->computed_style->width_spec != 0)
+                                  ? 0
+                                  : ARCR_MAX(1, track_w - mh);
 
             ArcrLayoutBox *ib = layout_element_node(
                 ctx, ch, pos_owner, cell_x, cur_y, track_w, container_def_h, false, item_bw, 0);
@@ -1778,7 +1917,7 @@ static ArcrLayoutBox *layout_element_node(LayoutCtx *ctx, const ArcrDomNode *nod
     box->dom_node     = node;
     box->style        = st;
     const char *tname = arcr_atom_cstr(ctx->doc->atoms, node->tag);
-    box->is_list_item = arcr_str_eq_nocase(tname, "li");
+    box->is_list_item = arcr_str_eq_nocase(tname, "li") && !st->list_style_none;
     box->list_ordinal = list_ordinal;
     box->is_hr        = arcr_str_eq_nocase(tname, "hr");
 
@@ -1898,7 +2037,10 @@ static ArcrLayoutBox *layout_element_node(LayoutCtx *ctx, const ArcrDomNode *nod
         content_h = zpx(2, zoom);
     } else if (is_replaced) {
         content_h = intrinsic_rep_h;
-        if (is_img && (!node->surface || !node->surface->argb_pixels)) {
+        if (is_svg && cw > 0 && content_h > 0) {
+            (void)arcr_dom_rerasterize_svg((ArcrDocument *)ctx->doc, (ArcrDomNode *)node,
+                                           st->color_argb, cw, content_h);
+        } else if (is_img && (!node->surface || !node->surface->argb_pixels)) {
             const char *alt = arcr_dom_get_attr_cstr(ctx->doc, node, "alt");
             if (alt && alt[0] != '\0' && cw > 16 && content_h >= st->font_px) {
                 int32_t base_y = cy + content_h / 2 + st->font_px / 3;
@@ -2032,7 +2174,8 @@ static ArcrLayoutBox *layout_element_node(LayoutCtx *ctx, const ArcrDomNode *nod
         }
 
         int32_t cursor_y = cy;
-        const ArcrDomNode *ch = node->first_child;
+        const ArcrDomNode *flow_parent = node->shadow_root ? node->shadow_root : node;
+        const ArcrDomNode *ch = flow_parent->first_child;
         while (ch) {
             if (is_inline_flow_child(ctx->doc->atoms, ch)) {
                 InlineBuf ibuf = {NULL, 0u, 0u};
@@ -2104,7 +2247,7 @@ static ArcrLayoutBox *layout_element_node(LayoutCtx *ctx, const ArcrDomNode *nod
                     ctx->fonts, num_buf, (size_t)nlen, st->font_px,
                     st->font_bold, st->font_monospace, false, 0u);
                 int32_t mx = cx - mw - zpx(6, zoom);
-                int32_t lh = ARCR_MAX(14, (st->font_px * ARCR_MAX(90, st->line_height_pct)) / 100);
+                int32_t lh = compute_style_line_h(st);
                 int32_t base_y = cy + (lh * 78) / 100;
                 mk->content_rect = (ArcrRect){mx, cy, mw + 4, lh};
                 mk->border_rect  = mk->content_rect;
@@ -2133,6 +2276,51 @@ static ArcrLayoutBox *layout_element_node(LayoutCtx *ctx, const ArcrDomNode *nod
         if (bh > max_bh) {
             bh        = ARCR_MAX(v_chrome, max_bh);
             content_h = ARCR_MAX(0, bh - v_chrome);
+        }
+    }
+
+    if (st->sr_only_clip) {
+        bw        = ARCR_MIN(bw, 1);
+        bh        = ARCR_MIN(bh, 1);
+        cw        = 0;
+        content_h = 0;
+    } else if (!is_replaced && st->mask_image_url &&
+               arcr_str_starts_with_nocase(st->mask_image_url, "data:image/svg+xml") &&
+               cw > 0 && content_h > 0 && cw <= 512 && content_h <= 512) {
+        uint32_t mask_tint = (((st->bg_argb >> 24) & 0xFFu) > 0u) ? st->bg_argb : st->color_argb;
+        if (!(node->surface && node->surface->argb_pixels &&
+              node->svg_rendered_color == mask_tint &&
+              node->svg_rendered_w == cw && node->svg_rendered_h == content_h)) {
+            ArcrImage mimg = {0, 0, NULL};
+            if (arcr_image_decode_data_uri(st->mask_image_url, strlen(st->mask_image_url), &mimg) &&
+                mimg.pixels && mimg.width > 0 && mimg.height > 0) {
+                ArcrImage resized = {0, 0, NULL};
+                const ArcrImage *src_img = &mimg;
+                if ((mimg.width != cw || mimg.height != content_h) &&
+                    arcr_image_resize_argb(mimg.pixels, mimg.width, mimg.height,
+                                           cw, content_h, &resized) &&
+                    resized.pixels) {
+                    src_img = &resized;
+                }
+                ArcrDomNode    *mut_node = (ArcrDomNode *)node;
+                ArcrDomSurface *surf = arcr_dom_ensure_surface((ArcrDocument *)ctx->doc, mut_node,
+                                                               src_img->width, src_img->height);
+                if (surf && surf->argb_pixels) {
+                    uint32_t ta  = (mask_tint >> 24) & 0xFFu;
+                    uint32_t rgb = mask_tint & 0x00FFFFFFu;
+                    size_t   npx = (size_t)src_img->width * (size_t)src_img->height;
+                    for (size_t pi = 0u; pi < npx; ++pi) {
+                        uint32_t ma = (src_img->pixels[pi] >> 24) & 0xFFu;
+                        uint32_t fa = (ma * ta + 127u) / 255u;
+                        surf->argb_pixels[pi] = (fa == 0u) ? 0u : ((fa << 24) | rgb);
+                    }
+                    mut_node->svg_rendered_color = mask_tint;
+                    mut_node->svg_rendered_w     = src_img->width;
+                    mut_node->svg_rendered_h     = src_img->height;
+                }
+                arcr_image_free(&resized);
+            }
+            arcr_image_free(&mimg);
         }
     }
 
@@ -2202,8 +2390,54 @@ static ArcrRect intersect_clip_rects(ArcrRect a, ArcrRect b) {
     return (ArcrRect){x0, y0, x1 - x0, y1 - y0};
 }
 
+static void clear_dom_layout_boxes_recursive(ArcrDomNode *n) {
+    for (; n != NULL; n = n->next_sibling) {
+        n->layout_x       = 0;
+        n->layout_y       = 0;
+        n->layout_w       = 0;
+        n->layout_h       = 0;
+        n->has_layout_box = false;
+        if (n->first_child) {
+            clear_dom_layout_boxes_recursive(n->first_child);
+        }
+        if (n->shadow_root) {
+            clear_dom_layout_boxes_recursive(n->shadow_root);
+        }
+        if (n->template_content) {
+            clear_dom_layout_boxes_recursive(n->template_content);
+        }
+    }
+}
+
+static void sync_dom_node_rect(ArcrDomNode *dn, ArcrRect r) {
+    if (!dn) return;
+    if (!dn->has_layout_box) {
+        dn->layout_x       = r.x;
+        dn->layout_y       = r.y;
+        dn->layout_w       = r.width;
+        dn->layout_h       = r.height;
+        dn->has_layout_box = true;
+    } else {
+        int32_t x0 = ARCR_MIN(dn->layout_x, r.x);
+        int32_t y0 = ARCR_MIN(dn->layout_y, r.y);
+        int32_t x1 = ARCR_MAX(dn->layout_x + dn->layout_w, r.x + r.width);
+        int32_t y1 = ARCR_MAX(dn->layout_y + dn->layout_h, r.y + r.height);
+        dn->layout_x = x0;
+        dn->layout_y = y0;
+        dn->layout_w = ARCR_MAX(0, x1 - x0);
+        dn->layout_h = ARCR_MAX(0, y1 - y0);
+    }
+}
+
 static void finalize_box_state_recursive(ArcrLayoutBox *box,
+                                         bool is_root_box,
+                                         int32_t viewport_h,
+                                         int32_t parent_sticky_limit_y,
                                          bool anc_fixed,
+                                         bool anc_sticky,
+                                         int32_t anc_sticky_anchor_y,
+                                         int32_t anc_sticky_top_px,
+                                         int32_t anc_sticky_max_dy,
                                          bool anc_has_clip, ArcrRect anc_clip,
                                          uint8_t anc_opacity,
                                          int32_t *inout_max_doc_bottom) {
@@ -2213,22 +2447,44 @@ static void finalize_box_state_recursive(ArcrLayoutBox *box,
     bool enters_fixed = (!anc_fixed && st && st->position == ARCR_POS_FIXED);
     bool cur_fixed    = anc_fixed || enters_fixed;
     if (enters_fixed) {
-        /* Viewport-fixed elements escape normal document overflow clips */
+        /* Viewport-fixed elements escape normal document overflow clips & sticky ancestors */
         anc_has_clip = false;
+        anc_sticky   = false;
+    }
+
+    bool    cur_sticky          = anc_sticky;
+    int32_t cur_sticky_anchor_y = anc_sticky_anchor_y;
+    int32_t cur_sticky_top_px   = anc_sticky_top_px;
+    int32_t cur_sticky_max_dy   = anc_sticky_max_dy;
+
+    if (!cur_fixed && !cur_sticky && st && st->position == ARCR_POS_STICKY && st->has_top) {
+        cur_sticky          = true;
+        cur_sticky_anchor_y = box->border_rect.y;
+        cur_sticky_top_px   = resolve_pos_offset(st->top_px, viewport_h);
+        cur_sticky_max_dy   = ARCR_MAX(
+            0, clamp_coord((int64_t)parent_sticky_limit_y -
+                           ((int64_t)box->border_rect.y + box->border_rect.height)));
     }
 
     uint8_t own_op = st ? st->opacity : 255u;
     uint8_t eff_op = (uint8_t)(((uint32_t)anc_opacity * (uint32_t)own_op + 127u) / 255u);
 
     box->is_fixed          = cur_fixed;
+    box->is_sticky         = cur_sticky;
+    box->sticky_anchor_y   = cur_sticky_anchor_y;
+    box->sticky_top_px     = cur_sticky_top_px;
+    box->sticky_max_dy     = cur_sticky_max_dy;
     box->z_index           = st ? st->z_index : 0;
     box->effective_opacity = eff_op;
 
     bool     child_has_clip = anc_has_clip;
     ArcrRect child_clip     = anc_clip;
 
-    if (st && (st->overflow_x != ARCR_OVERFLOW_VISIBLE ||
-               st->overflow_y != ARCR_OVERFLOW_VISIBLE)) {
+    if (st && st->sr_only_clip) {
+        child_clip     = (ArcrRect){box->border_rect.x, box->border_rect.y, 0, 0};
+        child_has_clip = true;
+    } else if (st && (st->overflow_x != ARCR_OVERFLOW_VISIBLE ||
+                      st->overflow_y != ARCR_OVERFLOW_VISIBLE)) {
         ArcrRect self_clip = box->border_rect;
         if (st->overflow_x == ARCR_OVERFLOW_VISIBLE) {
             self_clip.x     = -ARCR_LAYOUT_COORD_MAX;
@@ -2245,13 +2501,29 @@ static void finalize_box_state_recursive(ArcrLayoutBox *box,
     box->has_clip  = child_has_clip;
     box->clip_rect = child_clip;
 
+    if (box->dom_node) {
+        sync_dom_node_rect((ArcrDomNode *)box->dom_node, box->border_rect);
+    }
+    for (const ArcrInlineLinkSpan *ls = box->links_head; ls != NULL; ls = ls->next) {
+        if (ls->link_node) {
+            sync_dom_node_rect((ArcrDomNode *)ls->link_node, ls->rect);
+        }
+    }
+
     if (!cur_fixed && !child_has_clip) {
         int32_t bottom = clamp_coord((int64_t)box->border_rect.y + box->border_rect.height);
         if (bottom > *inout_max_doc_bottom) *inout_max_doc_bottom = bottom;
     }
 
+    int32_t child_sticky_limit_y =
+        is_root_box ? ARCR_LAYOUT_COORD_MAX
+                    : clamp_coord((int64_t)box->content_rect.y + box->content_rect.height);
+
     for (ArcrLayoutBox *ch = box->first_child; ch != NULL; ch = ch->next_sibling) {
-        finalize_box_state_recursive(ch, cur_fixed, child_has_clip, child_clip,
+        finalize_box_state_recursive(ch, false, viewport_h, child_sticky_limit_y,
+                                     cur_fixed, cur_sticky, cur_sticky_anchor_y,
+                                     cur_sticky_top_px, cur_sticky_max_dy,
+                                     child_has_clip, child_clip,
                                      eff_op, inout_max_doc_bottom);
     }
 }
@@ -2262,6 +2534,10 @@ ArcrLayoutTree *arcr_layout_build_ex(const ArcrDocument *doc, ArcrFontSystem *fo
     if (!doc || !doc->body) return NULL;
     ArcrLayoutTree *tree = (ArcrLayoutTree *)calloc(1u, sizeof(ArcrLayoutTree));
     if (!tree) return NULL;
+
+    if (doc->root) {
+        clear_dom_layout_boxes_recursive((ArcrDomNode *)doc->root);
+    }
 
     arcr_arena_init(&tree->arena, 32768u);
     tree->viewport_width  = (viewport_width > 64) ? viewport_width : 64;
@@ -2293,7 +2569,10 @@ ArcrLayoutTree *arcr_layout_build_ex(const ArcrDocument *doc, ArcrFontSystem *fo
         int32_t max_bottom = tree->root_box->border_rect.y +
                              tree->root_box->border_rect.height +
                              tree->root_box->style->margin.bottom;
-        finalize_box_state_recursive(tree->root_box, false, false, (ArcrRect){0, 0, 0, 0},
+        finalize_box_state_recursive(tree->root_box, true, tree->viewport_height,
+                                     ARCR_LAYOUT_COORD_MAX,
+                                     false, false, 0, 0, 0,
+                                     false, (ArcrRect){0, 0, 0, 0},
                                      255u, &max_bottom);
         tree->total_height = ARCR_MAX(tree->viewport_height, max_bottom);
     }
@@ -2320,7 +2599,7 @@ void arcr_layout_destroy(ArcrLayoutTree *tree) {
 }
 
 /* -------------------------------------------------------------------------
- * Z-Ordered Spatial Hit-Testing (Supports Fixed, Scroll, Overflow Clip & Pointer-Events)
+ * Z-Ordered Spatial Hit-Testing (Supports Fixed, Sticky, Scroll, Overflow Clip & Pointer-Events)
  * ------------------------------------------------------------------------- */
 static bool point_in_rect(int32_t x, int32_t y, ArcrRect r) {
     return x >= r.x && x < (r.x + r.width) &&
@@ -2351,6 +2630,7 @@ static void hit_test_walk_stacked(const ArcrLayoutBox *box,
                                   const ArcrLayoutBox **inout_best_box,
                                   const ArcrInlineLinkSpan **inout_best_link) {
     if (!box) return;
+    if (box->style && box->style->sr_only_clip) return;
 
     /* Collect positioned children with z_index != 0 for exact paint-order walk */
     size_t pos_cnt = 0u;
@@ -2386,8 +2666,18 @@ static void hit_test_walk_stacked(const ArcrLayoutBox *box,
     }
 
     /* 2. Self box & inline link spans */
+    int32_t eff_scroll_y = scroll_y;
+    if (box->is_fixed) {
+        eff_scroll_y = 0;
+    } else if (box->is_sticky) {
+        int32_t sticky_dy = ARCR_CLAMP(
+            clamp_coord((int64_t)scroll_y + box->sticky_top_px - box->sticky_anchor_y),
+            0, box->sticky_max_dy);
+        eff_scroll_y = clamp_coord((int64_t)scroll_y - sticky_dy);
+    }
+
     int32_t tx = view_x;
-    int32_t ty = box->is_fixed ? view_y : clamp_coord((int64_t)view_y + scroll_y);
+    int32_t ty = clamp_coord((int64_t)view_y + eff_scroll_y);
     bool self_interactable = box->style &&
                              !box->style->visibility_hidden &&
                              !box->style->pointer_events_none &&

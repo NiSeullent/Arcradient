@@ -120,6 +120,12 @@ static void free_surfaces_in_tree(ArcrDomNode *root_node) {
         if (cur->surface) {
             free_surface_heap_buffers(cur->surface);
         }
+        if (cur->template_content) {
+            free_surfaces_in_tree(cur->template_content);
+        }
+        if (cur->shadow_root) {
+            free_surfaces_in_tree(cur->shadow_root);
+        }
         if (cur->first_child) {
             cur = cur->first_child;
         } else {
@@ -142,6 +148,16 @@ static void destroy_subtree_nodes(ArcrDocument *doc, ArcrDomNode *node) {
         ch->next_sibling = NULL;
         destroy_subtree_nodes(doc, ch);
         ch = next;
+    }
+    if (node->template_content) {
+        ArcrDomNode *tc = node->template_content;
+        node->template_content = NULL;
+        destroy_subtree_nodes(doc, tc);
+    }
+    if (node->shadow_root) {
+        ArcrDomNode *sr = node->shadow_root;
+        node->shadow_root = NULL;
+        destroy_subtree_nodes(doc, sr);
     }
     if (node->surface) {
         free_surface_heap_buffers(node->surface);
@@ -230,6 +246,15 @@ ArcrDomNode *arcr_dom_create_element(ArcrDocument *doc, const char *tag_name, si
                arcr_str_eq_nocase_n(tag_name, tag_len, "canvas", 6u) ||
                arcr_str_eq_nocase_n(tag_name, tag_len, "svg", 3u)) {
         doc->has_images = true;
+    } else if (arcr_str_eq_nocase_n(tag_name, tag_len, "template", 8u)) {
+        ArcrDomNode *frag = (ArcrDomNode *)arcr_slab_alloc(&doc->node_slab);
+        if (frag) {
+            memset(frag, 0, sizeof(*frag));
+            frag->kind             = ARCR_NODE_DOCUMENT;
+            frag->node_uid         = ++doc->next_uid;
+            node->template_content = frag;
+            doc->node_count++;
+        }
     }
     return node;
 }
@@ -349,6 +374,14 @@ static bool has_svg_ancestor(const ArcrDocument *doc, const ArcrDomNode *node) {
     return false;
 }
 
+static bool is_connected_to_doc_root(const ArcrDocument *doc, const ArcrDomNode *node) {
+    if (!doc || !doc->root || !node) return false;
+    for (const ArcrDomNode *p = node; p != NULL; p = p->parent) {
+        if (p == doc->root) return true;
+    }
+    return false;
+}
+
 void arcr_dom_set_text_content(ArcrDocument *doc, ArcrDomNode *elem,
                                const char *utf8, size_t len) {
     if (!doc || !elem) return;
@@ -365,7 +398,9 @@ void arcr_dom_set_text_content(ArcrDocument *doc, ArcrDomNode *elem,
             arcr_dom_append_child(elem, tn);
             if (elem->kind == ARCR_NODE_ELEMENT) {
                 const char *tname = arcr_atom_cstr(doc->atoms, elem->tag);
-                if (arcr_str_eq_nocase(tname, "title") && !has_svg_ancestor(doc, elem)) {
+                if (arcr_str_eq_nocase(tname, "title") &&
+                    is_connected_to_doc_root(doc, elem) &&
+                    !has_svg_ancestor(doc, elem)) {
                     doc->title = tn->text;
                 } else if (arcr_str_eq_nocase(tname, "textarea")) {
                     arcr_dom_set_input_value(doc, elem, tn->text);
@@ -557,14 +592,18 @@ static void serialize_node_rec(const ArcrDocument *doc, const ArcrDomNode *node,
 
         bool is_raw = arcr_str_eq_nocase(tname, "script") ||
                       arcr_str_eq_nocase(tname, "style");
-        if (!node->first_child && node->text && node->text_len > 0u) {
+        const ArcrDomNode *child_container =
+            (node->template_content && arcr_str_eq_nocase(tname, "template"))
+                ? node->template_content
+                : node;
+        if (!child_container->first_child && node->text && node->text_len > 0u) {
             if (is_raw) {
                 ser_append_raw(sb, node->text, node->text_len);
             } else {
                 ser_append_escaped_text(sb, node->text, node->text_len);
             }
         } else {
-            for (const ArcrDomNode *ch = node->first_child; ch != NULL; ch = ch->next_sibling) {
+            for (const ArcrDomNode *ch = child_container->first_child; ch != NULL; ch = ch->next_sibling) {
                 serialize_node_rec(doc, ch, sb, is_raw);
             }
         }
@@ -588,16 +627,20 @@ char *arcr_dom_serialize_html_alloc(const ArcrDocument *doc, const ArcrDomNode *
         serialize_node_rec(doc, node, &sb, false);
     } else {
         bool is_raw = false;
+        const ArcrDomNode *child_container = node;
         if (node->kind == ARCR_NODE_ELEMENT) {
             const char *tn = arcr_atom_cstr(doc->atoms, node->tag);
             is_raw = arcr_str_eq_nocase(tn, "script") || arcr_str_eq_nocase(tn, "style");
+            if (node->template_content && arcr_str_eq_nocase(tn, "template")) {
+                child_container = node->template_content;
+            }
         }
-        if (node->kind == ARCR_NODE_ELEMENT && !node->first_child &&
+        if (node->kind == ARCR_NODE_ELEMENT && !child_container->first_child &&
             node->text && node->text_len > 0u) {
             if (is_raw) ser_append_raw(&sb, node->text, node->text_len);
             else        ser_append_escaped_text(&sb, node->text, node->text_len);
         } else {
-            for (const ArcrDomNode *ch = node->first_child; ch != NULL; ch = ch->next_sibling) {
+            for (const ArcrDomNode *ch = child_container->first_child; ch != NULL; ch = ch->next_sibling) {
                 serialize_node_rec(doc, ch, &sb, is_raw);
             }
         }
@@ -872,11 +915,87 @@ ArcrDomSurface *arcr_dom_ensure_surface(ArcrDocument *doc, ArcrDomNode *elem,
     return elem->surface;
 }
 
+bool arcr_dom_rerasterize_svg(ArcrDocument *doc, ArcrDomNode *svg_elem,
+                              uint32_t current_color_argb, int32_t target_w, int32_t target_h) {
+    if (!doc || !svg_elem || svg_elem->kind != ARCR_NODE_ELEMENT) return false;
+    const char *tname = arcr_atom_cstr(doc->atoms, svg_elem->tag);
+    if (!arcr_str_eq_nocase(tname, "svg")) return false;
+
+    uint32_t eff_color = (current_color_argb == 0u) ? 0xFF1E293Bu : current_color_argb;
+    int32_t  req_w     = (target_w > 0) ? ARCR_CLAMP(target_w, 1, 2048) : 0;
+    int32_t  req_h     = (target_h > 0) ? ARCR_CLAMP(target_h, 1, 2048) : 0;
+
+    if (svg_elem->surface && svg_elem->surface->argb_pixels &&
+        svg_elem->svg_rendered_color == eff_color &&
+        req_w > 0 && req_h > 0 &&
+        svg_elem->svg_rendered_w == req_w &&
+        svg_elem->svg_rendered_h == req_h) {
+        return true;
+    }
+
+    if (!svg_elem->raw_svg_markup || svg_elem->raw_svg_len == 0u) {
+        size_t ser_len = 0u;
+        char  *ser_xml = arcr_dom_serialize_html_alloc(doc, svg_elem, true, &ser_len);
+        if (!ser_xml || ser_len == 0u) {
+            free(ser_xml);
+            return false;
+        }
+        /* Restore case-sensitive SVG attributes needed by NanoSVG after lowercase atom interning */
+        for (size_t i = 0u; i + 8u <= ser_len; ++i) {
+            if (memcmp(ser_xml + i, "viewbox=", 8u) == 0) {
+                ser_xml[i + 4u] = 'B';
+            }
+        }
+        svg_elem->raw_svg_markup = arcr_arena_strdup(&doc->arena, ser_xml, ser_len);
+        svg_elem->raw_svg_len    = ser_len;
+        free(ser_xml);
+        if (!svg_elem->raw_svg_markup) return false;
+    }
+
+    ArcrImage img = {0, 0, NULL};
+    if (!arcr_svg_rasterize_mem(svg_elem->raw_svg_markup, svg_elem->raw_svg_len,
+                                req_w, req_h, eff_color, &img) ||
+        !img.pixels || img.width <= 0 || img.height <= 0) {
+        arcr_image_free(&img);
+        return false;
+    }
+
+    if (!svg_elem->surface) {
+        svg_elem->surface = (ArcrDomSurface *)arcr_arena_calloc(
+            &doc->arena, 1u, sizeof(ArcrDomSurface), sizeof(void *));
+        if (!svg_elem->surface) {
+            arcr_image_free(&img);
+            return false;
+        }
+    } else {
+        free_surface_heap_buffers(svg_elem->surface);
+    }
+
+    svg_elem->surface->width       = img.width;
+    svg_elem->surface->height      = img.height;
+    svg_elem->surface->argb_pixels = img.pixels;
+    svg_elem->surface->heap_owned  = true;
+
+    svg_elem->svg_rendered_color = eff_color;
+    svg_elem->svg_rendered_w     = img.width;
+    svg_elem->svg_rendered_h     = img.height;
+    doc->has_images              = true;
+    return true;
+}
+
 ArcrDomNode *arcr_dom_find_by_uid(ArcrDomNode *root, uint32_t uid) {
     if (!root || uid == 0u) return NULL;
     ArcrDomNode *cur = root;
     while (cur) {
         if (cur->node_uid == uid) return cur;
+        if (cur->template_content) {
+            ArcrDomNode *found = arcr_dom_find_by_uid(cur->template_content, uid);
+            if (found) return found;
+        }
+        if (cur->shadow_root) {
+            ArcrDomNode *found = arcr_dom_find_by_uid(cur->shadow_root, uid);
+            if (found) return found;
+        }
         if (cur->first_child) {
             cur = cur->first_child;
         } else {
@@ -914,7 +1033,7 @@ ArcrDomNode *arcr_dom_get_element_by_id(const ArcrDocument *doc, const char *id_
 }
 
 /* -------------------------------------------------------------------------
- * Heap-Backed CSS3 Selector Parser & Matcher (querySelectorAll & matches)
+ * Heap-Backed CSS3/CSS4 Selector Parser & Matcher (querySelectorAll & matches)
  * ------------------------------------------------------------------------- */
 typedef enum QSelCombinator {
     QSEL_COMB_NONE       = 0,
@@ -944,37 +1063,49 @@ typedef struct QSelAttr {
 } QSelAttr;
 
 struct QSelList;
+struct QSelHasList;
 
 typedef struct QSelStep {
-    char             *tag;
-    size_t            tag_len;
-    char             *id;
-    size_t            id_len;
-    char            **classes;
-    size_t           *class_lens;
-    uint32_t          class_count;
-    uint32_t          class_cap;
-    QSelAttr         *attrs;
-    uint32_t          attr_count;
-    uint32_t          attr_cap;
-    uint32_t          req_state;
-    bool              req_root;
-    bool              req_empty;
-    bool              req_first_child;
-    bool              req_last_child;
-    bool              req_only_child;
-    bool              req_disabled;
-    bool              req_enabled;
-    bool              req_focus_within;
-    bool              has_nth;
-    int32_t           nth_a;
-    int32_t           nth_b;
-    struct QSelList **not_lists;
-    uint32_t          not_count;
-    struct QSelList **is_lists;
-    uint32_t          is_count;
-    bool              impossible;
-    QSelCombinator    comb_to_next;
+    char                *tag;
+    size_t               tag_len;
+    char                *id;
+    size_t               id_len;
+    char               **classes;
+    size_t              *class_lens;
+    uint32_t             class_count;
+    uint32_t             class_cap;
+    QSelAttr            *attrs;
+    uint32_t             attr_count;
+    uint32_t             attr_cap;
+    uint32_t             req_state;
+    bool                 req_root;
+    bool                 req_empty;
+    bool                 req_first_child;
+    bool                 req_last_child;
+    bool                 req_only_child;
+    bool                 req_first_of_type;
+    bool                 req_last_of_type;
+    bool                 req_only_of_type;
+    bool                 req_disabled;
+    bool                 req_enabled;
+    bool                 req_focus_within;
+    bool                 has_nth;
+    bool                 nth_from_end;
+    int32_t              nth_a;
+    int32_t              nth_b;
+    struct QSelList     *nth_of_list;
+    bool                 has_nth_of_type;
+    bool                 nth_type_from_end;
+    int32_t              nth_type_a;
+    int32_t              nth_type_b;
+    struct QSelList    **not_lists;
+    uint32_t             not_count;
+    struct QSelList    **is_lists;
+    uint32_t             is_count;
+    struct QSelHasList **has_lists;
+    uint32_t             has_count;
+    bool                 impossible;
+    QSelCombinator       comb_to_next;
 } QSelStep;
 
 typedef struct QSelChain {
@@ -990,7 +1121,19 @@ typedef struct QSelList {
     size_t     cap;
 } QSelList;
 
+typedef struct QSelRelChain {
+    QSelCombinator rel_comb;
+    QSelChain      chain;
+} QSelRelChain;
+
+typedef struct QSelHasList {
+    QSelRelChain *items;
+    size_t        count;
+    size_t        cap;
+} QSelHasList;
+
 static void free_qsel_list(QSelList *list);
+static void free_qsel_has_list(QSelHasList *hlist);
 
 static void free_qsel_step(QSelStep *st) {
     if (!st) return;
@@ -1006,6 +1149,10 @@ static void free_qsel_step(QSelStep *st) {
         free(st->attrs[i].val);
     }
     free(st->attrs);
+    if (st->nth_of_list) {
+        free_qsel_list(st->nth_of_list);
+        free(st->nth_of_list);
+    }
     for (uint32_t i = 0u; i < st->not_count; ++i) {
         free_qsel_list(st->not_lists[i]);
         free(st->not_lists[i]);
@@ -1016,6 +1163,25 @@ static void free_qsel_step(QSelStep *st) {
         free(st->is_lists[i]);
     }
     free(st->is_lists);
+    for (uint32_t i = 0u; i < st->has_count; ++i) {
+        free_qsel_has_list(st->has_lists[i]);
+        free(st->has_lists[i]);
+    }
+    free(st->has_lists);
+}
+
+static void free_qsel_has_list(QSelHasList *hlist) {
+    if (!hlist) return;
+    for (size_t c = 0u; c < hlist->count; ++c) {
+        for (uint32_t s = 0u; s < hlist->items[c].chain.step_count; ++s) {
+            free_qsel_step(&hlist->items[c].chain.steps[s]);
+        }
+        free(hlist->items[c].chain.steps);
+    }
+    free(hlist->items);
+    hlist->items = NULL;
+    hlist->count = 0u;
+    hlist->cap   = 0u;
 }
 
 static void free_qsel_list(QSelList *list) {
@@ -1147,6 +1313,7 @@ static bool qsel_parse_nth_expr(const char *s, size_t len, int32_t *out_a, int32
 }
 
 static bool parse_qsel_list_str(const char *s, size_t len, int depth, QSelList *out_list);
+static bool parse_qsel_has_list_str(const char *s, size_t len, int depth, QSelHasList *out_hlist);
 
 static bool parse_qsel_compound(const char *s, size_t len, int depth, QSelStep *out) {
     memset(out, 0, sizeof(*out));
@@ -1344,8 +1511,9 @@ static bool parse_qsel_compound(const char *s, size_t len, int depth, QSelStep *
                 out->req_disabled = true;
             } else if (arcr_str_eq_nocase_n(ps, plen, "enabled", 7u)) {
                 out->req_enabled = true;
-            } else if (arcr_str_eq_nocase_n(ps, plen, "root", 4u)) {
-                out->req_root = true;
+            } else if (arcr_str_eq_nocase_n(ps, plen, "root", 4u) ||
+                       arcr_str_eq_nocase_n(ps, plen, "scope", 5u)) {
+                out->req_root = arcr_str_eq_nocase_n(ps, plen, "root", 4u);
             } else if (arcr_str_eq_nocase_n(ps, plen, "empty", 5u)) {
                 out->req_empty = true;
             } else if (arcr_str_eq_nocase_n(ps, plen, "first-child", 11u)) {
@@ -1354,11 +1522,62 @@ static bool parse_qsel_compound(const char *s, size_t len, int depth, QSelStep *
                 out->req_last_child = true;
             } else if (arcr_str_eq_nocase_n(ps, plen, "only-child", 10u)) {
                 out->req_only_child = true;
-            } else if (arcr_str_eq_nocase_n(ps, plen, "nth-child", 9u)) {
-                if (!arg || !qsel_parse_nth_expr(arg, alen, &out->nth_a, &out->nth_b)) {
+            } else if (arcr_str_eq_nocase_n(ps, plen, "first-of-type", 13u)) {
+                out->req_first_of_type = true;
+            } else if (arcr_str_eq_nocase_n(ps, plen, "last-of-type", 12u)) {
+                out->req_last_of_type = true;
+            } else if (arcr_str_eq_nocase_n(ps, plen, "only-of-type", 12u)) {
+                out->req_only_of_type = true;
+            } else if (arcr_str_eq_nocase_n(ps, plen, "nth-child", 9u) ||
+                       arcr_str_eq_nocase_n(ps, plen, "nth-last-child", 14u)) {
+                bool from_end = arcr_str_eq_nocase_n(ps, plen, "nth-last-child", 14u);
+                if (!arg) {
                     out->impossible = true;
                 } else {
-                    out->has_nth = true;
+                    const char *expr_s = arg;
+                    size_t      expr_l = alen;
+                    const char *of_s   = NULL;
+                    size_t      of_l   = 0u;
+                    for (size_t k = 0u; k + 3u < alen; ++k) {
+                        if (is_ws_char(arg[k]) &&
+                            (arg[k + 1u] == 'o' || arg[k + 1u] == 'O') &&
+                            (arg[k + 2u] == 'f' || arg[k + 2u] == 'F') &&
+                            is_ws_char(arg[k + 3u])) {
+                            expr_l = k;
+                            of_s   = arg + k + 4u;
+                            of_l   = alen - (k + 4u);
+                            break;
+                        }
+                    }
+                    if (!qsel_parse_nth_expr(expr_s, expr_l, &out->nth_a, &out->nth_b)) {
+                        out->impossible = true;
+                    } else if (of_s) {
+                        QSelList *ofl = (QSelList *)calloc(1u, sizeof(QSelList));
+                        if (!ofl || !parse_qsel_list_str(of_s, of_l, depth + 1, ofl)) {
+                            free_qsel_list(ofl);
+                            free(ofl);
+                            return false;
+                        }
+                        if (out->nth_of_list) {
+                            free_qsel_list(out->nth_of_list);
+                            free(out->nth_of_list);
+                        }
+                        out->nth_of_list  = ofl;
+                        out->has_nth      = true;
+                        out->nth_from_end = from_end;
+                    } else {
+                        out->has_nth      = true;
+                        out->nth_from_end = from_end;
+                    }
+                }
+            } else if (arcr_str_eq_nocase_n(ps, plen, "nth-of-type", 11u) ||
+                       arcr_str_eq_nocase_n(ps, plen, "nth-last-of-type", 16u)) {
+                bool from_end = arcr_str_eq_nocase_n(ps, plen, "nth-last-of-type", 16u);
+                if (!arg || !qsel_parse_nth_expr(arg, alen, &out->nth_type_a, &out->nth_type_b)) {
+                    out->impossible = true;
+                } else {
+                    out->has_nth_of_type   = true;
+                    out->nth_type_from_end = from_end;
                 }
             } else if (arcr_str_eq_nocase_n(ps, plen, "not", 3u)) {
                 if (!arg) return false;
@@ -1386,6 +1605,18 @@ static bool parse_qsel_compound(const char *s, size_t len, int depth, QSelStep *
                 if (!il) { free_qsel_list(sub); free(sub); return false; }
                 out->is_lists = il;
                 out->is_lists[out->is_count++] = sub;
+            } else if (arcr_str_eq_nocase_n(ps, plen, "has", 3u)) {
+                if (!arg) return false;
+                QSelHasList *hsub = (QSelHasList *)calloc(1u, sizeof(QSelHasList));
+                if (!hsub || !parse_qsel_has_list_str(arg, alen, depth + 1, hsub)) {
+                    free_qsel_has_list(hsub); free(hsub);
+                    return false;
+                }
+                QSelHasList **hl = (QSelHasList **)realloc(
+                    out->has_lists, (out->has_count + 1u) * sizeof(QSelHasList *));
+                if (!hl) { free_qsel_has_list(hsub); free(hsub); return false; }
+                out->has_lists = hl;
+                out->has_lists[out->has_count++] = hsub;
             } else {
                 out->impossible = true;
                 return true;
@@ -1471,6 +1702,72 @@ static bool parse_qsel_chain(const char *s, size_t len, int depth, QSelChain *ou
     }
     out->valid = (out->step_count > 0u);
     return out->valid;
+}
+
+static bool parse_qsel_has_list_str(const char *s, size_t len, int depth, QSelHasList *out_hlist) {
+    memset(out_hlist, 0, sizeof(*out_hlist));
+    arcr_str_trim_view(&s, &len);
+    if (len == 0u || depth > 4) return false;
+
+    size_t pos = 0u;
+    while (pos < len) {
+        size_t comma = pos;
+        int bracket = 0;
+        int paren   = 0;
+        char quote  = 0;
+        while (comma < len) {
+            if (s[comma] == '\\' && comma + 1u < len) {
+                comma += 2u;
+                continue;
+            }
+            if (quote) {
+                if (s[comma] == quote) quote = 0;
+            } else {
+                if (s[comma] == '"' || s[comma] == '\'') quote = s[comma];
+                else if (s[comma] == '[') ++bracket;
+                else if (s[comma] == ']' && bracket > 0) --bracket;
+                else if (s[comma] == '(') ++paren;
+                else if (s[comma] == ')' && paren > 0) --paren;
+                else if (s[comma] == ',' && bracket == 0 && paren == 0) break;
+            }
+            ++comma;
+        }
+
+        const char *seg  = s + pos;
+        size_t      slen = comma - pos;
+        arcr_str_trim_view(&seg, &slen);
+        if (slen > 0u) {
+            QSelCombinator rcomb = QSEL_COMB_DESCENDANT;
+            if (seg[0] == '>' || seg[0] == '+' || seg[0] == '~') {
+                if (seg[0] == '>')      rcomb = QSEL_COMB_CHILD;
+                else if (seg[0] == '+') rcomb = QSEL_COMB_ADJACENT;
+                else                    rcomb = QSEL_COMB_SIBLING;
+                ++seg;
+                --slen;
+                arcr_str_trim_view(&seg, &slen);
+            }
+            if (out_hlist->count >= out_hlist->cap) {
+                size_t ncap = (out_hlist->cap == 0u) ? 4u : (out_hlist->cap * 2u);
+                QSelRelChain *ni = (QSelRelChain *)realloc(
+                    out_hlist->items, ncap * sizeof(QSelRelChain));
+                if (!ni) return false;
+                out_hlist->items = ni;
+                out_hlist->cap   = ncap;
+            }
+            QSelRelChain *item = &out_hlist->items[out_hlist->count];
+            item->rel_comb = rcomb;
+            if (slen > 0u && parse_qsel_chain(seg, slen, depth, &item->chain)) {
+                out_hlist->count++;
+            } else {
+                for (uint32_t k = 0u; k < item->chain.step_count; ++k) {
+                    free_qsel_step(&item->chain.steps[k]);
+                }
+                free(item->chain.steps);
+            }
+        }
+        pos = (comma < len) ? (comma + 1u) : len;
+    }
+    return out_hlist->count > 0u;
 }
 
 static bool parse_qsel_list_str(const char *s, size_t len, int depth, QSelList *out_list) {
@@ -1591,6 +1888,8 @@ static bool qsel_nth_matches(int32_t idx_1based, int32_t a, int32_t b) {
 
 static bool qsel_list_matches_el(const ArcrDocument *doc, const QSelList *list,
                                  const ArcrDomNode *el);
+static bool qsel_has_list_matches_el(const ArcrDocument *doc, const QSelHasList *hlist,
+                                     const ArcrDomNode *el);
 
 static bool qsel_step_matches(const ArcrDocument *doc, const QSelStep *step,
                               const ArcrDomNode *el) {
@@ -1626,13 +1925,54 @@ static bool qsel_step_matches(const ArcrDocument *doc, const QSelStep *step,
             if (n->kind == ARCR_NODE_ELEMENT) return false;
         }
     }
+    if (step->req_first_of_type || step->req_only_of_type) {
+        if (!el->parent) return false;
+        for (const ArcrDomNode *p = el->prev_sibling; p != NULL; p = p->prev_sibling) {
+            if (p->kind == ARCR_NODE_ELEMENT && p->tag == el->tag) return false;
+        }
+    }
+    if (step->req_last_of_type || step->req_only_of_type) {
+        if (!el->parent) return false;
+        for (const ArcrDomNode *n = el->next_sibling; n != NULL; n = n->next_sibling) {
+            if (n->kind == ARCR_NODE_ELEMENT && n->tag == el->tag) return false;
+        }
+    }
     if (step->has_nth) {
         if (!el->parent) return false;
+        if (step->nth_of_list && !qsel_list_matches_el(doc, step->nth_of_list, el)) {
+            return false;
+        }
         int32_t idx = 1;
-        for (const ArcrDomNode *p = el->prev_sibling; p != NULL; p = p->prev_sibling) {
-            if (p->kind == ARCR_NODE_ELEMENT) ++idx;
+        if (step->nth_from_end) {
+            for (const ArcrDomNode *n = el->next_sibling; n != NULL; n = n->next_sibling) {
+                if (n->kind == ARCR_NODE_ELEMENT &&
+                    (!step->nth_of_list || qsel_list_matches_el(doc, step->nth_of_list, n))) {
+                    ++idx;
+                }
+            }
+        } else {
+            for (const ArcrDomNode *p = el->prev_sibling; p != NULL; p = p->prev_sibling) {
+                if (p->kind == ARCR_NODE_ELEMENT &&
+                    (!step->nth_of_list || qsel_list_matches_el(doc, step->nth_of_list, p))) {
+                    ++idx;
+                }
+            }
         }
         if (!qsel_nth_matches(idx, step->nth_a, step->nth_b)) return false;
+    }
+    if (step->has_nth_of_type) {
+        if (!el->parent) return false;
+        int32_t idx = 1;
+        if (step->nth_type_from_end) {
+            for (const ArcrDomNode *n = el->next_sibling; n != NULL; n = n->next_sibling) {
+                if (n->kind == ARCR_NODE_ELEMENT && n->tag == el->tag) ++idx;
+            }
+        } else {
+            for (const ArcrDomNode *p = el->prev_sibling; p != NULL; p = p->prev_sibling) {
+                if (p->kind == ARCR_NODE_ELEMENT && p->tag == el->tag) ++idx;
+            }
+        }
+        if (!qsel_nth_matches(idx, step->nth_type_a, step->nth_type_b)) return false;
     }
 
     if (step->tag_len > 0u) {
@@ -1677,23 +2017,51 @@ static bool qsel_step_matches(const ArcrDocument *doc, const QSelStep *step,
     for (uint32_t k = 0u; k < step->is_count; ++k) {
         if (!qsel_list_matches_el(doc, step->is_lists[k], el)) return false;
     }
+    for (uint32_t k = 0u; k < step->has_count; ++k) {
+        if (!qsel_has_list_matches_el(doc, step->has_lists[k], el)) return false;
+    }
     return true;
 }
 
-static bool qsel_chain_matches_at(const ArcrDocument *doc, const QSelChain *chain,
-                                  uint32_t idx, const ArcrDomNode *el) {
+static bool qsel_anchor_relation_ok(const ArcrDomNode *anchor, QSelCombinator rel_comb,
+                                    const ArcrDomNode *first_matched) {
+    if (!anchor) return true;
+    if (rel_comb == QSEL_COMB_CHILD) {
+        return first_matched->parent == anchor;
+    }
+    if (rel_comb == QSEL_COMB_ADJACENT) {
+        for (const ArcrDomNode *p = first_matched->prev_sibling; p != NULL; p = p->prev_sibling) {
+            if (p->kind == ARCR_NODE_ELEMENT) return p == anchor;
+        }
+        return false;
+    }
+    if (rel_comb == QSEL_COMB_SIBLING) {
+        for (const ArcrDomNode *p = first_matched->prev_sibling; p != NULL; p = p->prev_sibling) {
+            if (p == anchor) return true;
+        }
+        return false;
+    }
+    for (const ArcrDomNode *anc = first_matched->parent; anc != NULL; anc = anc->parent) {
+        if (anc == anchor) return true;
+    }
+    return false;
+}
+
+static bool qsel_chain_matches_at_rel(const ArcrDocument *doc, const QSelChain *chain,
+                                      uint32_t idx, const ArcrDomNode *el,
+                                      const ArcrDomNode *anchor, QSelCombinator rel_comb) {
     if (!qsel_step_matches(doc, &chain->steps[idx], el)) return false;
-    if (idx == 0u) return true;
+    if (idx == 0u) return qsel_anchor_relation_ok(anchor, rel_comb, el);
 
     QSelCombinator comb = chain->steps[idx - 1u].comb_to_next;
     if (comb == QSEL_COMB_CHILD) {
         if (!el->parent || el->parent->kind != ARCR_NODE_ELEMENT) return false;
-        return qsel_chain_matches_at(doc, chain, idx - 1u, el->parent);
+        return qsel_chain_matches_at_rel(doc, chain, idx - 1u, el->parent, anchor, rel_comb);
     }
     if (comb == QSEL_COMB_ADJACENT) {
         for (const ArcrDomNode *p = el->prev_sibling; p != NULL; p = p->prev_sibling) {
             if (p->kind == ARCR_NODE_ELEMENT) {
-                return qsel_chain_matches_at(doc, chain, idx - 1u, p);
+                return qsel_chain_matches_at_rel(doc, chain, idx - 1u, p, anchor, rel_comb);
             }
         }
         return false;
@@ -1701,7 +2069,7 @@ static bool qsel_chain_matches_at(const ArcrDocument *doc, const QSelChain *chai
     if (comb == QSEL_COMB_SIBLING) {
         for (const ArcrDomNode *p = el->prev_sibling; p != NULL; p = p->prev_sibling) {
             if (p->kind == ARCR_NODE_ELEMENT &&
-                qsel_chain_matches_at(doc, chain, idx - 1u, p)) {
+                qsel_chain_matches_at_rel(doc, chain, idx - 1u, p, anchor, rel_comb)) {
                 return true;
             }
         }
@@ -1709,8 +2077,58 @@ static bool qsel_chain_matches_at(const ArcrDocument *doc, const QSelChain *chai
     }
     for (const ArcrDomNode *anc = el->parent; anc != NULL; anc = anc->parent) {
         if (anc->kind == ARCR_NODE_ELEMENT &&
-            qsel_chain_matches_at(doc, chain, idx - 1u, anc)) {
+            qsel_chain_matches_at_rel(doc, chain, idx - 1u, anc, anchor, rel_comb)) {
             return true;
+        }
+    }
+    return false;
+}
+
+static bool qsel_rel_chain_matches_subtree(const ArcrDocument *doc, const QSelRelChain *rel,
+                                           const ArcrDomNode *anchor,
+                                           const ArcrDomNode *sub_root) {
+    const ArcrDomNode *cur = sub_root;
+    while (cur) {
+        if (cur->kind == ARCR_NODE_ELEMENT &&
+            qsel_chain_matches_at_rel(doc, &rel->chain, rel->chain.step_count - 1u,
+                                      cur, anchor, rel->rel_comb)) {
+            return true;
+        }
+        if (cur->first_child) {
+            cur = cur->first_child;
+        } else {
+            while (cur && cur != sub_root && !cur->next_sibling) cur = cur->parent;
+            if (!cur || cur == sub_root) break;
+            cur = cur->next_sibling;
+        }
+    }
+    return false;
+}
+
+static bool qsel_has_list_matches_el(const ArcrDocument *doc, const QSelHasList *hlist,
+                                     const ArcrDomNode *el) {
+    if (!hlist || !el || el->kind != ARCR_NODE_ELEMENT) return false;
+    for (size_t g = 0u; g < hlist->count; ++g) {
+        const QSelRelChain *rel = &hlist->items[g];
+        if (!rel->chain.valid || rel->chain.step_count == 0u) continue;
+
+        if (rel->rel_comb == QSEL_COMB_CHILD && rel->chain.step_count == 1u) {
+            for (const ArcrDomNode *ch = el->first_child; ch != NULL; ch = ch->next_sibling) {
+                if (ch->kind == ARCR_NODE_ELEMENT &&
+                    qsel_step_matches(doc, &rel->chain.steps[0], ch)) {
+                    return true;
+                }
+            }
+        } else if (rel->rel_comb == QSEL_COMB_CHILD || rel->rel_comb == QSEL_COMB_DESCENDANT) {
+            for (const ArcrDomNode *ch = el->first_child; ch != NULL; ch = ch->next_sibling) {
+                if (qsel_rel_chain_matches_subtree(doc, rel, el, ch)) return true;
+            }
+        } else {
+            for (const ArcrDomNode *sib = el->next_sibling; sib != NULL; sib = sib->next_sibling) {
+                if (sib->kind != ARCR_NODE_ELEMENT) continue;
+                if (qsel_rel_chain_matches_subtree(doc, rel, el, sib)) return true;
+                if (rel->rel_comb == QSEL_COMB_ADJACENT && rel->chain.step_count == 1u) break;
+            }
         }
     }
     return false;
@@ -1721,8 +2139,9 @@ static bool qsel_list_matches_el(const ArcrDocument *doc, const QSelList *list,
     if (!list || !el || el->kind != ARCR_NODE_ELEMENT) return false;
     for (size_t g = 0u; g < list->count; ++g) {
         if (list->chains[g].valid &&
-            qsel_chain_matches_at(doc, &list->chains[g],
-                                  list->chains[g].step_count - 1u, el)) {
+            qsel_chain_matches_at_rel(doc, &list->chains[g],
+                                      list->chains[g].step_count - 1u, el,
+                                      NULL, QSEL_COMB_NONE)) {
             return true;
         }
     }

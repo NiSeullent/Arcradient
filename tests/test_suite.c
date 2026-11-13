@@ -1692,11 +1692,518 @@ static void test_33_zero_lag_cached_tab_switching_and_shortcuts(void) {
     arcr_engine_destroy(eng);
 }
 
+/* 34. H01/S01: Resumable HTML5 Parser, <template> Inert Content, <noscript>, Foster Table & document.write */
+static void test_34_resumable_html5_parser_template_foster_and_docwrite(void) {
+    ArcrAtomTable atoms;
+    arcr_atom_table_init(&atoms, 256u);
+
+    const char *html =
+        "<!doctype html><html><head><title>Resumable H01</title>"
+        "<noscript><div id='ns-trap'>ShouldNotParse</div></noscript>"
+        "</head><body>"
+        "<template id='tpl'><div id='inside-tpl'>Inert</div></template>"
+        "<table><tr><td>Cell1</td></tr><span id='fostered'>FosterText</span></table>"
+        "<script id='s1'>window.__p = 1;</script>"
+        "<p id='after'>&mdash; &#xAC00; Done</p>"
+        "</body></html>";
+
+    ArcrHtmlParser *p = arcr_html_parser_begin(&atoms, html, strlen(html), true);
+    ASSERT_TRUE(p != NULL, "Began resumable HTML5 parser with scripting_enabled=true");
+
+    int script_pauses = 0;
+    for (;;) {
+        ArcrDomNode *paused_node = NULL;
+        ArcrHtmlPauseReason r = arcr_html_parser_resume(p, &paused_node);
+        if (r == ARCR_HTML_PARSE_DONE) break;
+        if (r == ARCR_HTML_PARSE_PAUSE_SCRIPT) {
+            script_pauses++;
+            const char *injected = "<em id='dw-node'>DocWriteOK</em>";
+            ASSERT_TRUE(arcr_html_parser_document_write(p, injected, strlen(injected)),
+                        "arcr_html_parser_document_write injected stream at script pause");
+        }
+    }
+    ArcrDocument *doc = arcr_html_parser_finish(p);
+    ASSERT_TRUE(doc != NULL && script_pauses == 1, "Resumable parser paused once at </script> and finished");
+
+    ASSERT_TRUE(arcr_dom_get_element_by_id(doc, "ns-trap") == NULL,
+                "<noscript> markup ignored as rawtext when scripting_enabled=true");
+    ArcrDomNode *tpl = arcr_dom_get_element_by_id(doc, "tpl");
+    ASSERT_TRUE(tpl != NULL && tpl->first_child == NULL && tpl->template_content != NULL &&
+                tpl->template_content->first_child != NULL,
+                "<template> isolated inert children inside template_content");
+    ASSERT_TRUE(arcr_dom_get_element_by_id(doc, "inside-tpl") == NULL,
+                "Inert <template> child excluded from main document getElementById");
+    ASSERT_TRUE(arcr_dom_get_element_by_id(doc, "fostered") != NULL,
+                "Misnested <span> inside <table> recovered via foster parenting");
+    ASSERT_TRUE(arcr_dom_get_element_by_id(doc, "dw-node") != NULL,
+                "document.write() chunk parsed in exact stream order before trailing <p>");
+
+    ArcrDomNode *after = arcr_dom_get_element_by_id(doc, "after");
+    char txt[128] = {0};
+    arcr_dom_get_text_content(after, txt, sizeof(txt));
+    ASSERT_TRUE(strstr(txt, "가") != NULL && strstr(txt, "Done") != NULL,
+                "Named (&mdash;) and hex (&#xAC00;) character references decoded");
+
+    arcr_dom_document_destroy(doc);
+    arcr_atom_table_destroy(&atoms);
+}
+
+/* 35. C01/C02: CSS 2026 Truthful @supports, @layer !important/revert-layer, @container, @scope, Nesting & Grid */
+static void test_35_css_2026_supports_layers_container_scope_and_grid(void) {
+    ASSERT_TRUE(arcr_css_supports_declaration("display", 7u, "grid", 4u),
+                "arcr_css_supports_declaration('display','grid') is true");
+    ASSERT_TRUE(!arcr_css_supports_declaration("nonexistent-prop-2099", 21u, "1px", 3u),
+                "arcr_css_supports_declaration rejects unknown CSS property truthfully");
+    ASSERT_TRUE(arcr_css_supports_condition("(display: flex) and (not (unknown-prop: 1))", 43u),
+                "arcr_css_supports_condition evaluates compound boolean logic truthfully");
+
+    ArcrAtomTable atoms;
+    arcr_atom_table_init(&atoms, 256u);
+    ArcrFontSystem *fs = arcr_font_system_create(NULL);
+
+    const char *html =
+        "<!doctype html><html><head><style>"
+        "  @layer base, theme, utilities;"
+        "  @layer base {"
+        "    #imp { color: #ef4444 !important; }"
+        "    #rev { background-color: #10b981; }"
+        "  }"
+        "  @layer utilities {"
+        "    #imp { color: #2563eb !important; }"
+        "    #rev { background-color: #f59e0b; background-color: revert-layer; }"
+        "  }"
+        "  @supports (not-a-real-prop: 42px) { #imp { display: none; } }"
+        "  .cq-wide { container-type: inline-size; width: 420px; }"
+        "  .cq-narrow { container-type: inline-size; width: 180px; }"
+        "  .cq-item { color: #64748b; }"
+        "  @container (min-width: 300px) { .cq-item { color: #22c55e; } }"
+        "  @scope (.card) to (.slot) { .label { color: #a855f7; } }"
+        "  #grid { display: grid; width: 800px; grid-template-columns: 240px 1fr; gap: 16px;"
+        "          & > .cell { height: 40px; padding-inline: 12px; } }"
+        "</style></head><body style='margin:0'>"
+        "  <div id='imp'>Important Layer</div>"
+        "  <div id='rev'>Revert Layer</div>"
+        "  <div class='cq-wide'><span id='cq-hit' class='cq-item'>Wide</span></div>"
+        "  <div class='cq-narrow'><span id='cq-miss' class='cq-item'>Narrow</span></div>"
+        "  <div class='card'><span id='sc-in' class='label'>In</span><div class='slot'><span id='sc-out' class='label'>Out</span></div></div>"
+        "  <div id='grid'><div id='g1' class='cell'>Sidebar</div><div id='g2' class='cell'>Main</div></div>"
+        "</body></html>";
+
+    ArcrDocument *doc = arcr_html_parse(&atoms, html, strlen(html));
+    ArcrCssMediaEnv env = {1024, 768, false};
+    ArcrStylesheet *sh = arcr_css_parse_document_styles_ex(doc, &env);
+    arcr_css_resolve_tree(doc, sh, NULL);
+    ArcrLayoutTree *lt = arcr_layout_build_ex(doc, fs, 1024, 768, 100);
+    ASSERT_TRUE(lt != NULL, "Built layout tree with @container and explicit multi-track CSS Grid");
+
+    ArcrDomNode *imp = arcr_dom_get_element_by_id(doc, "imp");
+    ArcrDomNode *rev = arcr_dom_get_element_by_id(doc, "rev");
+    ASSERT_TRUE(imp != NULL && imp->computed_style->display != ARCR_DISPLAY_NONE,
+                "False @supports block skipped cleanly");
+    ASSERT_TRUE(imp->computed_style->color_argb == 0xFFEF4444u,
+                "CSS Cascade Layers !important inversion: earlier @layer base beat @layer utilities");
+    ASSERT_TRUE(rev != NULL && rev->computed_style->bg_argb == 0xFF10B981u,
+                "revert-layer rolled back @layer utilities declaration to @layer base (#10b981)");
+
+    ArcrDomNode *cq_hit  = arcr_dom_get_element_by_id(doc, "cq-hit");
+    ArcrDomNode *cq_miss = arcr_dom_get_element_by_id(doc, "cq-miss");
+    ASSERT_TRUE(cq_hit != NULL && cq_hit->computed_style->color_argb == 0xFF22C55Eu &&
+                cq_miss != NULL && cq_miss->computed_style->color_argb == 0xFF64748Bu,
+                "@container (min-width: 300px) matched 420px inline-size container and skipped 180px");
+
+    ArcrDomNode *sc_in  = arcr_dom_get_element_by_id(doc, "sc-in");
+    ArcrDomNode *sc_out = arcr_dom_get_element_by_id(doc, "sc-out");
+    ASSERT_TRUE(sc_in != NULL && sc_in->computed_style->color_argb == 0xFFA855F7u &&
+                sc_out != NULL && sc_out->computed_style->color_argb != 0xFFA855F7u,
+                "@scope (.card) to (.slot) enforced doughnut scope lower boundary");
+
+    ArcrDomNode *g1 = arcr_dom_get_element_by_id(doc, "g1");
+    ArcrDomNode *g2 = arcr_dom_get_element_by_id(doc, "g2");
+    ASSERT_TRUE(g1 != NULL && g2 != NULL && g1->layout_w == 240 &&
+                g2->layout_x == 256 && g2->layout_w == 544 &&
+                g1->computed_style->padding.left == 12 && g1->computed_style->padding.right == 12,
+                "Explicit CSS Grid '240px 1fr' + gap:16px + nested '& > .cell' + padding-inline laid out accurately");
+
+    arcr_layout_destroy(lt);
+    arcr_css_destroy_stylesheet(sh);
+    arcr_dom_document_destroy(doc);
+    arcr_font_system_destroy(fs);
+    arcr_atom_table_destroy(&atoms);
+}
+
+/* 36. P2 Clean-Room ArcradientJS ES2026: Classes, Private Fields, Generators, BigInt, Proxy, Intl & GC */
+static void test_36_arcradient_js_cleanroom_es2026_bigint_proxy_intl_and_gc(void) {
+    ArcrEngineConfig cfg;
+    arcr_engine_default_config(&cfg, ARCR_PROFILE_MODERN);
+    cfg.module_search_dir = g_module_dir;
+    cfg.conformance_mode  = true;
+    ArcrEngine *eng = arcr_engine_create(&cfg);
+    ArcrWebView *vw = arcr_webview_create(eng, 640, 480, NULL);
+
+    const char *html =
+        "<!doctype html><html><body><script>"
+        "  class Vault {"
+        "    #secret = 40;"
+        "    static bonus = 0;"
+        "    static { Vault.bonus = 2; }"
+        "    read() { return this.#secret + Vault.bonus; }"
+        "  }"
+        "  function* seq() { yield 10; yield 20; }"
+        "  let genSum = 0; for (const v of seq()) genSum += v;"
+        "  const big = ((1n << 64n) + 7n) - (1n << 64n);"
+        "  const p = new Proxy({ x: 5 }, { get(t, k) { return k === 'x' ? t.x * 3 : Reflect.get(t, k); } });"
+        "  const sorted = [3, 1, 2].toSorted((a, b) => a - b).with(2, 9);"
+        "  const rx = /(?<yr>\\d{4})-(?<mo>\\d{2})/.exec('2026-11');"
+        "  const nf = new Intl.NumberFormat('en-US').format(12345);"
+        "  for (let i = 0; i < 1500; i++) { const tmp = { idx: i, arr: [i, i + 1] }; void tmp; }"
+        "  const { promise, resolve } = Promise.withResolvers();"
+        "  resolve('OK');"
+        "  promise.then(tag => {"
+        "    document.title = [new Vault().read(), genSum, String(big), p.x, sorted.join(''), rx.groups.yr, nf, tag].join(':');"
+        "  });"
+        "</script></body></html>";
+
+    ASSERT_TRUE(arcr_webview_load_html(vw, "https://js2026.local/", html, strlen(html)),
+                "Loaded clean-room ArcradientJS ES2026 test document");
+
+    ArcrEngineStats st;
+    arcr_engine_get_stats(eng, &st);
+    ASSERT_TRUE(st.js_engine_backend != NULL && strstr(st.js_engine_backend, "ArcradientJS") != NULL,
+                "Active shipping JS engine backend is clean-room ArcradientJS (not QuickJS)");
+    ASSERT_TRUE(strcmp(arcr_webview_get_title(vw), "42:30:7:15:129:2026:12,345:OK") == 0,
+                "ArcradientJS executed #private, static{}, generator, BigInt, Proxy/Reflect, toSorted/with, RegExp groups, Intl & Promise.withResolvers");
+
+    arcr_webview_destroy(vw);
+    arcr_engine_destroy(eng);
+}
+
+/* 37. S01/S02: External ES Modules, Import Map, Live Bindings, Top-Level Await, Dynamic import() & Request Trace */
+typedef struct EsmLoopbackCtx {
+    int      listen_fd;
+    uint16_t port;
+} EsmLoopbackCtx;
+
+static void serve_one_esm_conn(EsmLoopbackCtx *srv) {
+    struct sockaddr_in cli;
+#if defined(_WIN32)
+    int clen = (int)sizeof(cli);
+#else
+    socklen_t clen = (socklen_t)sizeof(cli);
+#endif
+    int cfd = (int)accept(srv->listen_fd, (struct sockaddr *)&cli, &clen);
+    if (cfd < 0) return;
+
+    char req[2048];
+    int rlen = (int)recv(cfd, req, sizeof(req) - 1, 0);
+    if (rlen <= 0) {
+        WS_CLOSE_SOCK(cfd);
+        return;
+    }
+    req[rlen] = '\0';
+
+    const char *ctype = "text/javascript; charset=utf-8";
+    const char *body  = "";
+    if (strncmp(req, "GET /index.html", 15) == 0) {
+        ctype = "text/html; charset=utf-8";
+        body =
+            "<!doctype html><html><head>"
+            "<script type='importmap'>{\"imports\":{\"pkg-counter\":\"./counter.js\"}}</script>"
+            "<script type='module' src='./entry.js'></script>"
+            "</head><body><script>document.body.setAttribute('data-classic','ran');</script></body></html>";
+    } else if (strncmp(req, "GET /counter.js", 15) == 0) {
+        body = "export let count = 1; export function inc() { count += 4; }";
+    } else if (strncmp(req, "GET /dyn.js", 11) == 0) {
+        body = "export const extra = 'DYN';";
+    } else if (strncmp(req, "GET /entry.js", 13) == 0) {
+        body =
+            "import { count, inc } from 'pkg-counter';"
+            "const before = count; inc();"
+            "const tla = await Promise.resolve('TLA');"
+            "const mod = await import('./dyn.js');"
+            "const hasMeta = import.meta.url.indexOf('/entry.js') !== -1;"
+            "document.title = before + ':' + count + ':' + tla + ':' + mod.extra + ':' + (hasMeta ? 'META' : 'NO');";
+    }
+
+    char hdr[512];
+    int hlen = snprintf(hdr, sizeof(hdr),
+                        "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+                        ctype, (unsigned long)strlen(body));
+    send(cfd, hdr, hlen, 0);
+    if (body[0] != '\0') {
+        send(cfd, body, (int)strlen(body), 0);
+    }
+    shutdown(cfd, 1);
+    WS_CLOSE_SOCK(cfd);
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI esm_server_thread(LPVOID arg) {
+    EsmLoopbackCtx *srv = (EsmLoopbackCtx *)arg;
+    for (int i = 0; i < 4; ++i) serve_one_esm_conn(srv);
+    return 0;
+}
+#else
+static void *esm_server_thread(void *arg) {
+    EsmLoopbackCtx *srv = (EsmLoopbackCtx *)arg;
+    for (int i = 0; i < 4; ++i) serve_one_esm_conn(srv);
+    return NULL;
+}
+#endif
+
+static void test_37_esm_importmap_live_bindings_tla_and_request_trace(void) {
+#if defined(_WIN32)
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#endif
+    EsmLoopbackCtx srv;
+    memset(&srv, 0, sizeof(srv));
+    srv.listen_fd = (int)socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port        = 0;
+    ASSERT_TRUE(bind(srv.listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0, "Bound ESM loopback socket");
+    ASSERT_TRUE(listen(srv.listen_fd, 8) == 0, "Listening on ESM loopback socket");
+
+#if defined(_WIN32)
+    int alen = (int)sizeof(addr);
+#else
+    socklen_t alen = (socklen_t)sizeof(addr);
+#endif
+    getsockname(srv.listen_fd, (struct sockaddr *)&addr, &alen);
+    srv.port = ntohs(addr.sin_port);
+
+#if defined(_WIN32)
+    HANDLE th = CreateThread(NULL, 0, esm_server_thread, &srv, 0, NULL);
+#else
+    pthread_t th;
+    pthread_create(&th, NULL, esm_server_thread, &srv);
+#endif
+
+    ArcrEngineConfig cfg;
+    arcr_engine_default_config(&cfg, ARCR_PROFILE_MODERN);
+    cfg.module_search_dir = g_module_dir;
+    cfg.conformance_mode  = true;
+    ArcrEngine *eng = arcr_engine_create(&cfg);
+    ArcrWebView *vw = arcr_webview_create(eng, 640, 480, NULL);
+
+    /* Include user:secret@ credentials in URL to verify trace URL credential sanitization! */
+    char url[160];
+    snprintf(url, sizeof(url), "http://alice:topsecret@127.0.0.1:%u/index.html", (unsigned)srv.port);
+    ASSERT_TRUE(arcr_webview_navigate_url(vw, url), "Navigated to external ESM + importmap fixture");
+
+    uint64_t t0 = arcr_platform_monotonic_usec();
+    for (int i = 0; i < 20; ++i) {
+        (void)arcr_webview_tick(vw, t0 + (uint64_t)i * 16000ULL);
+        if (strncmp(arcr_webview_get_title(vw), "1:5:TLA:DYN:META", 16u) == 0) break;
+    }
+
+#if defined(_WIN32)
+    WaitForSingleObject(th, 5000);
+    CloseHandle(th);
+#else
+    pthread_join(th, NULL);
+#endif
+    WS_CLOSE_SOCK(srv.listen_fd);
+
+    ASSERT_TRUE(strcmp(arcr_webview_get_title(vw), "1:5:TLA:DYN:META") == 0,
+                "Import map + external ESM live bindings + Top-Level await + dynamic import() + import.meta.url succeeded");
+    ASSERT_TRUE(strcmp(arcr_webview_get_ready_state(vw), "complete") == 0,
+                "Document readyState reached 'complete' after module graph evaluation");
+
+    ArcrRequestTraceEntry traces[16];
+    size_t n_traces = arcr_webview_get_request_traces(vw, traces, 16u);
+    ASSERT_TRUE(n_traces >= 4u && arcr_webview_get_navigation_id(vw) >= 1u &&
+                arcr_webview_get_document_id(vw) >= 1u,
+                "Request trace ring recorded navigation + 3 module fetches with IDs");
+    for (size_t i = 0u; i < n_traces; ++i) {
+        ASSERT_TRUE(strstr(traces[i].url, "topsecret") == NULL &&
+                    strstr(traces[i].final_url, "topsecret") == NULL,
+                    "Request trace sanitized user:password@ credentials from recorded URLs");
+    }
+
+    arcr_webview_destroy(vw);
+    arcr_engine_destroy(eng);
+}
+
+/* 38. P3 Web APIs: CustomElements, Shadow DOM Retargeting, History pushState/popstate, IndexedDB & WebCrypto */
+static void test_38_web_apis_custom_elements_shadow_history_idb_and_crypto(void) {
+    ArcrEngineConfig cfg;
+    arcr_engine_default_config(&cfg, ARCR_PROFILE_MODERN);
+    cfg.module_search_dir = g_module_dir;
+    cfg.conformance_mode  = true;
+    ArcrEngine *eng = arcr_engine_create(&cfg);
+    ArcrWebView *vw = arcr_webview_create(eng, 640, 480, NULL);
+
+    const char *html =
+        "<!doctype html><html><body>"
+        "<ws-badge id='host'></ws-badge>"
+        "<canvas id='cv'></canvas>"
+        "<script>"
+        "  let connected = 0, shadowRetargeted = false, popPath = 'none';"
+        "  class WsBadge extends HTMLElement {"
+        "    connectedCallback() {"
+        "      connected++;"
+        "      const sr = this.attachShadow({ mode: 'open' });"
+        "      const inner = document.createElement('button');"
+        "      inner.id = 'inner-btn';"
+        "      sr.appendChild(inner);"
+        "      this.addEventListener('ping', (e) => { shadowRetargeted = (e.target === this); });"
+        "      inner.dispatchEvent(new CustomEvent('ping', { bubbles: true, composed: true }));"
+        "    }"
+        "  }"
+        "  customElements.define('ws-badge', WsBadge);"
+        "  window.addEventListener('popstate', () => { popPath = location.pathname; });"
+        "  history.pushState({ page: 2 }, '', '/spa/route-2');"
+        "  const afterPush = location.pathname;"
+        "  const cloneOk = structuredClone({ a: [1, 2] }).a[1] === 2;"
+        "  const honestGpu = (document.getElementById('cv').getContext('webgl') === null) &&"
+        "                    (typeof navigator.gpu === 'undefined') &&"
+        "                    CSS.supports('display', 'grid') && !CSS.supports('fake-prop-x', '1');"
+        "  (async () => {"
+        "    const abc = new TextEncoder().encode('abc');"
+        "    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', abc));"
+        "    const hex4 = Array.from(digest.slice(0, 4)).map(b => b.toString(16).padStart(2, '0')).join('');"
+        "    const idbVal = await new Promise((resolve) => {"
+        "      const req = indexedDB.open('ws_test_db', 1);"
+        "      req.onupgradeneeded = () => req.result.createObjectStore('kv');"
+        "      req.onsuccess = () => {"
+        "        const db = req.result;"
+        "        const tx = db.transaction('kv', 'readwrite');"
+        "        tx.objectStore('kv').put('IDB_OK', 'k1');"
+        "        const g = tx.objectStore('kv').get('k1');"
+        "        g.onsuccess = () => resolve(g.result);"
+        "      };"
+        "    });"
+        "    document.title = [connected, shadowRetargeted, afterPush, cloneOk, honestGpu, hex4, idbVal].join('|');"
+        "  })();"
+        "</script></body></html>";
+
+    ASSERT_TRUE(arcr_webview_load_html(vw, "https://webapp.local/home", html, strlen(html)),
+                "Loaded P3 Web API conformance document");
+    uint64_t t0 = arcr_platform_monotonic_usec();
+    for (int i = 0; i < 10; ++i) {
+        (void)arcr_webview_tick(vw, t0 + (uint64_t)i * 16000ULL);
+    }
+
+    ASSERT_TRUE(strcmp(arcr_webview_get_title(vw), "1|true|/spa/route-2|true|true|ba7816bf|IDB_OK") == 0,
+                "CustomElements, ShadowRoot retargeting, pushState, structuredClone, honest WebGL/CSS.supports, SHA-256 & IndexedDB all passed");
+
+    ASSERT_TRUE(arcr_webview_can_go_back(vw) && arcr_webview_go_back(vw),
+                "Same-document history.pushState entry traversed backward via arcr_webview_go_back");
+    (void)arcr_webview_eval_js(vw, "document.title = 'BACK:' + location.pathname;", 45u);
+    ASSERT_TRUE(strcmp(arcr_webview_get_title(vw), "BACK:/home") == 0,
+                "popstate restored location.pathname to '/home' without full reload");
+
+    arcr_webview_destroy(vw);
+    arcr_engine_destroy(eng);
+}
+
+/* 39. Conformance Neutrality Guard: --conformance Excludes Site-Name Hydrator Substitution */
+static void test_39_conformance_mode_excludes_site_hydrators(void) {
+    ArcrEngineConfig cfg;
+    arcr_engine_default_config(&cfg, ARCR_PROFILE_MODERN);
+    cfg.module_search_dir = g_module_dir;
+    cfg.conformance_mode  = true;
+    ArcrEngine *eng = arcr_engine_create(&cfg);
+    ArcrWebView *vw = arcr_webview_create(eng, 800, 600, NULL);
+
+    const char *neutral_x_html =
+        "<!doctype html><html><head><title>NeutralX</title></head>"
+        "<body><div id='react-root'>PureStandardsBody</div></body></html>";
+    ASSERT_TRUE(arcr_webview_load_html(vw, "https://x.com/", neutral_x_html, strlen(neutral_x_html)),
+                "Loaded https://x.com/ under conformance_mode=true");
+    ASSERT_TRUE(strcmp(arcr_webview_get_title(vw), "NeutralX") == 0 &&
+                arcr_webview_find_in_page(vw, "PureStandardsBody", false, NULL) == 1u &&
+                arcr_webview_find_in_page(vw, "X (Twitter)", false, NULL) == 0u,
+                "conformance_mode=true bypassed site-name hydrator DOM replacement completely");
+
+    arcr_webview_destroy(vw);
+    arcr_engine_destroy(eng);
+}
+
+/* 40. W01/04_WIN32_UI: Single-Frame Ownership, Per-Monitor DPI Scaling, 20-Tab Overflow & F12 DevTools */
+static void test_40_single_frame_ownership_dpi_20tabs_overflow_and_devtools(void) {
+    ArcrEngineConfig ecfg;
+    arcr_engine_default_config(&ecfg, ARCR_PROFILE_MODERN);
+    ecfg.module_search_dir = g_module_dir;
+    ArcrEngine *eng = arcr_engine_create(&ecfg);
+
+    ArcrShellConfig scfg;
+    arcr_shell_default_config(&scfg, ARCR_SHELL_THEME_MODERN_DARK);
+    scfg.module_search_dir = g_module_dir;
+    scfg.private_browsing  = true;
+    scfg.window_width      = 1280;
+    scfg.window_height     = 800;
+    ASSERT_TRUE(scfg.draw_os_window_frame == false,
+                "Default browser shell config disables simulated inner OS caption frame (single-frame ownership)");
+
+    ArcrBrowserShell *sh = arcr_shell_create(eng, &scfg);
+    WaterscapeFrameMetrics fm;
+    arcr_shell_default_frame_metrics(&fm);
+    fm.mode                   = ARCR_FRAME_DWM_EXTENDED;
+    fm.dpi                    = 96;
+    fm.os_caption_height_px   = 36;
+    fm.caption_inset_right_px = 138;
+    arcr_shell_set_frame_metrics(sh, &fm);
+
+    ArcrShellLayoutMetrics m96, m144;
+    arcr_shell_compute_layout(sh, &m96);
+    ASSERT_TRUE(m96.window_caption_rect.height == 0 &&
+                m96.os_caption_inset_rect.width == 138 &&
+                arcr_shell_hit_test_chrome_zone(sh, 1280 - 20, 14) == ARCR_CHROME_OS_CAPTION_INSET,
+                "DWM extended single-frame reserves right 138px OS caption button inset with zero inner titlebar");
+
+    /* Scale to 150% DPI (144 DPI) and verify proportional toolbar/tab-strip scaling */
+    fm.dpi = 144;
+    fm.os_caption_height_px   = 54;
+    fm.caption_inset_right_px = 207;
+    arcr_shell_set_frame_metrics(sh, &fm);
+    arcr_shell_compute_layout(sh, &m144);
+    ASSERT_TRUE(m144.tab_strip_rect.height > m96.tab_strip_rect.height &&
+                m144.nav_toolbar_rect.height > m96.nav_toolbar_rect.height,
+                "Per-Monitor V2 DPI update (96 -> 144 DPI) scaled tab strip & navigation toolbar proportionally");
+
+    /* Narrow window (520x480) + 20 tabs: verify overflow count > 0 and non-overlapping tab bounds */
+    fm.dpi = 96;
+    fm.os_caption_height_px   = 36;
+    fm.caption_inset_right_px = 138;
+    arcr_shell_set_frame_metrics(sh, &fm);
+    arcr_shell_resize(sh, 520, 480);
+    for (int i = 0; i < 20; ++i) {
+        (void)arcr_shell_open_tab_url(sh, "waterscape://newtab", false);
+    }
+    ASSERT_TRUE(arcr_shell_tab_count(sh) >= 20u && arcr_shell_get_tab_overflow_count(sh) > 0,
+                "20 tabs in 520px narrow window engaged tab strip overflow handling cleanly");
+
+    /* Toggle F12 DevTools in both Bottom and Right dock modes across all 4 tabs */
+    arcr_shell_resize(sh, 1280, 800);
+    arcr_shell_set_devtools_visible(sh, true);
+    arcr_shell_set_devtools_dock(sh, ARCR_DEVTOOLS_DOCK_RIGHT, 380);
+    ArcrShellLayoutMetrics m_right;
+    arcr_shell_compute_layout(sh, &m_right);
+    ASSERT_TRUE(m_right.devtools_dock_rect.width >= 300 &&
+                m_right.content_viewport.width + m_right.devtools_dock_rect.width <= 1280,
+                "F12 DevTools Right dock partitioned content_viewport and splitter cleanly");
+
+    uint32_t *fb = (uint32_t *)calloc(1280u * 800u, sizeof(uint32_t));
+    for (int tab_idx = 0; tab_idx < 4; ++tab_idx) {
+        arcr_shell_set_devtools_tab(sh, tab_idx);
+        ASSERT_TRUE(arcr_shell_render_frame(sh, fb, 1280, 800, 1280),
+                    "Rendered single-frame browser chrome + F12 DevTools panel");
+    }
+    free(fb);
+
+    arcr_shell_destroy(sh);
+    arcr_engine_destroy(eng);
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) {
         g_module_dir = argv[1];
     }
-    printf("=== Waterscape 2.0 / Arcradient (MSHTML-Next) 33-Test Suite ===\n");
+    printf("=== Waterscape 2.0 / Arcradient (MSHTML-Next) 40-Test Suite ===\n");
     RUN_TEST(test_01_arena_slab_and_atoms);
     RUN_TEST(test_02_module_abi_guard);
     RUN_TEST(test_03_korean_utf8_and_line_breaking);
@@ -1730,6 +2237,13 @@ int main(int argc, char **argv) {
     RUN_TEST(test_31_zuzunza_nextjs_rsc_hydration_and_recovery);
     RUN_TEST(test_32_google_and_x_twitter_modern_support);
     RUN_TEST(test_33_zero_lag_cached_tab_switching_and_shortcuts);
+    RUN_TEST(test_34_resumable_html5_parser_template_foster_and_docwrite);
+    RUN_TEST(test_35_css_2026_supports_layers_container_scope_and_grid);
+    RUN_TEST(test_36_arcradient_js_cleanroom_es2026_bigint_proxy_intl_and_gc);
+    RUN_TEST(test_37_esm_importmap_live_bindings_tla_and_request_trace);
+    RUN_TEST(test_38_web_apis_custom_elements_shadow_history_idb_and_crypto);
+    RUN_TEST(test_39_conformance_mode_excludes_site_hydrators);
+    RUN_TEST(test_40_single_frame_ownership_dpi_20tabs_overflow_and_devtools);
 
     printf("---------------------------------------------------------------\n");
     printf("Result: %d/%d passed (%d failed)\n",

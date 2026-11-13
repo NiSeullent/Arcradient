@@ -12,6 +12,7 @@ option(ARCR_ENABLE_FREETYPE    "Enable optional FreeType2 CJK/Mono glyph backend
 option(ARCR_ENABLE_LIBPNG      "Enable optional libpng PNG export on POSIX (falls back to Pure C PNG codec)" ON)
 option(ARCR_ENABLE_OPENSSL     "Enable OpenSSL TLS 1.2/1.3 HTTPS client on POSIX" ON)
 option(WATERSCAPE_ENABLE_X11   "Enable native X11 + MIT-SHM desktop window presenter on POSIX" ON)
+option(ARCR_ENABLE_QUICKJS_COMPARE "Build optional QuickJS-NG comparison module (OFF in shipping)" OFF)
 
 if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(
@@ -134,20 +135,22 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(arcr_webp_obj PRIVATE -w)
 endif()
 
-add_library(arcr_quickjs_obj OBJECT
-    third_party/quickjs/quickjs.c
-    third_party/quickjs/libregexp.c
-    third_party/quickjs/libunicode.c
-    third_party/quickjs/dtoa.c
-)
-set_target_properties(arcr_quickjs_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(arcr_quickjs_obj PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
-target_compile_definitions(arcr_quickjs_obj PRIVATE QUICKJS_NG_BUILD=1)
-if(NOT WIN32)
-    target_compile_definitions(arcr_quickjs_obj PRIVATE _GNU_SOURCE=1 _DEFAULT_SOURCE=1)
-endif()
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(arcr_quickjs_obj PRIVATE -w)
+if(ARCR_ENABLE_QUICKJS_COMPARE)
+    add_library(arcr_quickjs_obj OBJECT
+        third_party/quickjs/quickjs.c
+        third_party/quickjs/libregexp.c
+        third_party/quickjs/libunicode.c
+        third_party/quickjs/dtoa.c
+    )
+    set_target_properties(arcr_quickjs_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(arcr_quickjs_obj PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
+    target_compile_definitions(arcr_quickjs_obj PRIVATE QUICKJS_NG_BUILD=1)
+    if(NOT WIN32)
+        target_compile_definitions(arcr_quickjs_obj PRIVATE _GNU_SOURCE=1 _DEFAULT_SOURCE=1)
+    endif()
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(arcr_quickjs_obj PRIVATE -w)
+    endif()
 endif()
 
 # =============================================================================
@@ -271,12 +274,65 @@ if((NOT WIN32) AND PkgConfig_FOUND AND ARCR_ENABLE_OPENSSL)
     endif()
 endif()
 
-add_library(arcr_js_portable SHARED
-    js/arcr_js_portable.c
-    $<TARGET_OBJECTS:arcr_quickjs_obj>
+set(ARCR_AJS_SOURCES
+    js/vm/ajs_utf16.c
+    js/vm/ajs_gc.c
+    js/vm/ajs_object.c
+    js/vm/ajs_lexer.c
+    js/vm/ajs_parser.c
+    js/vm/ajs_compiler.c
+    js/vm/ajs_interp.c
+    js/vm/ajs_api.c
+    js/builtins/ajs_builtins.c
+    js/builtins/ajs_string_array.c
+    js/builtins/ajs_collections.c
+    js/builtins/ajs_regexp.c
+    js/builtins/ajs_json.c
+    js/builtins/ajs_promise.c
+    js/builtins/ajs_typedarray.c
+    js/builtins/ajs_intl.c
+    js/modules/ajs_module.c
 )
-target_include_directories(arcr_js_portable PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
+
+set(ARCR_WEB_BINDINGS_SOURCES
+    web/bindings/web_dom_bridge.c
+    web/bindings/web_canvas2d.c
+    web/bindings/web_crypto_streams.c
+    web/bindings/web_bootstrap.c
+    web/bindings/web_js_module.c
+)
+
+add_library(arcr_js_portable SHARED
+    ${ARCR_AJS_SOURCES}
+    ${ARCR_WEB_BINDINGS_SOURCES}
+)
+target_include_directories(arcr_js_portable PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/js/vm"
+)
 target_link_libraries(arcr_js_portable PRIVATE arcr_engine arcr_platform_deps)
+
+# Standalone Clean-Room Pure C11 ArcradientJS CLI & Test262 Host (Zero DOM/Browser Coupling)
+add_executable(arcr_js
+    tools/arcr_js_cli.c
+    ${ARCR_AJS_SOURCES}
+)
+target_include_directories(arcr_js PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/js/vm"
+)
+if(NOT WIN32)
+    target_link_libraries(arcr_js PRIVATE m)
+endif()
+
+if(ARCR_ENABLE_QUICKJS_COMPARE)
+    add_library(arcr_js_quickjs_compare SHARED
+        js/arcr_js_portable.c
+        $<TARGET_OBJECTS:arcr_quickjs_obj>
+    )
+    target_include_directories(arcr_js_quickjs_compare PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/quickjs")
+    target_link_libraries(arcr_js_quickjs_compare PRIVATE arcr_engine arcr_platform_deps)
+endif()
 
 add_library(arcr_media SHARED media/arcr_media.c)
 target_link_libraries(arcr_media PRIVATE arcr_engine arcr_platform_deps)
@@ -470,6 +526,12 @@ if(WIN32)
     )
 endif()
 
+add_executable(win32_ui_verify tools/win32_ui_verify.c)
+target_include_directories(win32_ui_verify PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
+if(WIN32)
+    target_link_libraries(win32_ui_verify PRIVATE user32 gdi32 ole32)
+endif()
+
 if(WIN32)
     # Match arcr_platform_format_module_path ("%s\\%s.dll") without MinGW "lib" prefix
     set_target_properties(
@@ -481,7 +543,7 @@ if(WIN32)
             ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     )
     set_target_properties(
-        waterscape arcradient waterscape_uninstall waterscape_setup_stub
+        waterscape arcradient arcr_js win32_ui_verify waterscape_uninstall waterscape_setup_stub
         PROPERTIES
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
     )
@@ -495,6 +557,7 @@ if(WIN32)
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${WS_STAGE_DIR}/addons"
         COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:waterscape>"           "${WS_STAGE_DIR}/"
         COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcradient>"           "${WS_STAGE_DIR}/"
+        COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_js>"              "${WS_STAGE_DIR}/"
         COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:waterscape_uninstall>" "${WS_STAGE_DIR}/"
         COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_engine>"          "${WS_STAGE_DIR}/"
         COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:arcr_net>"             "${WS_STAGE_DIR}/"
@@ -506,7 +569,7 @@ if(WIN32)
         COMMAND "${CMAKE_COMMAND}" -E copy ${WS_BUNDLED_ADDON_OUTPUTS}           "${WS_STAGE_DIR}/addons/"
         COMMAND "${PACK_INSTALLER_TOOL}" "$<TARGET_FILE:waterscape_setup_stub>" "${WS_STAGE_DIR}" "${WS_SETUP_EXE}"
         DEPENDS
-            waterscape arcradient waterscape_uninstall waterscape_setup_stub
+            waterscape arcradient arcr_js waterscape_uninstall waterscape_setup_stub
             arcr_engine arcr_net arcr_js_portable arcr_media arcr_devtools ws_plugin_perf_hud
             waterscape_brand_assets waterscape_bundled_addons "${PACK_INSTALLER_TOOL}"
         COMMENT "Packing single-file self-extracting Windows installer WaterscapeSetup.exe"
@@ -521,7 +584,7 @@ enable_testing()
 add_executable(arcr_tests tests/test_suite.c)
 target_link_libraries(arcr_tests PRIVATE arcr_shell arcr_engine arcr_platform_deps)
 add_dependencies(arcr_tests
-    arcr_net arcr_js_portable arcr_media arcr_devtools ws_plugin_perf_hud
+    arcr_net arcr_js_portable arcr_js win32_ui_verify arcr_media arcr_devtools ws_plugin_perf_hud
     waterscape_bundled_addons waterscape_brand_assets
     waterscape_setup_stub waterscape_uninstall
 )

@@ -43,6 +43,7 @@
 #  include <windows.h>
 #  include <process.h>
 #else
+#  include <iconv.h>
 #  include <pthread.h>
 #  include <time.h>
 #endif
@@ -53,6 +54,10 @@
 #define ARCR_URL_BUF_CAP       2048u
 #define ARCR_SUBRES_BATCH_MAX  24u
 #define ARCR_MAX_VIEW_VIDEOS   8u
+#define ARCR_TRACE_RING_CAP    128u
+#define ARCR_VIEW_HIST_CAP     64u
+#define ARCR_DEFER_SCRIPT_MAX  256u
+#define ARCR_ASYNC_SUBRES_MAX  64u
 
 /* -------------------------------------------------------------------------
  * 1. Small Cross-Platform Mutex & Detached Worker Helpers (Win2000 + POSIX)
@@ -143,7 +148,7 @@ static void strbuf_free(EngineStrBuf *sb) {
 }
 
 /* -------------------------------------------------------------------------
- * 3. Engine, Tier-4 Module Slot, Async Nav Job & WebView State Structures
+ * 3. Engine, Tier-4 Module Slot, Async Nav/Subres Jobs, History & WebView State
  * ------------------------------------------------------------------------- */
 typedef struct ModuleSlot {
     const char      *stem;
@@ -167,13 +172,22 @@ typedef struct ViewVideoSlot {
     int32_t          h;
 } ViewVideoSlot;
 
+typedef struct ViewHistoryEntry {
+    char     url[ARCR_URL_BUF_CAP];
+    char    *state_json;   /* Heap-owned serialized history.state JSON (or NULL) */
+    uint64_t doc_group_id; /* Entries sharing doc_group_id traverse in-place via popstate */
+} ViewHistoryEntry;
+
 typedef struct AsyncNavJob {
     EngineMutex          mtx;
     int                  refs;
+    volatile int         cancel_flag;
     bool                 canceled;
     bool                 finished;
     bool                 net_ok;
     int32_t              progress;
+    uint64_t             navigation_id;
+    uint64_t             duration_usec;
     ArcrEngine          *eng;
     const ArcrNetVTable *net_vt;
     bool                 private_browsing;
@@ -185,6 +199,36 @@ typedef struct AsyncNavJob {
     ArcrHttpResponse     resp;
 } AsyncNavJob;
 
+typedef struct AsyncSubresItem {
+    uint32_t         owner_uid;
+    bool             is_async_script;
+    bool             is_module_script;
+    char             url[ARCR_URL_BUF_CAP];
+    ArcrHttpResponse resp;
+    bool             ok;
+    bool             blocked_filter;
+    bool             blocked_cors;
+    bool             blocked_mime;
+    uint64_t         duration_usec;
+} AsyncSubresItem;
+
+typedef struct AsyncSubresBatchJob {
+    EngineMutex          mtx;
+    int                  refs;
+    volatile int         cancel_flag;
+    bool                 canceled;
+    bool                 finished;
+    uint64_t             navigation_id;
+    uint64_t             document_id;
+    ArcrEngine          *eng;
+    const ArcrNetVTable *net_vt;
+    bool                 private_browsing;
+    char                 page_url[ARCR_URL_BUF_CAP];
+    char                 page_origin[256];
+    AsyncSubresItem     *items;
+    size_t               item_count;
+} AsyncSubresBatchJob;
+
 struct ArcrEngine {
     ArcrEngineConfig  cfg;
     char              module_dir[512];
@@ -195,11 +239,16 @@ struct ArcrEngine {
     ArcrWebView      *active_views_head;
 
     /* Systematized Tier-4 On-Demand Dynamic Module Registry */
+    EngineMutex       module_mtx;
     ModuleSlot        slots[WS_DYN_SLOT_COUNT];
 
-    /* Async background worker tracking so arcr_engine_destroy waits before dlclose */
+    /* Async background worker tracking & monotonic ID counters */
     EngineMutex       async_mtx;
     uint32_t          active_async_workers;
+    uint64_t          next_navigation_id;
+    uint64_t          next_document_id;
+    uint64_t          next_request_id;
+    uint64_t          next_doc_group_id;
 
     /* URL Shield / Ad & Tracker Filter Hook */
     ArcrUrlFilterFn   url_filter;
@@ -232,6 +281,24 @@ struct ArcrWebView {
     char                 last_hover_href[ARCR_URL_BUF_CAP];
     ArcrSecurityState    security;
 
+    /* End-to-End Navigation / Document / Request Trace State */
+    uint64_t              current_navigation_id;
+    uint64_t              current_document_id;
+    uint64_t              current_doc_group_id;
+    char                  ready_state[16];
+    ArcrHtmlParser       *active_parser;
+    EngineMutex           trace_mtx;
+    ArcrRequestTraceEntry traces[ARCR_TRACE_RING_CAP];
+    size_t                trace_start;
+    size_t                trace_count;
+
+    /* Session History Stack (Full Navigations + SPA pushState/replaceState) */
+    ViewHistoryEntry     history[ARCR_VIEW_HIST_CAP];
+    size_t               hist_count;
+    size_t               hist_index;
+    bool                 suppress_history_push;
+    int                  pending_hist_nav_idx;
+
     EngineStrBuf         user_css;
     EngineStrBuf         console_log;
     EngineStrBuf         raw_html;
@@ -243,8 +310,9 @@ struct ArcrWebView {
     char                 pending_js_nav_url[ARCR_URL_BUF_CAP];
     uint32_t             js_nav_depth;
 
-    /* Async Non-Blocking Navigation State */
+    /* Async Non-Blocking Navigation & Subresource State */
     AsyncNavJob         *async_job;
+    AsyncSubresBatchJob *subres_job;
     int32_t              load_progress;
 
     /* CSS @keyframes, Animated GIF & <video> State */
@@ -273,7 +341,7 @@ static void init_module_registry(ArcrEngine *eng) {
     eng->slots[WS_DYN_SLOT_NET].role_summary = "HTTP/1.1 + HTTPS TLS 1.3, Brotli/Gzip, Cookie & Parallel Pool";
 
     eng->slots[WS_DYN_SLOT_JS].stem          = WS_MOD_STEM_JS;
-    eng->slots[WS_DYN_SLOT_JS].role_summary  = "QuickJS-NG ES2026 Runtime & Live Browser Web API Bridge";
+    eng->slots[WS_DYN_SLOT_JS].role_summary  = "ArcradientJS Clean-Room ES2026 VM, ESM & Web API Bridge";
 
     eng->slots[WS_DYN_SLOT_MEDIA].stem         = WS_MOD_STEM_MEDIA;
     eng->slots[WS_DYN_SLOT_MEDIA].role_summary = "Hardware/FFmpeg <video>/<audio> Decoder & Cinema Policy";
@@ -284,8 +352,13 @@ static void init_module_registry(ArcrEngine *eng) {
 
 static const void *ensure_module_slot(ArcrEngine *eng, WaterscapeDynamicSlot slot_id) {
     if (!eng || (int)slot_id < 0 || slot_id >= WS_DYN_SLOT_COUNT) return NULL;
+    eng_mutex_lock(&eng->module_mtx);
     ModuleSlot *slot = &eng->slots[slot_id];
-    if (slot->vtable) return slot->vtable;
+    if (slot->vtable) {
+        const void *vt = slot->vtable;
+        eng_mutex_unlock(&eng->module_mtx);
+        return vt;
+    }
 
     slot->load_attempted = true;
 
@@ -301,6 +374,7 @@ static const void *ensure_module_slot(ArcrEngine *eng, WaterscapeDynamicSlot slo
     }
     if (!lib) {
         slot->last_status = ARCR_MOD_ERR_NULL;
+        eng_mutex_unlock(&eng->module_mtx);
         return NULL;
     }
 
@@ -314,6 +388,7 @@ static const void *ensure_module_slot(ArcrEngine *eng, WaterscapeDynamicSlot slo
     if (!query_fn) {
         slot->last_status = ARCR_MOD_ERR_NULL;
         arcr_platform_dlclose(lib);
+        eng_mutex_unlock(&eng->module_mtx);
         return NULL;
     }
 
@@ -327,12 +402,15 @@ static const void *ensure_module_slot(ArcrEngine *eng, WaterscapeDynamicSlot slo
     slot->last_status = st;
     if (st != ARCR_MOD_OK) {
         arcr_platform_dlclose(lib);
+        eng_mutex_unlock(&eng->module_mtx);
         return NULL;
     }
 
     slot->lib    = lib;
     slot->vtable = desc->vtable;
-    return slot->vtable;
+    const void *vt = slot->vtable;
+    eng_mutex_unlock(&eng->module_mtx);
+    return vt;
 }
 
 static inline const ArcrNetVTable *get_net_vt(const ArcrEngine *eng) {
@@ -450,6 +528,7 @@ ArcrEngine *arcr_engine_create(const ArcrEngineConfig *cfg) {
     ArcrEngine *eng = (ArcrEngine *)calloc(1u, sizeof(ArcrEngine));
     if (!eng) return NULL;
 
+    eng_mutex_init(&eng->module_mtx);
     eng_mutex_init(&eng->async_mtx);
     if (cfg) {
         eng->cfg = *cfg;
@@ -463,6 +542,7 @@ ArcrEngine *arcr_engine_create(const ArcrEngineConfig *cfg) {
 
     if (!arcr_atom_table_init(&eng->atoms, 512u)) {
         eng_mutex_destroy(&eng->async_mtx);
+        eng_mutex_destroy(&eng->module_mtx);
         free(eng);
         return NULL;
     }
@@ -492,7 +572,7 @@ void arcr_engine_destroy(ArcrEngine *eng) {
         arcr_webview_destroy(eng->active_views_head);
     }
 
-    /* Wait for any in-flight detached async navigation workers before dlclose */
+    /* Wait for any in-flight detached async navigation/subresource workers before dlclose */
     for (;;) {
         eng_mutex_lock(&eng->async_mtx);
         uint32_t active = eng->active_async_workers;
@@ -520,6 +600,7 @@ void arcr_engine_destroy(ArcrEngine *eng) {
     if (eng->accel) arcr_accel_destroy(eng->accel);
     arcr_atom_table_destroy(&eng->atoms);
     eng_mutex_destroy(&eng->async_mtx);
+    eng_mutex_destroy(&eng->module_mtx);
     free(eng);
 }
 
@@ -563,6 +644,14 @@ void arcr_engine_get_stats(const ArcrEngine *eng, ArcrEngineStats *out_stats) {
                                  &out_stats->glyph_cache_hits);
 
     const ArcrJsVTable *js_vt = get_js_vt(eng);
+    if (js_vt && js_vt->engine_backend_name && js_vt->engine_backend_name[0] != '\0') {
+        out_stats->js_engine_backend = js_vt->engine_backend_name;
+    } else if (js_vt) {
+        out_stats->js_engine_backend = "arcr_js_portable";
+    } else {
+        out_stats->js_engine_backend = "none (lazy-unloaded)";
+    }
+
     for (const ArcrWebView *v = eng->active_views_head; v != NULL; v = v->next) {
         if (v->doc) {
             out_stats->arena_allocated_bytes += v->doc->arena.total_allocated + v->doc->style_arena.total_allocated;
@@ -613,8 +702,490 @@ void arcr_engine_notify_memory_pressure(ArcrEngine *eng, int pressure_level) {
 }
 
 /* -------------------------------------------------------------------------
- * 6. URL Resolution, <base href>, Shield Filter & HTTP 2xx Resource Fetcher
+ * 6. Monotonic IDs, Sanitized Request Trace Pipeline, Charset, Origin & CORS
  * ------------------------------------------------------------------------- */
+static uint64_t engine_alloc_nav_id(ArcrEngine *eng) {
+    if (!eng) return 1ULL;
+    eng_mutex_lock(&eng->async_mtx);
+    uint64_t id = ++eng->next_navigation_id;
+    eng_mutex_unlock(&eng->async_mtx);
+    return id;
+}
+
+static uint64_t engine_alloc_doc_id(ArcrEngine *eng) {
+    if (!eng) return 1ULL;
+    eng_mutex_lock(&eng->async_mtx);
+    uint64_t id = ++eng->next_document_id;
+    eng_mutex_unlock(&eng->async_mtx);
+    return id;
+}
+
+static uint64_t engine_alloc_req_id(ArcrEngine *eng) {
+    if (!eng) return 1ULL;
+    eng_mutex_lock(&eng->async_mtx);
+    uint64_t id = ++eng->next_request_id;
+    eng_mutex_unlock(&eng->async_mtx);
+    return id;
+}
+
+static uint64_t engine_alloc_doc_group_id(ArcrEngine *eng) {
+    if (!eng) return 1ULL;
+    eng_mutex_lock(&eng->async_mtx);
+    uint64_t id = ++eng->next_doc_group_id;
+    eng_mutex_unlock(&eng->async_mtx);
+    return id;
+}
+
+/* Strips user:password@ credentials from URL authority before trace logging */
+static void sanitize_trace_url(const char *raw_url, char *out_buf, size_t cap) {
+    if (!out_buf || cap == 0u) return;
+    out_buf[0] = '\0';
+    if (!raw_url || raw_url[0] == '\0') return;
+
+    const char *sep = strstr(raw_url, "://");
+    if (!sep) {
+        arcr_str_copy(out_buf, cap, raw_url);
+        return;
+    }
+
+    const char *auth_start = sep + 3;
+    const char *auth_end   = auth_start;
+    while (*auth_end != '\0' && *auth_end != '/' && *auth_end != '?' && *auth_end != '#') {
+        ++auth_end;
+    }
+    const char *at = memchr(auth_start, '@', (size_t)(auth_end - auth_start));
+    if (!at) {
+        arcr_str_copy(out_buf, cap, raw_url);
+        return;
+    }
+
+    size_t prefix_len = (size_t)((sep + 3) - raw_url);
+    if (prefix_len >= cap) prefix_len = cap - 1u;
+    memcpy(out_buf, raw_url, prefix_len);
+    out_buf[prefix_len] = '\0';
+    arcr_str_copy(out_buf + prefix_len, cap - prefix_len, at + 1);
+}
+
+static void extract_mime_essence(const char *content_type, char *out_mime, size_t cap) {
+    if (!out_mime || cap == 0u) return;
+    out_mime[0] = '\0';
+    if (!content_type || content_type[0] == '\0') return;
+
+    const char *s = content_type;
+    size_t len = strlen(content_type);
+    const char *semi = strchr(content_type, ';');
+    if (semi) len = (size_t)(semi - content_type);
+    arcr_str_trim_view(&s, &len);
+    if (len >= cap) len = cap - 1u;
+    for (size_t i = 0u; i < len; ++i) {
+        out_mime[i] = arcr_ascii_tolower(s[i]);
+    }
+    out_mime[len] = '\0';
+}
+
+static bool is_js_mime_essence(const char *mime) {
+    if (!mime || mime[0] == '\0') return false;
+    return strcmp(mime, "text/javascript") == 0 ||
+           strcmp(mime, "application/javascript") == 0 ||
+           strcmp(mime, "application/x-javascript") == 0 ||
+           strcmp(mime, "text/ecmascript") == 0 ||
+           strcmp(mime, "application/ecmascript") == 0 ||
+           strcmp(mime, "text/jscript") == 0 ||
+           strcmp(mime, "text/livescript") == 0;
+}
+
+static void view_record_trace_explicit(ArcrWebView *view,
+                                       uint64_t     nav_id,
+                                       uint64_t     doc_id,
+                                       const char  *initiator,
+                                       const char  *req_url,
+                                       const char  *final_url,
+                                       int32_t      status_code,
+                                       const char  *content_type,
+                                       size_t       encoded_bytes,
+                                       size_t       decoded_bytes,
+                                       bool         from_cache,
+                                       const char  *blocked_reason,
+                                       uint64_t     duration_usec) {
+    if (!view || !view->engine) return;
+    ArcrRequestTraceEntry ent;
+    memset(&ent, 0, sizeof(ent));
+    ent.navigation_id = nav_id;
+    ent.document_id   = doc_id;
+    ent.request_id    = engine_alloc_req_id(view->engine);
+    arcr_str_copy(ent.initiator, sizeof(ent.initiator), initiator ? initiator : "other");
+    sanitize_trace_url(req_url, ent.url, sizeof(ent.url));
+    sanitize_trace_url((final_url && final_url[0]) ? final_url : req_url,
+                       ent.final_url, sizeof(ent.final_url));
+    ent.status_code   = status_code;
+    extract_mime_essence(content_type, ent.mime_type, sizeof(ent.mime_type));
+    ent.encoded_bytes = encoded_bytes;
+    ent.decoded_bytes = decoded_bytes;
+    ent.from_cache    = from_cache;
+    arcr_str_copy(ent.blocked_reason, sizeof(ent.blocked_reason),
+                  blocked_reason ? blocked_reason : "");
+    ent.duration_usec = duration_usec;
+
+    eng_mutex_lock(&view->trace_mtx);
+    if (view->trace_count < ARCR_TRACE_RING_CAP) {
+        size_t slot = (view->trace_start + view->trace_count) % ARCR_TRACE_RING_CAP;
+        view->traces[slot] = ent;
+        view->trace_count++;
+    } else {
+        view->traces[view->trace_start] = ent;
+        view->trace_start = (view->trace_start + 1u) % ARCR_TRACE_RING_CAP;
+    }
+    eng_mutex_unlock(&view->trace_mtx);
+}
+
+static void view_record_trace_resp(ArcrWebView            *view,
+                                   const char             *initiator,
+                                   const char             *req_url,
+                                   const ArcrHttpResponse *resp,
+                                   const char             *blocked_reason,
+                                   uint64_t                duration_usec) {
+    if (!view) return;
+    if (!resp) {
+        view_record_trace_explicit(view, view->current_navigation_id, view->current_document_id,
+                                   initiator, req_url, req_url, 0, "", 0u, 0u, false,
+                                   blocked_reason, duration_usec);
+        return;
+    }
+    const char *reason = blocked_reason;
+    if (!reason || reason[0] == '\0') {
+        if (resp->cancelled) {
+            reason = "cancelled";
+        } else if (resp->security == ARCR_SEC_CERT_ERROR ||
+                   resp->security == ARCR_SEC_CLOCK_SKEW_ERR) {
+            reason = "tls-error";
+        } else if (resp->length_mismatch || (resp->status_code == 0 && !resp->body &&
+                   !arcr_str_starts_with_nocase(req_url ? req_url : "", "file://"))) {
+            reason = "net-error";
+        } else {
+            reason = "";
+        }
+    }
+    size_t dec_bytes = resp->decoded_bytes > 0u ? resp->decoded_bytes : resp->body_len;
+    size_t enc_bytes = (resp->from_cache && resp->encoded_bytes == 0u)
+                           ? 0u
+                           : (resp->encoded_bytes > 0u ? resp->encoded_bytes : resp->body_len);
+    view_record_trace_explicit(view, view->current_navigation_id, view->current_document_id,
+                               initiator, req_url,
+                               resp->final_url[0] ? resp->final_url : req_url,
+                               (int32_t)resp->status_code, resp->content_type,
+                               enc_bytes, dec_bytes, resp->from_cache,
+                               reason, duration_usec);
+}
+
+uint64_t arcr_webview_get_navigation_id(const ArcrWebView *view) {
+    return view ? view->current_navigation_id : 0ULL;
+}
+
+uint64_t arcr_webview_get_document_id(const ArcrWebView *view) {
+    return view ? view->current_document_id : 0ULL;
+}
+
+const char *arcr_webview_get_ready_state(const ArcrWebView *view) {
+    if (!view || view->ready_state[0] == '\0') return "complete";
+    return view->ready_state;
+}
+
+size_t arcr_webview_get_request_traces(const ArcrWebView *view,
+                                       ArcrRequestTraceEntry *out_entries,
+                                       size_t max_entries) {
+    if (!view) return 0u;
+    ArcrWebView *mview = (ArcrWebView *)view;
+    eng_mutex_lock(&mview->trace_mtx);
+    size_t total = mview->trace_count;
+    if (!out_entries) {
+        eng_mutex_unlock(&mview->trace_mtx);
+        return total;
+    }
+    size_t n = ARCR_MIN(total, max_entries);
+    /* Copy most recent `n` entries in chronological order (or from start if max_entries >= total) */
+    size_t start_offset = (total > n) ? (total - n) : 0u;
+    for (size_t i = 0u; i < n; ++i) {
+        size_t idx = (mview->trace_start + start_offset + i) % ARCR_TRACE_RING_CAP;
+        out_entries[i] = mview->traces[idx];
+    }
+    eng_mutex_unlock(&mview->trace_mtx);
+    return n;
+}
+
+/* Charset sniffing & conversion to UTF-8 (BOM, HTTP Content-Type, <meta charset>, CP1252, CP949/EUC-KR) */
+static void extract_charset_param(const char *s, size_t len, char *out_cs, size_t cap) {
+    if (!out_cs || cap == 0u) return;
+    out_cs[0] = '\0';
+    if (!s || len == 0u) return;
+
+    for (size_t i = 0u; i + 8u <= len; ++i) {
+        if (arcr_str_eq_nocase_n(s + i, 7u, "charset", 7u)) {
+            size_t p = i + 7u;
+            while (p < len && (s[p] == ' ' || s[p] == '\t')) ++p;
+            if (p >= len || s[p] != '=') continue;
+            ++p;
+            while (p < len && (s[p] == ' ' || s[p] == '\t')) ++p;
+            char quote = 0;
+            if (p < len && (s[p] == '"' || s[p] == '\'')) {
+                quote = s[p++];
+            }
+            size_t k = 0u;
+            while (p < len && k + 1u < cap) {
+                char c = s[p];
+                if (quote != 0) {
+                    if (c == quote) break;
+                } else if (c == ';' || c == ' ' || c == '\t' || c == '\r' ||
+                           c == '\n' || c == '>' || c == '"' || c == '\'') {
+                    break;
+                }
+                out_cs[k++] = arcr_ascii_tolower(c);
+                ++p;
+            }
+            out_cs[k] = '\0';
+            if (k > 0u) return;
+        }
+    }
+}
+
+static void prescan_html_meta_charset(const uint8_t *bytes, size_t len, char *out_cs, size_t cap) {
+    if (!out_cs || cap == 0u) return;
+    out_cs[0] = '\0';
+    if (!bytes || len < 10u) return;
+    size_t scan_len = ARCR_MIN(len, 2048u);
+    const char *s = (const char *)bytes;
+    for (size_t i = 0u; i + 6u < scan_len; ++i) {
+        if (s[i] == '<' && arcr_str_eq_nocase_n(s + i + 1u, 4u, "meta", 4u) &&
+            (s[i + 5u] == ' ' || s[i + 5u] == '\t' || s[i + 5u] == '\r' || s[i + 5u] == '\n')) {
+            size_t end = i + 6u;
+            while (end < scan_len && s[end] != '>') ++end;
+            extract_charset_param(s + i + 5u, end - (i + 5u), out_cs, cap);
+            if (out_cs[0] != '\0') return;
+            i = end;
+        }
+    }
+}
+
+static bool is_valid_utf8_stream(const uint8_t *s, size_t len) {
+    size_t i = 0u;
+    while (i < len) {
+        uint8_t b0 = s[i];
+        if (b0 < 0x80u) {
+            ++i;
+        } else if ((b0 & 0xE0u) == 0xC0u) {
+            if (b0 < 0xC2u || i + 1u >= len || (s[i + 1u] & 0xC0u) != 0x80u) return false;
+            i += 2u;
+        } else if ((b0 & 0xF0u) == 0xE0u) {
+            if (i + 2u >= len) return false;
+            uint8_t b1 = s[i + 1u], b2 = s[i + 2u];
+            if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u) return false;
+            if (b0 == 0xE0u && b1 < 0xA0u) return false;
+            if (b0 == 0xEDu && b1 >= 0xA0u) return false;
+            i += 3u;
+        } else if ((b0 & 0xF8u) == 0xF0u) {
+            if (b0 > 0xF4u || i + 3u >= len) return false;
+            uint8_t b1 = s[i + 1u], b2 = s[i + 2u], b3 = s[i + 3u];
+            if ((b1 & 0xC0u) != 0x80u || (b2 & 0xC0u) != 0x80u || (b3 & 0xC0u) != 0x80u) return false;
+            if (b0 == 0xF0u && b1 < 0x90u) return false;
+            if (b0 == 0xF4u && b1 > 0x8Fu) return false;
+            i += 4u;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *decode_utf16_to_utf8_alloc(const uint8_t *src, size_t len, bool big_endian, size_t *out_len) {
+    EngineStrBuf sb = {0};
+    (void)strbuf_reserve(&sb, len + 16u);
+    size_t i = 0u;
+    while (i + 1u < len) {
+        uint16_t w1 = big_endian ? (uint16_t)(((uint16_t)src[i] << 8) | src[i + 1u])
+                                 : (uint16_t)(((uint16_t)src[i + 1u] << 8) | src[i]);
+        i += 2u;
+        uint32_t cp = w1;
+        if (w1 >= 0xD800u && w1 <= 0xDBFFu && i + 1u < len) {
+            uint16_t w2 = big_endian ? (uint16_t)(((uint16_t)src[i] << 8) | src[i + 1u])
+                                     : (uint16_t)(((uint16_t)src[i + 1u] << 8) | src[i]);
+            if (w2 >= 0xDC00u && w2 <= 0xDFFFu) {
+                cp = 0x10000u + (((uint32_t)(w1 - 0xD800u) << 10) | (uint32_t)(w2 - 0xDC00u));
+                i += 2u;
+            } else {
+                cp = 0xFFFDu;
+            }
+        } else if (w1 >= 0xDC00u && w1 <= 0xDFFFu) {
+            cp = 0xFFFDu;
+        }
+        char u8[4];
+        size_t un = arcr_utf8_encode_one(cp, u8);
+        (void)strbuf_append(&sb, u8, un);
+    }
+    if (!sb.data) (void)strbuf_append_cstr(&sb, "");
+    if (out_len) *out_len = sb.len;
+    return sb.data;
+}
+
+static char *decode_cp1252_to_utf8_alloc(const uint8_t *src, size_t len, size_t *out_len) {
+    static const uint16_t kCp1252Map[32] = {
+        0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+        0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+        0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+        0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
+    };
+    EngineStrBuf sb = {0};
+    (void)strbuf_reserve(&sb, len + (len / 4u) + 16u);
+    for (size_t i = 0u; i < len; ++i) {
+        uint8_t b = src[i];
+        if (b < 0x80u) {
+            (void)strbuf_append_char(&sb, (char)b);
+        } else {
+            uint32_t cp = (b < 0xA0u) ? (uint32_t)kCp1252Map[b - 0x80u] : (uint32_t)b;
+            char u8[4];
+            size_t un = arcr_utf8_encode_one(cp, u8);
+            (void)strbuf_append(&sb, u8, un);
+        }
+    }
+    if (!sb.data) (void)strbuf_append_cstr(&sb, "");
+    if (out_len) *out_len = sb.len;
+    return sb.data;
+}
+
+static char *decode_cp949_to_utf8_alloc(const uint8_t *src, size_t len, size_t *out_len) {
+    if (!src || len == 0u) return NULL;
+#if defined(_WIN32)
+    int wlen = MultiByteToWideChar(949u, 0u, (const char *)src, (int)len, NULL, 0);
+    if (wlen <= 0) return NULL;
+    wchar_t *wbuf = (wchar_t *)malloc(((size_t)wlen + 1u) * sizeof(wchar_t));
+    if (!wbuf) return NULL;
+    MultiByteToWideChar(949u, 0u, (const char *)src, (int)len, wbuf, wlen);
+    int ulen = WideCharToMultiByte(CP_UTF8, 0u, wbuf, wlen, NULL, 0, NULL, NULL);
+    if (ulen <= 0) {
+        free(wbuf);
+        return NULL;
+    }
+    char *ubuf = (char *)malloc((size_t)ulen + 1u);
+    if (!ubuf) {
+        free(wbuf);
+        return NULL;
+    }
+    WideCharToMultiByte(CP_UTF8, 0u, wbuf, wlen, ubuf, ulen, NULL, NULL);
+    ubuf[ulen] = '\0';
+    free(wbuf);
+    if (out_len) *out_len = (size_t)ulen;
+    return ubuf;
+#else
+    iconv_t cd = iconv_open("UTF-8", "CP949");
+    if (cd == (iconv_t)-1) {
+        cd = iconv_open("UTF-8", "EUC-KR");
+    }
+    if (cd == (iconv_t)-1) return NULL;
+    size_t cap = len * 3u + 32u;
+    char *dst = (char *)malloc(cap);
+    if (!dst) {
+        iconv_close(cd);
+        return NULL;
+    }
+    char  *in_p    = (char *)src;
+    size_t in_left = len;
+    char  *out_p   = dst;
+    size_t out_rem = cap - 1u;
+    while (in_left > 0u) {
+        size_t r = iconv(cd, &in_p, &in_left, &out_p, &out_rem);
+        if (r == (size_t)-1) {
+            if (out_rem < 8u) break;
+            /* Replace invalid sequence with U+FFFD */
+            *out_p++ = (char)0xEF;
+            *out_p++ = (char)0xBF;
+            *out_p++ = (char)0xBD;
+            out_rem -= 3u;
+            in_p++;
+            in_left--;
+        }
+    }
+    *out_p = '\0';
+    iconv_close(cd);
+    if (out_len) *out_len = (size_t)(out_p - dst);
+    return dst;
+#endif
+}
+
+static char *decode_html_bytes_to_utf8_alloc(const uint8_t *raw, size_t raw_len,
+                                             const char *http_content_type,
+                                             size_t *out_utf8_len) {
+    if (out_utf8_len) *out_utf8_len = 0u;
+    if (!raw || raw_len == 0u) {
+        char *empty = (char *)calloc(1u, 1u);
+        return empty;
+    }
+
+    /* 1. BOM check */
+    if (raw_len >= 3u && raw[0] == 0xEFu && raw[1] == 0xBBu && raw[2] == 0xBFu) {
+        size_t n = raw_len - 3u;
+        char *s = (char *)malloc(n + 1u);
+        if (!s) return NULL;
+        if (n > 0u) memcpy(s, raw + 3u, n);
+        s[n] = '\0';
+        if (out_utf8_len) *out_utf8_len = n;
+        return s;
+    }
+    if (raw_len >= 2u && raw[0] == 0xFFu && raw[1] == 0xFEu) {
+        return decode_utf16_to_utf8_alloc(raw + 2u, raw_len - 2u, false, out_utf8_len);
+    }
+    if (raw_len >= 2u && raw[0] == 0xFEu && raw[1] == 0xFFu) {
+        return decode_utf16_to_utf8_alloc(raw + 2u, raw_len - 2u, true, out_utf8_len);
+    }
+
+    /* 2. HTTP Content-Type charset or HTML <meta charset> prescan */
+    char cs[64] = {0};
+    if (http_content_type && http_content_type[0] != '\0') {
+        extract_charset_param(http_content_type, strlen(http_content_type), cs, sizeof(cs));
+    }
+    if (cs[0] == '\0') {
+        prescan_html_meta_charset(raw, raw_len, cs, sizeof(cs));
+    }
+
+    if (strcmp(cs, "euc-kr") == 0 || strcmp(cs, "euckr") == 0 ||
+        strcmp(cs, "cp949") == 0 || strcmp(cs, "ks_c_5601-1987") == 0 ||
+        strcmp(cs, "cseuckr") == 0 || strcmp(cs, "x-windows-949") == 0) {
+        char *kr = decode_cp949_to_utf8_alloc(raw, raw_len, out_utf8_len);
+        if (kr) return kr;
+    }
+    if (strcmp(cs, "windows-1252") == 0 || strcmp(cs, "cp1252") == 0 ||
+        strcmp(cs, "iso-8859-1") == 0 || strcmp(cs, "iso8859-1") == 0 ||
+        strcmp(cs, "latin1") == 0 || strcmp(cs, "latin-1") == 0) {
+        return decode_cp1252_to_utf8_alloc(raw, raw_len, out_utf8_len);
+    }
+    if (strcmp(cs, "utf-16le") == 0) {
+        return decode_utf16_to_utf8_alloc(raw, raw_len, false, out_utf8_len);
+    }
+    if (strcmp(cs, "utf-16be") == 0 || strcmp(cs, "utf-16") == 0) {
+        return decode_utf16_to_utf8_alloc(raw, raw_len, true, out_utf8_len);
+    }
+
+    if (is_valid_utf8_stream(raw, raw_len)) {
+        char *s = (char *)malloc(raw_len + 1u);
+        if (!s) return NULL;
+        memcpy(s, raw, raw_len);
+        s[raw_len] = '\0';
+        if (out_utf8_len) *out_utf8_len = raw_len;
+        return s;
+    }
+
+    /* Invalid UTF-8 without explicit charset: try CP949 if Hangul lead/trail pairs appear, else CP1252 */
+    size_t kr_pairs = 0u;
+    for (size_t i = 0u; i + 1u < raw_len; ++i) {
+        if (raw[i] >= 0xB0u && raw[i] <= 0xC8u && raw[i + 1u] >= 0xA1u && raw[i + 1u] <= 0xFEu) {
+            ++kr_pairs;
+            ++i;
+        }
+    }
+    if (kr_pairs >= 2u) {
+        char *kr = decode_cp949_to_utf8_alloc(raw, raw_len, out_utf8_len);
+        if (kr) return kr;
+    }
+    return decode_cp1252_to_utf8_alloc(raw, raw_len, out_utf8_len);
+}
+
 static void extract_url_host(const char *url, char *out_host, size_t cap) {
     if (!out_host || cap == 0u) return;
     out_host[0] = '\0';
@@ -653,6 +1224,202 @@ static void extract_url_host(const char *url, char *out_host, size_t cap) {
         out_host[i] = arcr_ascii_tolower(host_start[i]);
     }
     out_host[len] = '\0';
+}
+
+/* Extracts normalized Web Origin ("http://host:port" or "https://host" or "null") */
+static void extract_url_origin(const char *url, char *out_origin, size_t cap) {
+    if (!out_origin || cap == 0u) return;
+    out_origin[0] = '\0';
+    if (!url || url[0] == '\0') {
+        arcr_str_copy(out_origin, cap, "null");
+        return;
+    }
+    bool is_http  = arcr_str_starts_with_nocase(url, "http://");
+    bool is_https = arcr_str_starts_with_nocase(url, "https://");
+    if (!is_http && !is_https) {
+        arcr_str_copy(out_origin, cap, "null");
+        return;
+    }
+
+    const char *sep = strstr(url, "://");
+    const char *auth_start = sep + 3;
+    const char *auth_end   = auth_start;
+    while (*auth_end != '\0' && *auth_end != '/' && *auth_end != '?' && *auth_end != '#') {
+        ++auth_end;
+    }
+    const char *at = memchr(auth_start, '@', (size_t)(auth_end - auth_start));
+    const char *host_start = at ? (at + 1) : auth_start;
+    const char *host_end   = auth_end;
+    int32_t     port       = is_https ? 443 : 80;
+
+    if (host_start < auth_end && *host_start == '[') {
+        const char *rb = memchr(host_start, ']', (size_t)(auth_end - host_start));
+        if (rb && (rb + 1) < auth_end && rb[1] == ':') {
+            host_end = rb + 1;
+            int32_t p = 0;
+            if (arcr_parse_i32(rb + 2, (size_t)(auth_end - (rb + 2)), &p) && p > 0 && p <= 65535) {
+                port = p;
+            }
+        }
+    } else {
+        for (const char *p = host_start; p < auth_end; ++p) {
+            if (*p == ':') {
+                host_end = p;
+                int32_t parsed_p = 0;
+                if (arcr_parse_i32(p + 1, (size_t)(auth_end - (p + 1)), &parsed_p) &&
+                    parsed_p > 0 && parsed_p <= 65535) {
+                    port = parsed_p;
+                }
+                break;
+            }
+        }
+    }
+
+    char host_lc[232];
+    size_t hlen = (size_t)(host_end - host_start);
+    if (hlen >= sizeof(host_lc)) hlen = sizeof(host_lc) - 1u;
+    for (size_t i = 0u; i < hlen; ++i) {
+        host_lc[i] = arcr_ascii_tolower(host_start[i]);
+    }
+    host_lc[hlen] = '\0';
+
+    int32_t def_port = is_https ? 443 : 80;
+    if (port == def_port) {
+        snprintf(out_origin, cap, "%s://%s", is_https ? "https" : "http", host_lc);
+    } else {
+        snprintf(out_origin, cap, "%s://%s:%d", is_https ? "https" : "http", host_lc, (int)port);
+    }
+}
+
+static bool urls_are_same_origin(const char *url_a, const char *url_b) {
+    if (!url_a || !url_b) return false;
+    if (arcr_str_starts_with_nocase(url_a, "file://") &&
+        arcr_str_starts_with_nocase(url_b, "file://")) {
+        return true;
+    }
+    char oa[256], ob[256];
+    extract_url_origin(url_a, oa, sizeof(oa));
+    extract_url_origin(url_b, ob, sizeof(ob));
+    if (strcmp(oa, "null") == 0 || strcmp(ob, "null") == 0) return false;
+    return strcmp(oa, ob) == 0;
+}
+
+static bool http_raw_headers_get(const char *raw_headers, const char *name,
+                                 char *out_val, size_t val_cap) {
+    if (out_val && val_cap > 0u) out_val[0] = '\0';
+    if (!raw_headers || !name || name[0] == '\0') return false;
+    size_t nlen = strlen(name);
+    bool found = false;
+    const char *p = raw_headers;
+    while (*p != '\0') {
+        const char *eol = strstr(p, "\r\n");
+        size_t line_len = eol ? (size_t)(eol - p) : strlen(p);
+        const char *colon = memchr(p, ':', line_len);
+        if (colon) {
+            const char *hn = p;
+            size_t hn_len = (size_t)(colon - p);
+            arcr_str_trim_view(&hn, &hn_len);
+            if (arcr_str_eq_nocase_n(hn, hn_len, name, nlen)) {
+                const char *hv = colon + 1;
+                size_t hv_len = (size_t)((p + line_len) - hv);
+                arcr_str_trim_view(&hv, &hv_len);
+                if (out_val && val_cap > 0u) {
+                    if (found) {
+                        size_t cur = strlen(out_val);
+                        if (cur + 2u < val_cap) arcr_str_copy(out_val + cur, val_cap - cur, ", ");
+                    }
+                    size_t cur = strlen(out_val);
+                    if (cur + 1u < val_cap) {
+                        size_t copy_n = ARCR_MIN(hv_len, (val_cap - 1u) - cur);
+                        memcpy(out_val + cur, hv, copy_n);
+                        out_val[cur + copy_n] = '\0';
+                    }
+                }
+                found = true;
+            }
+        }
+        if (!eol) break;
+        p = eol + 2;
+    }
+    return found;
+}
+
+static bool cors_response_allows_origin(const char *raw_headers, const char *page_origin,
+                                        bool include_credentials) {
+    if (!raw_headers || !page_origin || page_origin[0] == '\0') return false;
+    char acao[256] = {0};
+    if (!http_raw_headers_get(raw_headers, "access-control-allow-origin", acao, sizeof(acao))) {
+        return false;
+    }
+    if (include_credentials) {
+        if (strcmp(acao, page_origin) != 0) return false;
+        char acac[32] = {0};
+        if (!http_raw_headers_get(raw_headers, "access-control-allow-credentials", acac, sizeof(acac))) {
+            return false;
+        }
+        return arcr_str_eq_nocase(acac, "true");
+    }
+    return strcmp(acao, "*") == 0 || strcmp(acao, page_origin) == 0;
+}
+
+static bool cors_request_needs_preflight(const char *method, const char *req_headers_raw,
+                                         char *out_non_simple_hdrs, size_t hdrs_cap) {
+    if (out_non_simple_hdrs && hdrs_cap > 0u) out_non_simple_hdrs[0] = '\0';
+    bool preflight = false;
+    const char *m = (method && method[0]) ? method : "GET";
+    if (!arcr_str_eq_nocase(m, "GET") &&
+        !arcr_str_eq_nocase(m, "HEAD") &&
+        !arcr_str_eq_nocase(m, "POST")) {
+        preflight = true;
+    }
+    if (!req_headers_raw || req_headers_raw[0] == '\0') return preflight;
+
+    const char *p = req_headers_raw;
+    while (*p != '\0') {
+        const char *eol = strstr(p, "\r\n");
+        size_t line_len = eol ? (size_t)(eol - p) : strlen(p);
+        const char *colon = memchr(p, ':', line_len);
+        if (colon) {
+            const char *hn = p;
+            size_t hn_len = (size_t)(colon - p);
+            arcr_str_trim_view(&hn, &hn_len);
+            const char *hv = colon + 1;
+            size_t hv_len = (size_t)((p + line_len) - hv);
+            arcr_str_trim_view(&hv, &hv_len);
+
+            bool simple_hdr = arcr_str_eq_nocase_n(hn, hn_len, "accept", 6u) ||
+                              arcr_str_eq_nocase_n(hn, hn_len, "accept-language", 15u) ||
+                              arcr_str_eq_nocase_n(hn, hn_len, "content-language", 16u);
+            if (!simple_hdr && arcr_str_eq_nocase_n(hn, hn_len, "content-type", 12u)) {
+                char hv_buf[128] = {0};
+                size_t cn = ARCR_MIN(hv_len, sizeof(hv_buf) - 1u);
+                memcpy(hv_buf, hv, cn);
+                hv_buf[cn] = '\0';
+                char mime[64] = {0};
+                extract_mime_essence(hv_buf, mime, sizeof(mime));
+                simple_hdr = strcmp(mime, "application/x-www-form-urlencoded") == 0 ||
+                             strcmp(mime, "multipart/form-data") == 0 ||
+                             strcmp(mime, "text/plain") == 0;
+            }
+            if (!simple_hdr && hn_len > 0u) {
+                preflight = true;
+                if (out_non_simple_hdrs && hdrs_cap > 0u) {
+                    size_t cur = strlen(out_non_simple_hdrs);
+                    if (cur > 0u && cur + 2u < hdrs_cap) {
+                        arcr_str_copy(out_non_simple_hdrs + cur, hdrs_cap - cur, ", ");
+                        cur += 2u;
+                    }
+                    for (size_t i = 0u; i < hn_len && cur + 1u < hdrs_cap; ++i) {
+                        out_non_simple_hdrs[cur++] = arcr_ascii_tolower(hn[i]);
+                    }
+                    out_non_simple_hdrs[cur] = '\0';
+                }
+            }
+        }
+        if (!eol) break;
+        p = eol + 2;
+    }
+    return preflight;
 }
 
 static bool has_explicit_scheme(const char *s) {
@@ -884,8 +1651,9 @@ static void free_net_http_response(const ArcrNetVTable *net_vt, ArcrHttpResponse
     if (!resp) return;
     if (net_vt && net_vt->free_response) {
         net_vt->free_response(resp);
-        resp->body     = NULL;
-        resp->body_len = 0u;
+        resp->body        = NULL;
+        resp->body_len    = 0u;
+        resp->raw_headers = NULL;
     } else if (resp->body) {
         if (net_vt && net_vt->free_resource) {
             net_vt->free_resource((char *)resp->body);
@@ -911,36 +1679,49 @@ static bool is_http_status_2xx_or_local(int status_code) {
     return status_code == 0 || (status_code >= 200 && status_code < 300);
 }
 
-static bool engine_fetch_resource_ex(ArcrEngine        *eng,
-                                     const char        *target_url,
-                                     const char        *context_page_url,
-                                     const char        *method,
-                                     const char        *post_body,
-                                     size_t             post_body_len,
-                                     bool               require_2xx,
-                                     uint8_t          **out_bytes,
-                                     size_t            *out_len,
-                                     char              *out_final_url,
-                                     size_t             final_url_cap,
-                                     ArcrSecurityState *out_sec,
-                                     char              *out_detail,
-                                     size_t             detail_cap,
-                                     bool              *out_was_blocked,
-                                     int               *out_http_status) {
+static bool engine_fetch_resource_traced(ArcrWebView       *trace_view_or_null,
+                                         const char        *initiator,
+                                         ArcrEngine        *eng,
+                                         const char        *target_url,
+                                         const char        *context_page_url,
+                                         const char        *method,
+                                         const char        *post_body,
+                                         size_t             post_body_len,
+                                         bool               require_2xx,
+                                         uint8_t          **out_bytes,
+                                         size_t            *out_len,
+                                         char              *out_final_url,
+                                         size_t             final_url_cap,
+                                         char              *out_content_type,
+                                         size_t             ctype_cap,
+                                         ArcrSecurityState *out_sec,
+                                         char              *out_detail,
+                                         size_t             detail_cap,
+                                         bool              *out_was_blocked,
+                                         int               *out_http_status) {
     if (out_bytes)       *out_bytes       = NULL;
     if (out_len)         *out_len         = 0u;
     if (out_http_status) *out_http_status = 0;
     if (out_final_url && final_url_cap > 0u) {
         arcr_str_copy(out_final_url, final_url_cap, target_url ? target_url : "");
     }
+    if (out_content_type && ctype_cap > 0u) out_content_type[0] = '\0';
     if (out_sec) *out_sec = ARCR_SEC_LOCAL_OR_NONE;
     if (out_detail && detail_cap > 0u) out_detail[0] = '\0';
     if (out_was_blocked) *out_was_blocked = false;
 
     if (!eng || !target_url || target_url[0] == '\0') return false;
 
+    uint64_t t0 = arcr_platform_monotonic_usec();
     if (check_url_blocked(eng, target_url, context_page_url)) {
         if (out_was_blocked) *out_was_blocked = true;
+        if (trace_view_or_null) {
+            view_record_trace_explicit(trace_view_or_null,
+                                       trace_view_or_null->current_navigation_id,
+                                       trace_view_or_null->current_document_id,
+                                       initiator, target_url, target_url, 0, "", 0u, 0u,
+                                       false, "url-filter", 0ULL);
+        }
         return false;
     }
 
@@ -966,6 +1747,12 @@ static bool engine_fetch_resource_ex(ArcrEngine        *eng,
         ArcrHttpResponse resp;
         memset(&resp, 0, sizeof(resp));
         bool ok = net_vt->fetch_http(&req, &resp);
+        uint64_t dur = arcr_platform_monotonic_usec() - t0;
+
+        if (trace_view_or_null) {
+            view_record_trace_resp(trace_view_or_null, initiator, target_url, &resp, NULL, dur);
+        }
+
         if (out_http_status) *out_http_status = resp.status_code;
         if (out_sec)         *out_sec         = resp.security;
         if (out_detail && detail_cap > 0u) {
@@ -973,6 +1760,9 @@ static bool engine_fetch_resource_ex(ArcrEngine        *eng,
         }
         if (out_final_url && final_url_cap > 0u && resp.final_url[0] != '\0') {
             arcr_str_copy(out_final_url, final_url_cap, resp.final_url);
+        }
+        if (out_content_type && ctype_cap > 0u) {
+            arcr_str_copy(out_content_type, ctype_cap, resp.content_type);
         }
 
         if (!ok || !resp.body || (require_2xx && !is_http_status_2xx_or_local(resp.status_code))) {
@@ -996,6 +1786,15 @@ static bool engine_fetch_resource_ex(ArcrEngine        *eng,
 
         bool ok = net_vt->load_url_resource(target_url, &body, &len, &sec,
                                             detail_buf, sizeof(detail_buf));
+        uint64_t dur = arcr_platform_monotonic_usec() - t0;
+        if (trace_view_or_null) {
+            view_record_trace_explicit(trace_view_or_null,
+                                       trace_view_or_null->current_navigation_id,
+                                       trace_view_or_null->current_document_id,
+                                       initiator, target_url, target_url,
+                                       ok ? 200 : 0, "", len, len, false,
+                                       ok ? "" : "net-error", dur);
+        }
         if (out_sec) *out_sec = sec;
         if (out_detail && detail_cap > 0u) {
             arcr_str_copy(out_detail, detail_cap, detail_buf);
@@ -1012,6 +1811,29 @@ static bool engine_fetch_resource_ex(ArcrEngine        *eng,
     }
 
     return false;
+}
+
+static bool engine_fetch_resource_ex(ArcrEngine        *eng,
+                                     const char        *target_url,
+                                     const char        *context_page_url,
+                                     const char        *method,
+                                     const char        *post_body,
+                                     size_t             post_body_len,
+                                     bool               require_2xx,
+                                     uint8_t          **out_bytes,
+                                     size_t            *out_len,
+                                     char              *out_final_url,
+                                     size_t             final_url_cap,
+                                     ArcrSecurityState *out_sec,
+                                     char              *out_detail,
+                                     size_t             detail_cap,
+                                     bool              *out_was_blocked,
+                                     int               *out_http_status) {
+    return engine_fetch_resource_traced(NULL, "other", eng, target_url, context_page_url,
+                                        method, post_body, post_body_len, require_2xx,
+                                        out_bytes, out_len, out_final_url, final_url_cap,
+                                        NULL, 0u, out_sec, out_detail, detail_cap,
+                                        out_was_blocked, out_http_status);
 }
 
 /* -------------------------------------------------------------------------
@@ -1355,29 +2177,200 @@ static void attach_image_bytes_to_node(ArcrWebView *view, ArcrDomNode *img_node,
     }
 }
 
-typedef enum SubresKind {
-    SUBRES_STYLE  = 0,
-    SUBRES_IMAGE  = 1,
-    SUBRES_SCRIPT = 2
-} SubresKind;
+/* -------------------------------------------------------------------------
+ * 8b. Non-Blocking Async Subresource Batch Worker & Stylesheet Barrier
+ * ------------------------------------------------------------------------- */
+static void subres_job_release(AsyncSubresBatchJob *job) {
+    if (!job) return;
+    eng_mutex_lock(&job->mtx);
+    int rem = --job->refs;
+    eng_mutex_unlock(&job->mtx);
+    if (rem <= 0) {
+        eng_mutex_destroy(&job->mtx);
+        if (job->items) {
+            for (size_t i = 0u; i < job->item_count; ++i) {
+                free_net_http_response(job->net_vt, &job->items[i].resp);
+            }
+            free(job->items);
+            job->items = NULL;
+        }
+        free(job);
+    }
+}
 
-typedef struct SubresPendingItem {
-    SubresKind               kind;
-    ArcrExternalResourceRef *ref;
-    uint32_t                 owner_uid;
-    char                     url[ARCR_URL_BUF_CAP];
-} SubresPendingItem;
+static void cancel_view_subres_job(ArcrWebView *view) {
+    if (!view || !view->subres_job) return;
+    AsyncSubresBatchJob *job = view->subres_job;
+    view->subres_job = NULL;
+    job->cancel_flag = 1;
+    eng_mutex_lock(&job->mtx);
+    job->canceled = true;
+    eng_mutex_unlock(&job->mtx);
+    subres_job_release(job);
+}
 
-static void fetch_document_subresources(ArcrWebView *view) {
+static void async_subres_worker_run(AsyncSubresBatchJob *job) {
+    if (!job) return;
+    ArcrEngine *eng = job->eng;
+    const ArcrNetVTable *net_vt = job->net_vt;
+
+    for (size_t i = 0u; i < job->item_count; ++i) {
+        if (job->cancel_flag != 0) break;
+        eng_mutex_lock(&job->mtx);
+        bool was_canceled = job->canceled;
+        eng_mutex_unlock(&job->mtx);
+        if (was_canceled) break;
+
+        AsyncSubresItem *it = &job->items[i];
+        if (it->blocked_filter) continue;
+
+        uint64_t t0 = arcr_platform_monotonic_usec();
+        bool cross_origin = !urls_are_same_origin(job->page_url, it->url);
+        bool ok = false;
+
+        if (net_vt && net_vt->fetch_http) {
+            ArcrHttpRequest req;
+            memset(&req, 0, sizeof(req));
+            req.url                 = it->url;
+            req.method              = "GET";
+            req.referer             = is_fetchable_base_url(job->page_url) ? job->page_url : NULL;
+            req.origin              = (it->is_module_script && cross_origin && job->page_origin[0])
+                                          ? job->page_origin
+                                          : NULL;
+            req.include_credentials = !(it->is_module_script && cross_origin);
+            req.private_browsing    = job->private_browsing;
+            req.cancel_flag         = &job->cancel_flag;
+            ok = net_vt->fetch_http(&req, &it->resp);
+        } else if (net_vt && net_vt->load_url_resource) {
+            char  *body = NULL;
+            size_t len  = 0u;
+            ArcrSecurityState sec = ARCR_SEC_LOCAL_OR_NONE;
+            char detail[256] = {0};
+            ok = net_vt->load_url_resource(it->url, &body, &len, &sec, detail, sizeof(detail));
+            it->resp.status_code = ok ? 200 : 0;
+            it->resp.security    = sec;
+            arcr_str_copy(it->resp.final_url, sizeof(it->resp.final_url), it->url);
+            arcr_str_copy(it->resp.detail, sizeof(it->resp.detail), detail);
+            it->resp.body          = (uint8_t *)body;
+            it->resp.body_len      = len;
+            it->resp.decoded_bytes = len;
+        }
+        it->duration_usec = arcr_platform_monotonic_usec() - t0;
+
+        if (ok && it->resp.body && is_http_status_2xx_or_local(it->resp.status_code)) {
+            if (it->is_module_script) {
+                const char *furl = it->resp.final_url[0] ? it->resp.final_url : it->url;
+                if (!urls_are_same_origin(job->page_url, furl) &&
+                    !cors_response_allows_origin(it->resp.raw_headers, job->page_origin, false)) {
+                    it->blocked_cors = true;
+                } else {
+                    char mime[64] = {0};
+                    extract_mime_essence(it->resp.content_type, mime, sizeof(mime));
+                    if (!is_js_mime_essence(mime) &&
+                        !arcr_str_starts_with_nocase(furl, "file://")) {
+                        it->blocked_mime = true;
+                    } else {
+                        it->ok = true;
+                    }
+                }
+            } else {
+                it->ok = true;
+            }
+        }
+    }
+
+    eng_mutex_lock(&job->mtx);
+    if (!job->canceled) {
+        job->finished = true;
+    }
+    eng_mutex_unlock(&job->mtx);
+
+    subres_job_release(job);
+
+    if (eng) {
+        eng_mutex_lock(&eng->async_mtx);
+        if (eng->active_async_workers > 0u) {
+            eng->active_async_workers--;
+        }
+        eng_mutex_unlock(&eng->async_mtx);
+    }
+}
+
+#if defined(_WIN32)
+static unsigned __stdcall win32_async_subres_proc(void *arg) {
+    async_subres_worker_run((AsyncSubresBatchJob *)arg);
+    return 0u;
+}
+#else
+static void *posix_async_subres_proc(void *arg) {
+    async_subres_worker_run((AsyncSubresBatchJob *)arg);
+    return NULL;
+}
+#endif
+
+/* Synchronously fetches pending <link rel="stylesheet"> blocks (script-blocking per HTML5) */
+static void fetch_pending_stylesheets_sync(ArcrWebView *view) {
     if (!view || !view->doc || !view->engine) return;
     ArcrDocument *doc = view->doc;
     ArcrEngine   *eng = view->engine;
 
-    /* 1. Handle inline data: image URIs without touching arcr_net! */
+    char eff_base[ARCR_URL_BUF_CAP];
+    view_effective_base_url(view, eff_base, sizeof(eff_base));
+    if (!is_fetchable_base_url(eff_base) && !is_fetchable_base_url(view->url)) return;
+
+    size_t count = 0u;
+    for (ArcrExternalResourceRef *r = doc->ext_styles_head; r != NULL; r = r->next) {
+        if (r->href_or_src && r->href_or_src[0] != '\0') ++count;
+    }
+    if (count == 0u) return;
+
+    for (ArcrExternalResourceRef *r = doc->ext_styles_head; r != NULL; r = r->next) {
+        if (!r->href_or_src || r->href_or_src[0] == '\0') continue;
+        const char *raw = r->href_or_src;
+        r->href_or_src = NULL;
+
+        char resolved[ARCR_URL_BUF_CAP];
+        resolve_url_with_engine(eng, eff_base, raw, resolved, sizeof(resolved));
+
+        uint8_t *bytes = NULL;
+        size_t   blen  = 0u;
+        char     ctype[128] = {0};
+        if (engine_fetch_resource_traced(view, "css", eng, resolved, view->url, "GET",
+                                         NULL, 0u, true, &bytes, &blen, NULL, 0u,
+                                         ctype, sizeof(ctype), NULL, NULL, 0u, NULL, NULL)) {
+            if (bytes && blen > 0u) {
+                size_t u8_len = 0u;
+                char *u8_css = decode_html_bytes_to_utf8_alloc(bytes, blen, ctype, &u8_len);
+                if (u8_css) {
+                    arcr_dom_append_style_block(doc, u8_css, u8_len);
+                    free(u8_css);
+                } else {
+                    arcr_dom_append_style_block(doc, (const char *)bytes, blen);
+                }
+            }
+            engine_free_resource(eng, bytes);
+        }
+    }
+}
+
+/* Launches non-blocking background fetch for http(s) <img> & async <script> subresources */
+static void start_async_subresources_if_needed(ArcrWebView        *view,
+                                               const uint32_t     *async_script_uids,
+                                               const bool         *async_is_module,
+                                               size_t              async_script_count) {
+    if (!view || !view->doc || !view->engine) return;
+    ArcrDocument *doc = view->doc;
+    ArcrEngine   *eng = view->engine;
+
+    /* 1. Decode inline data: and local file:// images immediately (0 network stall) */
+    char eff_base[ARCR_URL_BUF_CAP];
+    view_effective_base_url(view, eff_base, sizeof(eff_base));
+
     for (ArcrExternalResourceRef *r = doc->ext_images_head; r != NULL; r = r->next) {
-        if (r->href_or_src && arcr_str_starts_with_nocase(r->href_or_src, "data:")) {
+        if (!r->href_or_src || r->href_or_src[0] == '\0') continue;
+        if (arcr_str_starts_with_nocase(r->href_or_src, "data:")) {
             const char *uri = r->href_or_src;
-            r->href_or_src = NULL; /* Mark processed so repeat passes stay idempotent */
+            r->href_or_src = NULL;
             ArcrDomNode *owner = (r->owner_uid != 0u)
                                      ? arcr_dom_find_by_uid(doc->root, r->owner_uid)
                                      : r->owner_node;
@@ -1389,184 +2382,212 @@ static void fetch_document_subresources(ArcrWebView *view) {
                     arcr_image_free(&img);
                 }
             }
+            continue;
         }
-    }
 
-    char eff_base[ARCR_URL_BUF_CAP];
-    view_effective_base_url(view, eff_base, sizeof(eff_base));
-    if (!is_fetchable_base_url(eff_base) && !is_fetchable_base_url(view->url)) {
-        return;
-    }
-
-    /* Count unprocessed external refs first so static pages never load arcr_net */
-    size_t raw_candidates = 0u;
-    for (ArcrExternalResourceRef *r = doc->ext_styles_head; r != NULL; r = r->next) {
-        if (r->href_or_src && r->href_or_src[0] != '\0') ++raw_candidates;
-    }
-    for (ArcrExternalResourceRef *r = doc->ext_images_head; r != NULL; r = r->next) {
-        if (r->href_or_src && r->href_or_src[0] != '\0') ++raw_candidates;
-    }
-    if (eng->cfg.enable_javascript) {
-        for (ArcrExternalResourceRef *r = doc->ext_scripts_head; r != NULL; r = r->next) {
-            if (r->href_or_src && r->href_or_src[0] != '\0') ++raw_candidates;
-        }
-    }
-    if (raw_candidates == 0u) return;
-
-    (void)ensure_net_module(eng);
-    const ArcrNetVTable *net_vt = get_net_vt(eng);
-
-    SubresPendingItem *items = (SubresPendingItem *)calloc(raw_candidates, sizeof(SubresPendingItem));
-    if (!items) return;
-    size_t item_count = 0u;
-
-    for (ArcrExternalResourceRef *r = doc->ext_styles_head; r != NULL; r = r->next) {
-        if (!r->href_or_src || r->href_or_src[0] == '\0') continue;
-        const char *raw = r->href_or_src;
-        r->href_or_src = NULL;
-        SubresPendingItem *it = &items[item_count];
-        resolve_url_with_engine(eng, eff_base, raw, it->url, sizeof(it->url));
-        if (check_url_blocked(eng, it->url, view->url)) continue;
-        it->kind      = SUBRES_STYLE;
-        it->ref       = r;
-        it->owner_uid = r->owner_uid;
-        ++item_count;
-    }
-
-    for (ArcrExternalResourceRef *r = doc->ext_images_head; r != NULL; r = r->next) {
-        if (!r->href_or_src || r->href_or_src[0] == '\0') continue;
-        const char *raw = r->href_or_src;
-        r->href_or_src = NULL;
-        SubresPendingItem *it = &items[item_count];
-        resolve_url_with_engine(eng, eff_base, raw, it->url, sizeof(it->url));
-        if (check_url_blocked(eng, it->url, view->url)) continue;
-        it->kind      = SUBRES_IMAGE;
-        it->ref       = r;
-        it->owner_uid = r->owner_uid;
-        ++item_count;
-    }
-
-    if (eng->cfg.enable_javascript) {
-        for (ArcrExternalResourceRef *r = doc->ext_scripts_head; r != NULL; r = r->next) {
-            if (!r->href_or_src || r->href_or_src[0] == '\0') continue;
-            const char *raw = r->href_or_src;
+        char resolved[ARCR_URL_BUF_CAP];
+        resolve_url_with_engine(eng, eff_base, r->href_or_src, resolved, sizeof(resolved));
+        if (arcr_str_starts_with_nocase(resolved, "file://")) {
             r->href_or_src = NULL;
-            SubresPendingItem *it = &items[item_count];
-            resolve_url_with_engine(eng, eff_base, raw, it->url, sizeof(it->url));
-            if (check_url_blocked(eng, it->url, view->url)) continue;
-            it->kind      = SUBRES_SCRIPT;
-            it->ref       = r;
-            it->owner_uid = r->owner_uid;
-            ++item_count;
+            uint8_t *bytes = NULL;
+            size_t   blen  = 0u;
+            char     ctype[128] = {0};
+            if (engine_fetch_resource_traced(view, "img", eng, resolved, view->url, "GET",
+                                             NULL, 0u, true, &bytes, &blen, NULL, 0u,
+                                             ctype, sizeof(ctype), NULL, NULL, 0u, NULL, NULL)) {
+                ArcrDomNode *owner = (r->owner_uid != 0u)
+                                         ? arcr_dom_find_by_uid(doc->root, r->owner_uid)
+                                         : r->owner_node;
+                if (owner && bytes && blen > 0u) {
+                    attach_image_bytes_to_node(view, owner, ctype, bytes, blen);
+                }
+                engine_free_resource(eng, bytes);
+            }
         }
     }
 
-    if (!net_vt || item_count == 0u) {
+    if (!is_fetchable_base_url(eff_base) && !is_fetchable_base_url(view->url)) return;
+
+    /* 2. Collect remote http(s) images + async external scripts */
+    size_t cap = async_script_count;
+    for (ArcrExternalResourceRef *r = doc->ext_images_head; r != NULL; r = r->next) {
+        if (r->href_or_src && r->href_or_src[0] != '\0') ++cap;
+    }
+    if (cap == 0u) return;
+
+    AsyncSubresItem *items = (AsyncSubresItem *)calloc(cap, sizeof(AsyncSubresItem));
+    if (!items) return;
+    size_t nitems = 0u;
+
+    for (size_t i = 0u; i < async_script_count; ++i) {
+        ArcrDomNode *sn = arcr_dom_find_by_uid(doc->root, async_script_uids[i]);
+        if (!sn) continue;
+        const char *src = arcr_dom_get_attr_cstr(doc, sn, "src");
+        if (!src || src[0] == '\0') continue;
+
+        AsyncSubresItem *it = &items[nitems];
+        it->owner_uid        = sn->node_uid;
+        it->is_async_script  = true;
+        it->is_module_script = async_is_module ? async_is_module[i] : false;
+        resolve_url_with_engine(eng, eff_base, src, it->url, sizeof(it->url));
+        if (check_url_blocked(eng, it->url, view->url)) {
+            view_record_trace_explicit(view, view->current_navigation_id, view->current_document_id,
+                                       it->is_module_script ? "module" : "script",
+                                       it->url, it->url, 0, "", 0u, 0u, false, "url-filter", 0ULL);
+            continue;
+        }
+        ++nitems;
+    }
+
+    for (ArcrExternalResourceRef *r = doc->ext_images_head; r != NULL; r = r->next) {
+        if (!r->href_or_src || r->href_or_src[0] == '\0') continue;
+        const char *raw = r->href_or_src;
+        r->href_or_src = NULL;
+
+        AsyncSubresItem *it = &items[nitems];
+        it->owner_uid = r->owner_uid;
+        resolve_url_with_engine(eng, eff_base, raw, it->url, sizeof(it->url));
+        if (!arcr_str_starts_with_nocase(it->url, "http://") &&
+            !arcr_str_starts_with_nocase(it->url, "https://")) {
+            continue;
+        }
+        if (check_url_blocked(eng, it->url, view->url)) {
+            view_record_trace_explicit(view, view->current_navigation_id, view->current_document_id,
+                                       "img", it->url, it->url, 0, "", 0u, 0u, false,
+                                       "url-filter", 0ULL);
+            continue;
+        }
+        ++nitems;
+    }
+
+    if (nitems == 0u || !ensure_net_module(eng)) {
         free(items);
         return;
     }
 
-    /* Parallel multi-core batch fetch when fetch_batch_parallel is available */
-    if (net_vt->fetch_batch_parallel && item_count > 1u) {
-        const char *ref_hdr = is_fetchable_base_url(view->url) ? view->url : NULL;
-        for (size_t base = 0u; base < item_count; base += ARCR_SUBRES_BATCH_MAX) {
-            size_t bn = item_count - base;
-            if (bn > ARCR_SUBRES_BATCH_MAX) bn = ARCR_SUBRES_BATCH_MAX;
+    cancel_view_subres_job(view);
 
-            ArcrHttpRequest  reqs[ARCR_SUBRES_BATCH_MAX];
-            ArcrHttpResponse resps[ARCR_SUBRES_BATCH_MAX];
-            memset(reqs, 0, sizeof(reqs));
-            memset(resps, 0, sizeof(resps));
-
-            for (size_t i = 0u; i < bn; ++i) {
-                reqs[i].url              = items[base + i].url;
-                reqs[i].method           = "GET";
-                reqs[i].referer          = ref_hdr;
-                reqs[i].private_browsing = eng->cfg.private_browsing;
-            }
-
-            net_vt->fetch_batch_parallel(reqs, resps, bn);
-
-            for (size_t i = 0u; i < bn; ++i) {
-                SubresPendingItem *it = &items[base + i];
-                ArcrHttpResponse  *rp = &resps[i];
-                if (rp->body && rp->body_len > 0u && is_http_status_2xx_or_local(rp->status_code)) {
-                    ArcrDomNode *owner = (it->owner_uid != 0u)
-                                             ? arcr_dom_find_by_uid(doc->root, it->owner_uid)
-                                             : (it->ref ? it->ref->owner_node : NULL);
-                    if (it->kind == SUBRES_STYLE) {
-                        arcr_dom_append_style_block(doc, (const char *)rp->body, rp->body_len);
-                    } else if (it->kind == SUBRES_IMAGE && owner) {
-                        attach_image_bytes_to_node(view, owner, rp->content_type,
-                                                   rp->body, rp->body_len);
-                    } else if (it->kind == SUBRES_SCRIPT && owner) {
-                        owner->text     = arcr_arena_strdup(&doc->arena, (const char *)rp->body, rp->body_len);
-                        owner->text_len = rp->body_len;
-                        doc->has_scripts = true;
-                    }
-                }
-                free_net_http_response(net_vt, rp);
-            }
-        }
+    AsyncSubresBatchJob *job = (AsyncSubresBatchJob *)calloc(1u, sizeof(AsyncSubresBatchJob));
+    if (!job) {
         free(items);
         return;
     }
+    eng_mutex_init(&job->mtx);
+    job->refs             = 2;
+    job->navigation_id    = view->current_navigation_id;
+    job->document_id      = view->current_document_id;
+    job->eng              = eng;
+    job->net_vt           = get_net_vt(eng);
+    job->private_browsing = eng->cfg.private_browsing;
+    arcr_str_copy(job->page_url, sizeof(job->page_url), view->url);
+    extract_url_origin(view->url, job->page_origin, sizeof(job->page_origin));
+    job->items      = items;
+    job->item_count = nitems;
 
-    /* Single-item or legacy load_url_resource fallback */
-    for (size_t i = 0u; i < item_count; ++i) {
-        SubresPendingItem *it = &items[i];
-        uint8_t *bytes = NULL;
-        size_t   blen  = 0u;
-        if (net_vt->fetch_http) {
-            ArcrHttpRequest req;
-            ArcrHttpResponse rp;
-            memset(&req, 0, sizeof(req));
-            memset(&rp, 0, sizeof(rp));
-            req.url              = it->url;
-            req.method           = "GET";
-            req.referer          = is_fetchable_base_url(view->url) ? view->url : NULL;
-            req.private_browsing = eng->cfg.private_browsing;
-            if (net_vt->fetch_http(&req, &rp) && rp.body && rp.body_len > 0u &&
-                is_http_status_2xx_or_local(rp.status_code)) {
-                ArcrDomNode *owner = (it->owner_uid != 0u)
-                                         ? arcr_dom_find_by_uid(doc->root, it->owner_uid)
-                                         : (it->ref ? it->ref->owner_node : NULL);
-                if (it->kind == SUBRES_STYLE) {
-                    arcr_dom_append_style_block(doc, (const char *)rp.body, rp.body_len);
-                } else if (it->kind == SUBRES_IMAGE && owner) {
-                    attach_image_bytes_to_node(view, owner, rp.content_type, rp.body, rp.body_len);
-                } else if (it->kind == SUBRES_SCRIPT && owner) {
-                    owner->text      = arcr_arena_strdup(&doc->arena, (const char *)rp.body, rp.body_len);
-                    owner->text_len  = rp.body_len;
-                    doc->has_scripts = true;
-                }
-            }
-            free_net_http_response(net_vt, &rp);
-        } else if (engine_fetch_resource_ex(eng, it->url, view->url, "GET", NULL, 0u,
-                                            true, &bytes, &blen, NULL, 0u, NULL, NULL, 0u, NULL, NULL)) {
-            ArcrDomNode *owner = (it->owner_uid != 0u)
-                                     ? arcr_dom_find_by_uid(doc->root, it->owner_uid)
-                                     : (it->ref ? it->ref->owner_node : NULL);
-            if (bytes && blen > 0u) {
-                if (it->kind == SUBRES_STYLE) {
-                    arcr_dom_append_style_block(doc, (const char *)bytes, blen);
-                } else if (it->kind == SUBRES_IMAGE && owner) {
-                    attach_image_bytes_to_node(view, owner, NULL, bytes, blen);
-                } else if (it->kind == SUBRES_SCRIPT && owner) {
-                    owner->text      = arcr_arena_strdup(&doc->arena, (const char *)bytes, blen);
-                    owner->text_len  = blen;
-                    doc->has_scripts = true;
-                }
-            }
-            engine_free_resource(eng, bytes);
-        }
+    view->subres_job = job;
+
+    eng_mutex_lock(&eng->async_mtx);
+    eng->active_async_workers++;
+    eng_mutex_unlock(&eng->async_mtx);
+
+    bool spawned = false;
+#if defined(_WIN32)
+    uintptr_t th = _beginthreadex(NULL, 0u, win32_async_subres_proc, job, 0u, NULL);
+    if (th != 0u) {
+        CloseHandle((HANDLE)th);
+        spawned = true;
     }
-    free(items);
+#else
+    pthread_t th;
+    if (pthread_create(&th, NULL, posix_async_subres_proc, job) == 0) {
+        (void)pthread_detach(th);
+        spawned = true;
+    }
+#endif
+
+    if (!spawned) {
+        eng_mutex_lock(&eng->async_mtx);
+        if (eng->active_async_workers > 0u) eng->active_async_workers--;
+        eng_mutex_unlock(&eng->async_mtx);
+        job->refs = 1;
+        /* Synchronous fallback if OS thread creation fails */
+        async_subres_worker_run(job);
+        view->subres_job = NULL;
+    }
+}
+
+/* Synchronously fetches dynamically inserted CSS/image subresources (or starts async batch) */
+static void fetch_document_subresources(ArcrWebView *view) {
+    if (!view || !view->doc) return;
+    fetch_pending_stylesheets_sync(view);
+    if (!view->subres_job) {
+        start_async_subresources_if_needed(view, NULL, NULL, 0u);
+    }
 }
 
 /* -------------------------------------------------------------------------
- * 9. JavaScript VM Host Bridge & UID-Safe Script Execution
+ * 9. Session History Stack, Web Host v2 Callbacks & Script Execution
  * ------------------------------------------------------------------------- */
+static void clear_view_history(ArcrWebView *view) {
+    if (!view) return;
+    for (size_t i = 0u; i < view->hist_count; ++i) {
+        free(view->history[i].state_json);
+        view->history[i].state_json = NULL;
+    }
+    memset(view->history, 0, sizeof(view->history));
+    view->hist_count = 0u;
+    view->hist_index = 0u;
+}
+
+static void record_view_history_commit(ArcrWebView *view, const char *committed_url,
+                                       uint64_t doc_group_id) {
+    if (!view || !committed_url || committed_url[0] == '\0') return;
+    if (arcr_str_eq_nocase(committed_url, "about:blank") && view->hist_count == 0u) return;
+    if (view->suppress_history_push) return;
+
+    /* Truncate forward entries when a new navigation commits */
+    if (view->hist_count > 0u && view->hist_index + 1u < view->hist_count) {
+        for (size_t i = view->hist_index + 1u; i < view->hist_count; ++i) {
+            free(view->history[i].state_json);
+            view->history[i].state_json = NULL;
+        }
+        view->hist_count = view->hist_index + 1u;
+    }
+
+    /* Avoid duplicate consecutive identical URL on reload */
+    if (view->hist_count > 0u &&
+        strcmp(view->history[view->hist_index].url, committed_url) == 0) {
+        view->history[view->hist_index].doc_group_id = doc_group_id;
+        return;
+    }
+
+    if (view->hist_count >= ARCR_VIEW_HIST_CAP) {
+        free(view->history[0].state_json);
+        memmove(&view->history[0], &view->history[1],
+                (ARCR_VIEW_HIST_CAP - 1u) * sizeof(ViewHistoryEntry));
+        memset(&view->history[ARCR_VIEW_HIST_CAP - 1u], 0, sizeof(ViewHistoryEntry));
+        view->hist_count = ARCR_VIEW_HIST_CAP - 1u;
+    }
+
+    size_t idx = view->hist_count++;
+    arcr_str_copy(view->history[idx].url, sizeof(view->history[idx].url), committed_url);
+    free(view->history[idx].state_json);
+    view->history[idx].state_json   = NULL;
+    view->history[idx].doc_group_id = doc_group_id;
+    view->hist_index                = idx;
+}
+
+static void view_set_ready_state(ArcrWebView *view, const char *state) {
+    if (!view || !state) return;
+    arcr_str_copy(view->ready_state, sizeof(view->ready_state), state);
+    if (view->js_vm) {
+        const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+        if (js_vt && js_vt->set_ready_state) {
+            js_vt->set_ready_state(view->js_vm, state);
+        }
+    }
+}
+
 static const char *js_host_get_current_url(void *userdata) {
     const ArcrWebView *view = (const ArcrWebView *)userdata;
     return view ? view->url : "about:blank";
@@ -1649,71 +2670,491 @@ static void js_host_storage_set(void *userdata, const char *key, const char *val
     arcr_str_copy(eng->storage[idx].val, sizeof(eng->storage[idx].val), val);
 }
 
-static bool js_host_http_fetch(void *userdata, const char *url, const char *method,
-                               const char *body, size_t body_len, const char *content_type,
-                               int *out_status, char *out_resp_ctype, size_t ctype_cap,
-                               uint8_t **out_resp_bytes, size_t *out_resp_len) {
+static void js_host_ensure_layout(void *userdata) {
+    ArcrWebView *view = (ArcrWebView *)userdata;
+    if (!view || !view->doc) return;
+    if (!view->sheet || !view->layout || view->doc->dom_dirty) {
+        fetch_pending_stylesheets_sync(view);
+        restyle_and_relayout(view);
+    }
+}
+
+static bool js_host_css_supports(void *userdata, const char *prop_or_cond, const char *val_or_null) {
+    (void)userdata;
+    if (!prop_or_cond) return false;
+    if (val_or_null) {
+        return arcr_css_supports_declaration(prop_or_cond, strlen(prop_or_cond),
+                                             val_or_null, strlen(val_or_null));
+    }
+    return arcr_css_supports_condition(prop_or_cond, strlen(prop_or_cond));
+}
+
+static void js_host_free_buffer(void *userdata, void *buf) {
+    (void)userdata;
+    free(buf);
+}
+
+/* Extended Fetch / XHR host bridge (thread-safe: may be called from async fetch worker!) */
+static bool js_host_http_fetch_ex(void *userdata, const char *url, const char *method,
+                                  const char *req_headers_raw, const uint8_t *body, size_t body_len,
+                                  bool include_credentials, const volatile int *cancel_flag,
+                                  int *out_status, char *out_final_url, size_t final_url_cap,
+                                  char *out_content_type, size_t ctype_cap,
+                                  char **out_resp_headers_raw, size_t *out_resp_headers_len,
+                                  uint8_t **out_resp_bytes, size_t *out_resp_len,
+                                  char *out_blocked_reason, size_t reason_cap) {
     if (out_status) *out_status = 0;
-    if (out_resp_ctype && ctype_cap > 0u) out_resp_ctype[0] = '\0';
+    if (out_final_url && final_url_cap > 0u) out_final_url[0] = '\0';
+    if (out_content_type && ctype_cap > 0u) out_content_type[0] = '\0';
+    if (out_resp_headers_raw) *out_resp_headers_raw = NULL;
+    if (out_resp_headers_len) *out_resp_headers_len = 0u;
     if (out_resp_bytes) *out_resp_bytes = NULL;
     if (out_resp_len)   *out_resp_len   = 0u;
+    if (out_blocked_reason && reason_cap > 0u) out_blocked_reason[0] = '\0';
 
     ArcrWebView *view = (ArcrWebView *)userdata;
     if (!view || !view->engine || !url || url[0] == '\0') return false;
+    ArcrEngine *eng = view->engine;
+
+    if (cancel_flag && *cancel_flag != 0) {
+        if (out_blocked_reason && reason_cap > 0u) {
+            arcr_str_copy(out_blocked_reason, reason_cap, "cancelled");
+        }
+        view_record_trace_explicit(view, view->current_navigation_id, view->current_document_id,
+                                   "fetch", url, url, 0, "", 0u, 0u, false, "cancelled", 0ULL);
+        return false;
+    }
 
     char eff_base[ARCR_URL_BUF_CAP];
     view_effective_base_url(view, eff_base, sizeof(eff_base));
     char resolved[ARCR_URL_BUF_CAP];
-    resolve_url_with_engine(view->engine, eff_base, url, resolved, sizeof(resolved));
-
-    if (check_url_blocked(view->engine, resolved, view->url)) return false;
-    if (!ensure_net_module(view->engine)) return false;
-    const ArcrNetVTable *net_vt = get_net_vt(view->engine);
-    if (!net_vt) return false;
-
-    if (net_vt->fetch_http) {
-        ArcrHttpRequest  req;
-        ArcrHttpResponse resp;
-        memset(&req, 0, sizeof(req));
-        memset(&resp, 0, sizeof(resp));
-        req.url              = resolved;
-        req.method           = (method && method[0]) ? method : "GET";
-        req.post_body        = body;
-        req.post_body_len    = body_len;
-        req.content_type     = content_type;
-        req.referer          = is_fetchable_base_url(view->url) ? view->url : NULL;
-        req.private_browsing = view->engine->cfg.private_browsing;
-        req.bypass_cache     = (body != NULL && body_len > 0u);
-
-        bool ok = net_vt->fetch_http(&req, &resp);
-        if (out_status) *out_status = resp.status_code;
-        if (out_resp_ctype && ctype_cap > 0u) {
-            arcr_str_copy(out_resp_ctype, ctype_cap, resp.content_type);
-        }
-        if (!ok || !resp.body) {
-            free_net_http_response(net_vt, &resp);
-            return false;
-        }
-        if (out_resp_bytes) {
-            *out_resp_bytes = resp.body;
-            resp.body       = NULL;
-        }
-        if (out_resp_len) *out_resp_len = resp.body_len;
-        free_net_http_response(net_vt, &resp);
-        return true;
+    resolve_url_with_engine(eng, eff_base, url, resolved, sizeof(resolved));
+    if (out_final_url && final_url_cap > 0u) {
+        arcr_str_copy(out_final_url, final_url_cap, resolved);
     }
 
-    int status = 0;
-    return engine_fetch_resource_ex(view->engine, resolved, view->url, method,
-                                    body, body_len, false, out_resp_bytes, out_resp_len,
-                                    NULL, 0u, NULL, NULL, 0u, NULL, &status) &&
-           (out_status ? (*out_status = status, true) : true);
+    if (check_url_blocked(eng, resolved, view->url)) {
+        if (out_blocked_reason && reason_cap > 0u) {
+            arcr_str_copy(out_blocked_reason, reason_cap, "url-filter");
+        }
+        view_record_trace_explicit(view, view->current_navigation_id, view->current_document_id,
+                                   "fetch", resolved, resolved, 0, "", 0u, 0u,
+                                   false, "url-filter", 0ULL);
+        return false;
+    }
+
+    if (!ensure_net_module(eng)) {
+        if (out_blocked_reason && reason_cap > 0u) {
+            arcr_str_copy(out_blocked_reason, reason_cap, "net-error");
+        }
+        return false;
+    }
+    const ArcrNetVTable *net_vt = get_net_vt(eng);
+    if (!net_vt || !net_vt->fetch_http) return false;
+
+    char page_origin[256] = {0};
+    extract_url_origin(view->url, page_origin, sizeof(page_origin));
+    bool cross_origin = !urls_are_same_origin(view->url, resolved);
+    const char *eff_method = (method && method[0]) ? method : "GET";
+
+    /* CORS Preflight OPTIONS for non-simple cross-origin requests */
+    char non_simple_hdrs[256] = {0};
+    if (cross_origin && cors_request_needs_preflight(eff_method, req_headers_raw,
+                                                     non_simple_hdrs, sizeof(non_simple_hdrs))) {
+        char pre_hdrs[512];
+        if (non_simple_hdrs[0] != '\0') {
+            snprintf(pre_hdrs, sizeof(pre_hdrs),
+                     "Access-Control-Request-Method: %s\r\n"
+                     "Access-Control-Request-Headers: %s\r\n",
+                     eff_method, non_simple_hdrs);
+        } else {
+            snprintf(pre_hdrs, sizeof(pre_hdrs),
+                     "Access-Control-Request-Method: %s\r\n", eff_method);
+        }
+        ArcrHttpRequest  pre_req;
+        ArcrHttpResponse pre_resp;
+        memset(&pre_req, 0, sizeof(pre_req));
+        memset(&pre_resp, 0, sizeof(pre_resp));
+        pre_req.url                 = resolved;
+        pre_req.method              = "OPTIONS";
+        pre_req.extra_headers       = pre_hdrs;
+        pre_req.origin              = page_origin[0] ? page_origin : "null";
+        pre_req.include_credentials = false;
+        pre_req.private_browsing    = eng->cfg.private_browsing;
+        pre_req.bypass_cache        = true;
+        pre_req.cancel_flag         = cancel_flag;
+
+        uint64_t pt0 = arcr_platform_monotonic_usec();
+        bool pok = net_vt->fetch_http(&pre_req, &pre_resp);
+        uint64_t pdur = arcr_platform_monotonic_usec() - pt0;
+        bool pre_allowed = pok && is_http_status_2xx_or_local(pre_resp.status_code) &&
+                           cors_response_allows_origin(pre_resp.raw_headers, page_origin,
+                                                       include_credentials);
+        view_record_trace_resp(view, "fetch", resolved, &pre_resp,
+                               pre_allowed ? "" : "cors", pdur);
+        free_net_http_response(net_vt, &pre_resp);
+        if (!pre_allowed) {
+            if (out_blocked_reason && reason_cap > 0u) {
+                arcr_str_copy(out_blocked_reason, reason_cap, "cors");
+            }
+            return false;
+        }
+    }
+
+    char req_ctype[128] = {0};
+    if (req_headers_raw) {
+        (void)http_raw_headers_get(req_headers_raw, "content-type", req_ctype, sizeof(req_ctype));
+    }
+
+    ArcrHttpRequest  req;
+    ArcrHttpResponse resp;
+    memset(&req, 0, sizeof(req));
+    memset(&resp, 0, sizeof(resp));
+    req.url                 = resolved;
+    req.method              = eff_method;
+    req.post_body           = (const char *)body;
+    req.post_body_len       = body_len;
+    req.content_type        = req_ctype[0] ? req_ctype : NULL;
+    req.extra_headers       = req_headers_raw;
+    req.referer             = is_fetchable_base_url(view->url) ? view->url : NULL;
+    req.origin              = (cross_origin || !arcr_str_eq_nocase(eff_method, "GET"))
+                                  ? (page_origin[0] ? page_origin : "null")
+                                  : NULL;
+    req.include_credentials = include_credentials;
+    req.private_browsing    = eng->cfg.private_browsing;
+    req.bypass_cache        = !arcr_str_eq_nocase(eff_method, "GET");
+    req.cancel_flag         = cancel_flag;
+
+    uint64_t t0 = arcr_platform_monotonic_usec();
+    bool ok = net_vt->fetch_http(&req, &resp);
+    uint64_t dur = arcr_platform_monotonic_usec() - t0;
+
+    if (resp.cancelled || (cancel_flag && *cancel_flag != 0)) {
+        view_record_trace_resp(view, "fetch", resolved, &resp, "cancelled", dur);
+        if (out_blocked_reason && reason_cap > 0u) {
+            arcr_str_copy(out_blocked_reason, reason_cap, "cancelled");
+        }
+        free_net_http_response(net_vt, &resp);
+        return false;
+    }
+
+    const char *furl = resp.final_url[0] ? resp.final_url : resolved;
+    if ((cross_origin || !urls_are_same_origin(view->url, furl)) &&
+        !cors_response_allows_origin(resp.raw_headers, page_origin, include_credentials)) {
+        view_record_trace_resp(view, "fetch", resolved, &resp, "cors", dur);
+        if (out_blocked_reason && reason_cap > 0u) {
+            arcr_str_copy(out_blocked_reason, reason_cap, "cors");
+        }
+        free_net_http_response(net_vt, &resp);
+        return false;
+    }
+
+    view_record_trace_resp(view, "fetch", resolved, &resp, ok ? "" : "net-error", dur);
+
+    if (!ok) {
+        if (out_blocked_reason && reason_cap > 0u) {
+            arcr_str_copy(out_blocked_reason, reason_cap,
+                          (resp.security == ARCR_SEC_CERT_ERROR ||
+                           resp.security == ARCR_SEC_CLOCK_SKEW_ERR)
+                              ? "tls-error"
+                              : "net-error");
+        }
+        free_net_http_response(net_vt, &resp);
+        return false;
+    }
+
+    if (out_status) *out_status = resp.status_code;
+    if (out_final_url && final_url_cap > 0u) {
+        arcr_str_copy(out_final_url, final_url_cap, furl);
+    }
+    if (out_content_type && ctype_cap > 0u) {
+        arcr_str_copy(out_content_type, ctype_cap, resp.content_type);
+    }
+    if (out_resp_headers_raw && resp.raw_headers) {
+        char *hcopy = (char *)malloc(resp.raw_headers_len + 1u);
+        if (hcopy) {
+            memcpy(hcopy, resp.raw_headers, resp.raw_headers_len);
+            hcopy[resp.raw_headers_len] = '\0';
+            *out_resp_headers_raw = hcopy;
+            if (out_resp_headers_len) *out_resp_headers_len = resp.raw_headers_len;
+        }
+    }
+    if (out_resp_bytes) {
+        uint8_t *bcopy = (uint8_t *)malloc(resp.body_len + 1u);
+        if (bcopy) {
+            if (resp.body && resp.body_len > 0u) memcpy(bcopy, resp.body, resp.body_len);
+            bcopy[resp.body_len] = 0u;
+            *out_resp_bytes = bcopy;
+            if (out_resp_len) *out_resp_len = resp.body_len;
+        }
+    }
+
+    free_net_http_response(net_vt, &resp);
+    return true;
+}
+
+/* Legacy v1 HTTP fetch bridge */
+static bool js_host_http_fetch(void *userdata, const char *url, const char *method,
+                               const char *body, size_t body_len, const char *content_type,
+                               int *out_status, char *out_resp_ctype, size_t ctype_cap,
+                               uint8_t **out_resp_bytes, size_t *out_resp_len) {
+    char hdr_buf[256] = {0};
+    if (content_type && content_type[0] != '\0') {
+        snprintf(hdr_buf, sizeof(hdr_buf), "Content-Type: %s\r\n", content_type);
+    }
+    return js_host_http_fetch_ex(userdata, url, method, hdr_buf[0] ? hdr_buf : NULL,
+                                 (const uint8_t *)body, body_len, true, NULL,
+                                 out_status, NULL, 0u, out_resp_ctype, ctype_cap,
+                                 NULL, NULL, out_resp_bytes, out_resp_len, NULL, 0u);
 }
 
 static void js_host_http_free(void *userdata, uint8_t *resp_bytes) {
+    (void)userdata;
+    free(resp_bytes);
+}
+
+/* Fetches external ES module source with strict JS MIME & CORS enforcement */
+static bool js_host_load_module_source(void *userdata, const char *resolved_url,
+                                       const char *referrer_url,
+                                       char **out_utf8_code, size_t *out_code_len,
+                                       char *out_final_url, size_t final_url_cap,
+                                       char *out_mime, size_t mime_cap,
+                                       char *out_error, size_t err_cap) {
+    if (out_utf8_code) *out_utf8_code = NULL;
+    if (out_code_len)  *out_code_len  = 0u;
+    if (out_final_url && final_url_cap > 0u) out_final_url[0] = '\0';
+    if (out_mime && mime_cap > 0u) out_mime[0] = '\0';
+    if (out_error && err_cap > 0u) out_error[0] = '\0';
+
     ArcrWebView *view = (ArcrWebView *)userdata;
-    if (!resp_bytes) return;
-    engine_free_resource(view ? view->engine : NULL, resp_bytes);
+    if (!view || !view->engine || !resolved_url || resolved_url[0] == '\0') return false;
+    ArcrEngine *eng = view->engine;
+
+    char eff_base[ARCR_URL_BUF_CAP];
+    if (referrer_url && referrer_url[0] != '\0' && is_fetchable_base_url(referrer_url)) {
+        arcr_str_copy(eff_base, sizeof(eff_base), referrer_url);
+    } else {
+        view_effective_base_url(view, eff_base, sizeof(eff_base));
+    }
+
+    char target_url[ARCR_URL_BUF_CAP];
+    resolve_url_with_engine(eng, eff_base, resolved_url, target_url, sizeof(target_url));
+
+    if (check_url_blocked(eng, target_url, view->url)) {
+        view_record_trace_explicit(view, view->current_navigation_id, view->current_document_id,
+                                   "module", target_url, target_url, 0, "", 0u, 0u,
+                                   false, "url-filter", 0ULL);
+        if (out_error && err_cap > 0u) {
+            snprintf(out_error, err_cap, "Module request blocked by URL filter: %s", target_url);
+        }
+        return false;
+    }
+
+    if (!ensure_net_module(eng)) {
+        if (out_error && err_cap > 0u) {
+            arcr_str_copy(out_error, err_cap, "arcr_net module unavailable");
+        }
+        return false;
+    }
+    const ArcrNetVTable *net_vt = get_net_vt(eng);
+    if (!net_vt) return false;
+
+    char page_origin[256] = {0};
+    extract_url_origin(view->url, page_origin, sizeof(page_origin));
+    bool cross_origin = !urls_are_same_origin(view->url, target_url);
+
+    ArcrHttpResponse resp;
+    memset(&resp, 0, sizeof(resp));
+    bool ok = false;
+    uint64_t t0 = arcr_platform_monotonic_usec();
+
+    if (net_vt->fetch_http) {
+        ArcrHttpRequest req;
+        memset(&req, 0, sizeof(req));
+        req.url                 = target_url;
+        req.method              = "GET";
+        req.referer             = is_fetchable_base_url(eff_base) ? eff_base : NULL;
+        req.origin              = cross_origin ? (page_origin[0] ? page_origin : "null") : NULL;
+        req.include_credentials = !cross_origin; /* ESM default credentials mode is same-origin */
+        req.private_browsing    = eng->cfg.private_browsing;
+        ok = net_vt->fetch_http(&req, &resp);
+    } else if (net_vt->load_url_resource) {
+        char  *body = NULL;
+        size_t len  = 0u;
+        ArcrSecurityState sec = ARCR_SEC_LOCAL_OR_NONE;
+        char detail[256] = {0};
+        ok = net_vt->load_url_resource(target_url, &body, &len, &sec, detail, sizeof(detail));
+        resp.status_code   = ok ? 200 : 0;
+        resp.security      = sec;
+        resp.body          = (uint8_t *)body;
+        resp.body_len      = len;
+        resp.decoded_bytes = len;
+        arcr_str_copy(resp.final_url, sizeof(resp.final_url), target_url);
+    }
+    uint64_t dur = arcr_platform_monotonic_usec() - t0;
+    const char *furl = resp.final_url[0] ? resp.final_url : target_url;
+
+    if (!ok || !resp.body || !is_http_status_2xx_or_local(resp.status_code)) {
+        view_record_trace_resp(view, "module", target_url, &resp,
+                               ok ? "" : "net-error", dur);
+        if (out_error && err_cap > 0u) {
+            snprintf(out_error, err_cap, "[module/fetch] %s: HTTP %d (%s)",
+                     furl, resp.status_code, resp.detail[0] ? resp.detail : "network failure");
+        }
+        free_net_http_response(net_vt, &resp);
+        return false;
+    }
+
+    if ((cross_origin || !urls_are_same_origin(view->url, furl)) &&
+        !cors_response_allows_origin(resp.raw_headers, page_origin, false)) {
+        view_record_trace_resp(view, "module", target_url, &resp, "cors", dur);
+        if (out_error && err_cap > 0u) {
+            snprintf(out_error, err_cap,
+                     "[module/fetch] %s: Cross-origin module blocked by CORS policy", furl);
+        }
+        free_net_http_response(net_vt, &resp);
+        return false;
+    }
+
+    char mime[64] = {0};
+    extract_mime_essence(resp.content_type, mime, sizeof(mime));
+    if (out_mime && mime_cap > 0u) arcr_str_copy(out_mime, mime_cap, mime);
+
+    if (!is_js_mime_essence(mime) && !arcr_str_starts_with_nocase(furl, "file://")) {
+        view_record_trace_resp(view, "module", target_url, &resp, "bad-mime", dur);
+        if (out_error && err_cap > 0u) {
+            snprintf(out_error, err_cap,
+                     "[module/fetch] %s: Strict MIME check failed (got '%s', expected JavaScript)",
+                     furl, mime[0] ? mime : "empty");
+        }
+        free_net_http_response(net_vt, &resp);
+        return false;
+    }
+
+    view_record_trace_resp(view, "module", target_url, &resp, "", dur);
+
+    if (out_final_url && final_url_cap > 0u) {
+        arcr_str_copy(out_final_url, final_url_cap, furl);
+    }
+
+    size_t u8_len = 0u;
+    char *u8 = decode_html_bytes_to_utf8_alloc(resp.body, resp.body_len, resp.content_type, &u8_len);
+    free_net_http_response(net_vt, &resp);
+    if (!u8) return false;
+
+    if (out_utf8_code) *out_utf8_code = u8;
+    else free(u8);
+    if (out_code_len)  *out_code_len  = u8_len;
+    return true;
+}
+
+static void js_host_history_push_or_replace(void *userdata, const char *new_url,
+                                            const char *state_json, bool is_replace) {
+    ArcrWebView *view = (ArcrWebView *)userdata;
+    if (!view) return;
+
+    char resolved[ARCR_URL_BUF_CAP];
+    if (new_url && new_url[0] != '\0') {
+        resolve_url_with_engine(view->engine, view->url, new_url, resolved, sizeof(resolved));
+        if (!urls_are_same_origin(view->url, resolved) &&
+            is_fetchable_base_url(view->url)) {
+            /* Cross-origin pushState/replaceState is forbidden per HTML5 SecurityError */
+            return;
+        }
+    } else {
+        arcr_str_copy(resolved, sizeof(resolved), view->url);
+    }
+
+    if (view->hist_count == 0u) {
+        view->current_doc_group_id = engine_alloc_doc_group_id(view->engine);
+        record_view_history_commit(view, view->url, view->current_doc_group_id);
+    }
+
+    if (is_replace && view->hist_count > 0u) {
+        ViewHistoryEntry *ent = &view->history[view->hist_index];
+        arcr_str_copy(ent->url, sizeof(ent->url), resolved);
+        free(ent->state_json);
+        ent->state_json = state_json ? strdup(state_json) : NULL;
+    } else {
+        if (view->hist_count > 0u && view->hist_index + 1u < view->hist_count) {
+            for (size_t i = view->hist_index + 1u; i < view->hist_count; ++i) {
+                free(view->history[i].state_json);
+                view->history[i].state_json = NULL;
+            }
+            view->hist_count = view->hist_index + 1u;
+        }
+        if (view->hist_count >= ARCR_VIEW_HIST_CAP) {
+            free(view->history[0].state_json);
+            memmove(&view->history[0], &view->history[1],
+                    (ARCR_VIEW_HIST_CAP - 1u) * sizeof(ViewHistoryEntry));
+            memset(&view->history[ARCR_VIEW_HIST_CAP - 1u], 0, sizeof(ViewHistoryEntry));
+            view->hist_count = ARCR_VIEW_HIST_CAP - 1u;
+        }
+        size_t idx = view->hist_count++;
+        arcr_str_copy(view->history[idx].url, sizeof(view->history[idx].url), resolved);
+        view->history[idx].state_json   = state_json ? strdup(state_json) : NULL;
+        view->history[idx].doc_group_id = view->current_doc_group_id;
+        view->hist_index                = idx;
+    }
+
+    arcr_str_copy(view->url, sizeof(view->url), resolved);
+    if (view->cb.on_url_changed) {
+        view->cb.on_url_changed(view->cb.userdata, view->url);
+    }
+    if (view->js_vm) {
+        const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+        if (js_vt && js_vt->notify_url_and_popstate) {
+            js_vt->notify_url_and_popstate(view->js_vm, view->url, state_json, false);
+        }
+    }
+}
+
+static bool js_host_history_go(void *userdata, int32_t delta) {
+    ArcrWebView *view = (ArcrWebView *)userdata;
+    if (!view || view->hist_count == 0u) return false;
+    if (delta == 0) {
+        arcr_str_copy(view->pending_js_nav_url, sizeof(view->pending_js_nav_url), view->url);
+        return true;
+    }
+    int target = (int)view->hist_index + (int)delta;
+    if (target < 0 || (size_t)target >= view->hist_count) return false;
+
+    ViewHistoryEntry *ent = &view->history[(size_t)target];
+    if (ent->doc_group_id == view->current_doc_group_id) {
+        view->hist_index = (size_t)target;
+        arcr_str_copy(view->url, sizeof(view->url), ent->url);
+        if (view->cb.on_url_changed) {
+            view->cb.on_url_changed(view->cb.userdata, view->url);
+        }
+        if (view->js_vm) {
+            const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+            if (js_vt && js_vt->notify_url_and_popstate) {
+                js_vt->notify_url_and_popstate(view->js_vm, view->url, ent->state_json, true);
+            }
+        }
+        return true;
+    }
+
+    view->pending_hist_nav_idx = target;
+    return true;
+}
+
+static size_t js_host_history_length(void *userdata) {
+    const ArcrWebView *view = (const ArcrWebView *)userdata;
+    if (!view) return 1u;
+    return view->hist_count > 0u ? view->hist_count : 1u;
+}
+
+static bool js_host_document_write(void *userdata, const char *utf8_html, size_t len) {
+    ArcrWebView *view = (ArcrWebView *)userdata;
+    if (!view || !utf8_html || len == 0u) return false;
+    if (view->active_parser) {
+        return arcr_html_parser_document_write(view->active_parser, utf8_html, len);
+    }
+    if (view->doc && view->doc->body) {
+        return arcr_html_parse_fragment(view->doc, view->doc->body, utf8_html, len);
+    }
+    return false;
 }
 
 static bool ensure_view_js_vm(ArcrWebView *view) {
@@ -1730,21 +3171,34 @@ static bool ensure_view_js_vm(ArcrWebView *view) {
                           : (32u * 1024u * 1024u);
     ArcrJsHostCallbacks hcb;
     memset(&hcb, 0, sizeof(hcb));
-    hcb.userdata           = view;
-    hcb.doc                = view->doc;
-    hcb.viewport_width     = view->width;
-    hcb.viewport_height    = view->height;
-    hcb.prefers_dark       = view->prefers_dark;
-    hcb.get_current_url    = js_host_get_current_url;
-    hcb.set_document_title = js_host_set_title;
-    hcb.console_log        = js_host_console_log;
-    hcb.navigate_to        = js_host_navigate_to;
-    hcb.storage_get        = js_host_storage_get;
-    hcb.storage_set        = js_host_storage_set;
-    hcb.http_fetch         = js_host_http_fetch;
-    hcb.http_free          = js_host_http_free;
+    hcb.userdata                = view;
+    hcb.doc                     = view->doc;
+    hcb.viewport_width          = view->width;
+    hcb.viewport_height         = view->height;
+    hcb.prefers_dark            = view->prefers_dark;
+    hcb.private_browsing        = view->engine->cfg.private_browsing;
+    hcb.get_current_url         = js_host_get_current_url;
+    hcb.set_document_title      = js_host_set_title;
+    hcb.console_log             = js_host_console_log;
+    hcb.navigate_to             = js_host_navigate_to;
+    hcb.storage_get             = js_host_storage_get;
+    hcb.storage_set             = js_host_storage_set;
+    hcb.http_fetch              = js_host_http_fetch;
+    hcb.http_free               = js_host_http_free;
+    hcb.ensure_layout           = js_host_ensure_layout;
+    hcb.css_supports            = js_host_css_supports;
+    hcb.load_module_source      = js_host_load_module_source;
+    hcb.free_host_buffer        = js_host_free_buffer;
+    hcb.http_fetch_ex           = js_host_http_fetch_ex;
+    hcb.history_push_or_replace = js_host_history_push_or_replace;
+    hcb.history_go              = js_host_history_go;
+    hcb.history_length          = js_host_history_length;
+    hcb.document_write          = js_host_document_write;
 
     view->js_vm = js_vt->create_vm(heap_cap, &hcb);
+    if (view->js_vm && js_vt->set_ready_state && view->ready_state[0] != '\0') {
+        js_vt->set_ready_state(view->js_vm, view->ready_state);
+    }
     return view->js_vm != NULL;
 }
 
@@ -1759,8 +3213,31 @@ static void sync_doc_title_effects(ArcrWebView *view) {
     }
 }
 
+static bool navigate_or_post_internal(ArcrWebView *view, const char *utf8_url,
+                                      const char *method,
+                                      const char *post_body, size_t post_len);
+
 static bool handle_pending_js_navigation(ArcrWebView *view, char *out_url, size_t url_cap) {
-    if (!view || view->pending_js_nav_url[0] == '\0') return false;
+    if (!view) return false;
+
+    if (view->pending_hist_nav_idx >= 0 && (size_t)view->pending_hist_nav_idx < view->hist_count) {
+        size_t target_idx = (size_t)view->pending_hist_nav_idx;
+        view->pending_hist_nav_idx = -1;
+        if (view->js_nav_depth < ARCR_MAX_JS_NAV_DEPTH) {
+            view->js_nav_depth++;
+            view->hist_index            = target_idx;
+            view->suppress_history_push = true;
+            char target_url[ARCR_URL_BUF_CAP];
+            arcr_str_copy(target_url, sizeof(target_url), view->history[target_idx].url);
+            if (out_url && url_cap > 0u) arcr_str_copy(out_url, url_cap, target_url);
+            (void)arcr_webview_navigate_url(view, target_url);
+            view->suppress_history_push = false;
+            view->js_nav_depth--;
+            return true;
+        }
+    }
+
+    if (view->pending_js_nav_url[0] == '\0') return false;
 
     char raw_target[ARCR_URL_BUF_CAP];
     arcr_str_copy(raw_target, sizeof(raw_target), view->pending_js_nav_url);
@@ -1783,65 +3260,193 @@ static bool handle_pending_js_navigation(ArcrWebView *view, char *out_url, size_
     return false;
 }
 
-static bool is_executable_js_script(const ArcrDocument *doc, const ArcrDomNode *el) {
-    if (!doc || !el || el->kind != ARCR_NODE_ELEMENT) return false;
+typedef enum ScriptTagKind {
+    SCRIPT_KIND_NONE      = 0, /* JSON data block / nomodule / unknown type */
+    SCRIPT_KIND_CLASSIC   = 1,
+    SCRIPT_KIND_MODULE    = 2,
+    SCRIPT_KIND_IMPORTMAP = 3
+} ScriptTagKind;
+
+static ScriptTagKind classify_script_element(const ArcrDocument *doc, const ArcrDomNode *el) {
+    if (!doc || !el || el->kind != ARCR_NODE_ELEMENT) return SCRIPT_KIND_NONE;
     const char *tp = arcr_dom_get_attr_cstr(doc, el, "type");
-    if (!tp) return true;
+    ScriptTagKind kind = SCRIPT_KIND_CLASSIC;
 
-    const char *s = tp;
-    size_t len = strlen(tp);
-    const char *semi = strchr(tp, ';');
-    if (semi) len = (size_t)(semi - tp);
-    arcr_str_trim_view(&s, &len);
-    if (len == 0u) return true;
-
-    return arcr_str_eq_nocase_n(s, len, "text/javascript", 15u) ||
-           arcr_str_eq_nocase_n(s, len, "application/javascript", 22u) ||
-           arcr_str_eq_nocase_n(s, len, "application/x-javascript", 24u) ||
-           arcr_str_eq_nocase_n(s, len, "text/ecmascript", 15u) ||
-           arcr_str_eq_nocase_n(s, len, "application/ecmascript", 22u) ||
-           arcr_str_eq_nocase_n(s, len, "module", 6u);
-}
-
-static void collect_executable_script_uids(const ArcrDocument *doc, const ArcrDomNode *n,
-                                           ArcrAtom script_atom,
-                                           uint32_t *out_uids, size_t *io_count, size_t max_cap) {
-    if (!doc || !n || *io_count >= max_cap) return;
-    if (n->kind == ARCR_NODE_ELEMENT && n->tag == script_atom) {
-        if (is_executable_js_script(doc, n) && n->text && n->text_len > 0u && n->node_uid != 0u) {
-            out_uids[(*io_count)++] = n->node_uid;
+    if (tp) {
+        const char *s = tp;
+        size_t len = strlen(tp);
+        arcr_str_trim_view(&s, &len);
+        if (len == 0u) {
+            kind = SCRIPT_KIND_CLASSIC;
+        } else if (arcr_str_eq_nocase_n(s, len, "module", 6u)) {
+            kind = SCRIPT_KIND_MODULE;
+        } else if (arcr_str_eq_nocase_n(s, len, "importmap", 9u)) {
+            kind = SCRIPT_KIND_IMPORTMAP;
+        } else {
+            const char *semi = memchr(s, ';', len);
+            size_t mlen = semi ? (size_t)(semi - s) : len;
+            arcr_str_trim_view(&s, &mlen);
+            if (arcr_str_eq_nocase_n(s, mlen, "text/javascript", 15u) ||
+                arcr_str_eq_nocase_n(s, mlen, "application/javascript", 22u) ||
+                arcr_str_eq_nocase_n(s, mlen, "application/x-javascript", 24u) ||
+                arcr_str_eq_nocase_n(s, mlen, "text/ecmascript", 15u) ||
+                arcr_str_eq_nocase_n(s, mlen, "application/ecmascript", 22u) ||
+                arcr_str_eq_nocase_n(s, mlen, "text/jscript", 12u) ||
+                arcr_str_eq_nocase_n(s, mlen, "text/livescript", 15u)) {
+                kind = SCRIPT_KIND_CLASSIC;
+            } else {
+                return SCRIPT_KIND_NONE;
+            }
         }
-        return;
     }
-    for (const ArcrDomNode *ch = n->first_child; ch != NULL; ch = ch->next_sibling) {
-        collect_executable_script_uids(doc, ch, script_atom, out_uids, io_count, max_cap);
+
+    /* Per HTML5: <script nomodule> is suppressed on Classic scripts when ES modules are supported */
+    if (kind == SCRIPT_KIND_CLASSIC && arcr_dom_get_attr_cstr(doc, el, "nomodule") != NULL) {
+        return SCRIPT_KIND_NONE;
     }
+    return kind;
 }
 
-static void run_document_scripts_safe(ArcrWebView *view, ArcrAtom script_atom,
-                                      const uint32_t *uids, size_t count) {
-    (void)script_atom;
-    if (!view || !view->doc || !view->js_vm || !uids || count == 0u) return;
+static void eval_classic_script_with_url(ArcrWebView *view, const char *code, size_t len,
+                                         const char *source_url) {
+    if (!view || !code || len == 0u) return;
+    if (!ensure_view_js_vm(view)) return;
     const ArcrJsVTable *js_vt = get_js_vt(view->engine);
-    if (!js_vt || !js_vt->eval_script) return;
+    if (!js_vt) return;
+    if (js_vt->eval_script_ex) {
+        (void)js_vt->eval_script_ex(view->js_vm, code, len, source_url ? source_url : view->url);
+    } else if (js_vt->eval_script) {
+        (void)js_vt->eval_script(view->js_vm, code, len);
+    }
+}
 
-    for (size_t i = 0u; i < count; ++i) {
-        if (view->pending_js_nav_url[0] != '\0') break;
-        const ArcrDomNode *sn = arcr_dom_find_by_uid(view->doc->root, uids[i]);
-        if (sn && sn->text && sn->text_len > 0u) {
-            (void)js_vt->eval_script(view->js_vm, sn->text, sn->text_len);
+static void eval_module_script_node(ArcrWebView *view, uint32_t script_uid) {
+    if (!view || !view->doc || script_uid == 0u) return;
+    ArcrDomNode *sn = arcr_dom_find_by_uid(view->doc->root, script_uid);
+    if (!sn) return;
+
+    char eff_base[ARCR_URL_BUF_CAP];
+    view_effective_base_url(view, eff_base, sizeof(eff_base));
+    const char *src = arcr_dom_get_attr_cstr(view->doc, sn, "src");
+
+    if (!src && (!sn->text || sn->text_len == 0u)) return;
+    if (!ensure_view_js_vm(view)) return;
+    const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+    if (!js_vt) return;
+
+    if (src && src[0] != '\0') {
+        char mod_url[ARCR_URL_BUF_CAP];
+        resolve_url_with_engine(view->engine, eff_base, src, mod_url, sizeof(mod_url));
+        if (js_vt->eval_module) {
+            (void)js_vt->eval_module(view->js_vm, NULL, 0u, mod_url);
+        }
+    } else if (sn->text && sn->text_len > 0u) {
+        if (js_vt->eval_module) {
+            (void)js_vt->eval_module(view->js_vm, sn->text, sn->text_len, eff_base);
+        } else {
+            eval_classic_script_with_url(view, sn->text, sn->text_len, eff_base);
         }
     }
+
+    /* Drain any immediately settled top-level await / Promise microtasks */
+    if (view->js_vm && js_vt->tick_timers_and_raf) {
+        bool dummy = false;
+        (void)js_vt->tick_timers_and_raf(view->js_vm,
+                                         arcr_platform_monotonic_usec() / 1000ULL, &dummy);
+    }
+}
+
+/* Flushes completed AsyncSubresBatchJob on main thread; fires window 'load' if document finished */
+static bool flush_finished_subres_job(ArcrWebView *view, bool rebuild_now) {
+    if (!view || !view->subres_job) return false;
+    AsyncSubresBatchJob *job = view->subres_job;
+
+    eng_mutex_lock(&job->mtx);
+    bool done = job->finished;
+    eng_mutex_unlock(&job->mtx);
+    if (!done) return false;
+
+    view->subres_job = NULL;
+    if (job->document_id != view->current_document_id || !view->doc) {
+        subres_job_release(job);
+        return false;
+    }
+
+    bool dom_or_img_changed = false;
+    for (size_t i = 0u; i < job->item_count; ++i) {
+        AsyncSubresItem *it = &job->items[i];
+        const char *init_kind = it->is_async_script
+                                    ? (it->is_module_script ? "module" : "script")
+                                    : "img";
+        const char *reason = "";
+        if (it->blocked_cors)      reason = "cors";
+        else if (it->blocked_mime) reason = "bad-mime";
+
+        view_record_trace_resp(view, init_kind, it->url, &it->resp, reason, it->duration_usec);
+
+        if (!it->ok || !it->resp.body || !view->doc) continue;
+
+        if (it->is_async_script && view->engine->cfg.enable_javascript) {
+            if (!ensure_view_js_vm(view)) continue;
+            const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+            size_t u8_len = 0u;
+            char *u8 = decode_html_bytes_to_utf8_alloc(it->resp.body, it->resp.body_len,
+                                                       it->resp.content_type, &u8_len);
+            if (u8) {
+                const char *furl = it->resp.final_url[0] ? it->resp.final_url : it->url;
+                if (it->is_module_script && js_vt && js_vt->eval_module) {
+                    (void)js_vt->eval_module(view->js_vm, u8, u8_len, furl);
+                } else {
+                    eval_classic_script_with_url(view, u8, u8_len, furl);
+                }
+                free(u8);
+                dom_or_img_changed = true;
+            }
+        } else {
+            ArcrDomNode *owner = (it->owner_uid != 0u)
+                                     ? arcr_dom_find_by_uid(view->doc->root, it->owner_uid)
+                                     : NULL;
+            if (owner) {
+                attach_image_bytes_to_node(view, owner, it->resp.content_type,
+                                           it->resp.body, it->resp.body_len);
+                dom_or_img_changed = true;
+            }
+        }
+    }
+
+    subres_job_release(job);
+
+    /* Transition readyState -> complete and fire window 'load' once initial subresources finish */
+    if (strcmp(view->ready_state, "interactive") == 0) {
+        view_set_ready_state(view, "complete");
+        if (view->js_vm) {
+            const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+            if (js_vt && js_vt->dispatch_dom_event_ex) {
+                bool dummy_prev = false;
+                (void)js_vt->dispatch_dom_event_ex(view->js_vm, 0u, "load",
+                                                   0, 0, 0, &dummy_prev);
+            } else if (js_vt && js_vt->dispatch_dom_event) {
+                (void)js_vt->dispatch_dom_event(view->js_vm, 0u, "load");
+            }
+            dom_or_img_changed = true;
+        }
+    }
+
+    if (handle_pending_js_navigation(view, NULL, 0u)) {
+        return true;
+    }
+    sync_doc_title_effects(view);
+    if (dom_or_img_changed && rebuild_now && view->doc) {
+        sync_view_video_players(view);
+        restyle_and_relayout(view);
+    }
+    return dom_or_img_changed;
 }
 
 #include "arcr_site_hydrators.h"
 /* -------------------------------------------------------------------------
  * 10. Multi-Core Non-Blocking Async Navigation Worker & Lifecycle
  * ------------------------------------------------------------------------- */
-static bool navigate_or_post_internal(ArcrWebView *view, const char *utf8_url,
-                                      const char *method,
-                                      const char *post_body, size_t post_len);
-
 static void async_job_release(AsyncNavJob *job) {
     if (!job) return;
     eng_mutex_lock(&job->mtx);
@@ -1861,7 +3466,7 @@ static void async_nav_worker_run(AsyncNavJob *job) {
     ArcrEngine *eng = job->eng;
 
     eng_mutex_lock(&job->mtx);
-    bool was_canceled = job->canceled;
+    bool was_canceled = job->canceled || (job->cancel_flag != 0);
     if (!was_canceled) {
         job->progress = 35;
     }
@@ -1872,6 +3477,7 @@ static void async_nav_worker_run(AsyncNavJob *job) {
         ArcrHttpResponse local_resp;
         memset(&local_resp, 0, sizeof(local_resp));
         bool ok = false;
+        uint64_t t0 = arcr_platform_monotonic_usec();
 
         bool is_post = arcr_str_eq_nocase(job->method, "POST");
         if (net_vt->fetch_http) {
@@ -1885,6 +3491,7 @@ static void async_nav_worker_run(AsyncNavJob *job) {
             req.referer          = job->referer[0] ? job->referer : NULL;
             req.private_browsing = job->private_browsing;
             req.bypass_cache     = is_post;
+            req.cancel_flag      = &job->cancel_flag;
             ok = net_vt->fetch_http(&req, &local_resp);
         } else if (net_vt->load_url_resource) {
             char  *body = NULL;
@@ -1893,23 +3500,26 @@ static void async_nav_worker_run(AsyncNavJob *job) {
             char detail[256] = {0};
             ok = net_vt->load_url_resource(job->req_url, &body, &len, &sec,
                                            detail, sizeof(detail));
-            local_resp.status_code = ok ? 200 : 0;
-            local_resp.security    = sec;
+            local_resp.status_code   = ok ? 200 : 0;
+            local_resp.security      = sec;
             arcr_str_copy(local_resp.final_url, sizeof(local_resp.final_url), job->req_url);
             arcr_str_copy(local_resp.detail, sizeof(local_resp.detail), detail);
-            local_resp.body     = (uint8_t *)body;
-            local_resp.body_len = len;
+            local_resp.body          = (uint8_t *)body;
+            local_resp.body_len      = len;
+            local_resp.decoded_bytes = len;
         }
+        uint64_t dur = arcr_platform_monotonic_usec() - t0;
 
         eng_mutex_lock(&job->mtx);
-        if (job->canceled) {
+        if (job->canceled || job->cancel_flag != 0) {
             eng_mutex_unlock(&job->mtx);
             free_net_http_response(net_vt, &local_resp);
         } else {
-            job->resp     = local_resp;
-            job->net_ok   = ok && (local_resp.body != NULL);
-            job->progress = 85;
-            job->finished = true;
+            job->resp          = local_resp;
+            job->duration_usec = dur;
+            job->net_ok        = ok && (local_resp.body != NULL) && !local_resp.length_mismatch;
+            job->progress      = 85;
+            job->finished      = true;
             eng_mutex_unlock(&job->mtx);
         }
     } else if (!was_canceled) {
@@ -1949,32 +3559,46 @@ void arcr_webview_stop_loading(ArcrWebView *view) {
         AsyncNavJob *job = view->async_job;
         view->async_job     = NULL;
         view->load_progress = 100;
+        job->cancel_flag    = 1;
         eng_mutex_lock(&job->mtx);
         job->canceled = true;
         eng_mutex_unlock(&job->mtx);
+        view_record_trace_explicit(view, job->navigation_id, view->current_document_id,
+                                   "navigation", job->req_url, job->req_url, 0, "", 0u, 0u,
+                                   false, "cancelled", 0ULL);
         async_job_release(job);
+    }
+    cancel_view_subres_job(view);
+    if (strcmp(view->ready_state, "interactive") == 0) {
+        view_set_ready_state(view, "complete");
     }
 }
 
 bool arcr_webview_is_loading(const ArcrWebView *view) {
-    return view && (view->async_job != NULL);
+    return view && (view->async_job != NULL || view->subres_job != NULL);
 }
 
 int32_t arcr_webview_get_load_progress(const ArcrWebView *view) {
     if (!view) return 100;
-    if (!view->async_job) return view->load_progress;
-    AsyncNavJob *job = view->async_job;
-    eng_mutex_lock(&job->mtx);
-    int32_t p = job->progress;
-    eng_mutex_unlock(&job->mtx);
-    return ARCR_CLAMP(p, 0, 100);
+    if (view->async_job) {
+        AsyncNavJob *job = view->async_job;
+        eng_mutex_lock(&job->mtx);
+        int32_t p = job->progress;
+        eng_mutex_unlock(&job->mtx);
+        return ARCR_CLAMP(p, 0, 100);
+    }
+    if (view->subres_job) return 90;
+    return view->load_progress;
 }
 
 /* -------------------------------------------------------------------------
- * 11. WebView Lifecycle & Viewport Controls
+ * 11. WebView Lifecycle, Session History API & Viewport Controls
  * ------------------------------------------------------------------------- */
 static void free_view_document_state(ArcrWebView *view) {
     if (!view) return;
+
+    cancel_view_subres_job(view);
+    view->active_parser = NULL;
 
     if (view->js_vm) {
         const ArcrJsVTable *js_vt = get_js_vt(view->engine);
@@ -2017,12 +3641,15 @@ ArcrWebView *arcr_webview_create(ArcrEngine *engine, int32_t width, int32_t heig
     ArcrWebView *view = (ArcrWebView *)calloc(1u, sizeof(ArcrWebView));
     if (!view) return NULL;
 
-    view->engine        = engine;
-    view->width         = ARCR_MAX(width, 64);
-    view->height        = ARCR_MAX(height, 64);
-    view->zoom_percent  = 100;
-    view->load_progress = 100;
-    view->security      = ARCR_SEC_LOCAL_OR_NONE;
+    eng_mutex_init(&view->trace_mtx);
+    view->engine               = engine;
+    view->width                = ARCR_MAX(width, 64);
+    view->height               = ARCR_MAX(height, 64);
+    view->zoom_percent         = 100;
+    view->load_progress        = 100;
+    view->security             = ARCR_SEC_LOCAL_OR_NONE;
+    view->pending_hist_nav_idx = -1;
+    arcr_str_copy(view->ready_state, sizeof(view->ready_state), "complete");
     arcr_str_copy(view->url, sizeof(view->url), "about:blank");
     arcr_str_copy(view->title, sizeof(view->title), "새 탭");
 
@@ -2051,9 +3678,11 @@ void arcr_webview_destroy(ArcrWebView *view) {
     }
 
     free_view_document_state(view);
+    clear_view_history(view);
     strbuf_free(&view->user_css);
     strbuf_free(&view->console_log);
     strbuf_free(&view->raw_html);
+    eng_mutex_destroy(&view->trace_mtx);
     free(view);
 }
 
@@ -2108,33 +3737,138 @@ void arcr_webview_set_prefers_dark(ArcrWebView *view, bool prefers_dark) {
     restyle_and_relayout(view);
 }
 
+bool arcr_webview_can_go_back(const ArcrWebView *view) {
+    return view && view->hist_count > 1u && view->hist_index > 0u;
+}
+
+bool arcr_webview_can_go_forward(const ArcrWebView *view) {
+    return view && view->hist_count > 1u && (view->hist_index + 1u) < view->hist_count;
+}
+
+bool arcr_webview_go_back(ArcrWebView *view) {
+    if (!arcr_webview_can_go_back(view)) return false;
+    size_t prev_idx = view->hist_index - 1u;
+    ViewHistoryEntry *ent = &view->history[prev_idx];
+
+    if (ent->doc_group_id == view->current_doc_group_id && view->doc) {
+        view->hist_index = prev_idx;
+        arcr_str_copy(view->url, sizeof(view->url), ent->url);
+        if (view->cb.on_url_changed) {
+            view->cb.on_url_changed(view->cb.userdata, view->url);
+        }
+        if (view->js_vm) {
+            const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+            if (js_vt && js_vt->notify_url_and_popstate) {
+                js_vt->notify_url_and_popstate(view->js_vm, view->url, ent->state_json, true);
+            }
+            sync_doc_title_effects(view);
+            if (view->doc && view->doc->dom_dirty) {
+                restyle_and_relayout(view);
+            }
+        }
+        return true;
+    }
+
+    char target_url[ARCR_URL_BUF_CAP];
+    arcr_str_copy(target_url, sizeof(target_url), ent->url);
+    view->hist_index            = prev_idx;
+    view->suppress_history_push = true;
+    bool ok = arcr_webview_navigate_url(view, target_url);
+    view->suppress_history_push = false;
+    return ok;
+}
+
+bool arcr_webview_go_forward(ArcrWebView *view) {
+    if (!arcr_webview_can_go_forward(view)) return false;
+    size_t next_idx = view->hist_index + 1u;
+    ViewHistoryEntry *ent = &view->history[next_idx];
+
+    if (ent->doc_group_id == view->current_doc_group_id && view->doc) {
+        view->hist_index = next_idx;
+        arcr_str_copy(view->url, sizeof(view->url), ent->url);
+        if (view->cb.on_url_changed) {
+            view->cb.on_url_changed(view->cb.userdata, view->url);
+        }
+        if (view->js_vm) {
+            const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+            if (js_vt && js_vt->notify_url_and_popstate) {
+                js_vt->notify_url_and_popstate(view->js_vm, view->url, ent->state_json, true);
+            }
+            sync_doc_title_effects(view);
+            if (view->doc && view->doc->dom_dirty) {
+                restyle_and_relayout(view);
+            }
+        }
+        return true;
+    }
+
+    char target_url[ARCR_URL_BUF_CAP];
+    arcr_str_copy(target_url, sizeof(target_url), ent->url);
+    view->hist_index            = next_idx;
+    view->suppress_history_push = true;
+    bool ok = arcr_webview_navigate_url(view, target_url);
+    view->suppress_history_push = false;
+    return ok;
+}
+
+bool arcr_webview_reload(ArcrWebView *view) {
+    if (!view || view->url[0] == '\0') return false;
+    char cur_url[ARCR_URL_BUF_CAP];
+    arcr_str_copy(cur_url, sizeof(cur_url), view->url);
+    view->suppress_history_push = true;
+    bool ok = arcr_webview_navigate_url(view, cur_url);
+    view->suppress_history_push = false;
+    return ok;
+}
+
 /* -------------------------------------------------------------------------
- * 12. Document Loading, Site Hydrators & Diagnostic Error Page
+ * 12. Resumable HTML5 Document Loader, Script Lifecycle & Diagnostic Error Page
  * ------------------------------------------------------------------------- */
-static bool load_html_internal(ArcrWebView      *view,
-                               const char       *base_url,
-                               const char       *utf8_html,
-                               size_t            html_len,
-                               ArcrSecurityState sec_state,
-                               const char       *sec_detail) {
+typedef struct DeferredScriptEntry {
+    uint32_t uid;
+    bool     is_module;
+} DeferredScriptEntry;
+
+static bool load_html_bytes_internal(ArcrWebView      *view,
+                                     const char       *base_url,
+                                     const uint8_t    *raw_bytes,
+                                     size_t            raw_len,
+                                     const char       *http_content_type,
+                                     ArcrSecurityState sec_state,
+                                     const char       *sec_detail,
+                                     bool              record_history) {
     if (!view || !view->engine) return false;
-    const char *safe_html = utf8_html ? utf8_html : "";
-    if (!utf8_html) html_len = 0u;
+
+    size_t utf8_len = 0u;
+    char *decoded_utf8 = decode_html_bytes_to_utf8_alloc(
+        raw_bytes, raw_len, http_content_type, &utf8_len);
+    const char *safe_html = decoded_utf8 ? decoded_utf8 : "";
 
     free_view_document_state(view);
     view->scroll_y              = 0;
     view->ime_comp[0]           = '\0';
     view->last_hover_href[0]    = '\0';
     view->pending_js_nav_url[0] = '\0';
+    view->pending_hist_nav_idx  = -1;
     view->find_active_idx       = 0u;
     view->find_total_matches    = 0u;
     strbuf_clear(&view->console_log);
     strbuf_clear(&view->raw_html);
-    (void)strbuf_append(&view->raw_html, safe_html, html_len);
+    (void)strbuf_append(&view->raw_html, safe_html, utf8_len);
+
+    if (view->current_navigation_id == 0ULL) {
+        view->current_navigation_id = engine_alloc_nav_id(view->engine);
+    }
+    view->current_document_id  = engine_alloc_doc_id(view->engine);
+    view->current_doc_group_id = engine_alloc_doc_group_id(view->engine);
 
     const char *eff_url = (base_url && base_url[0] != '\0') ? base_url : "about:blank";
-    arcr_str_copy(view->url, sizeof(view->url), eff_url);
+    sanitize_trace_url(eff_url, view->url, sizeof(view->url));
     view->security = sec_state;
+
+    if (record_history) {
+        record_view_history_commit(view, view->url, view->current_doc_group_id);
+    }
 
     if (view->cb.on_url_changed) {
         view->cb.on_url_changed(view->cb.userdata, view->url);
@@ -2144,9 +3878,203 @@ static bool load_html_internal(ArcrWebView      *view,
                                      sec_detail ? sec_detail : "");
     }
 
-    ArcrDocument *doc = arcr_html_parse(&view->engine->atoms, safe_html, html_len);
-    if (!doc) return false;
-    view->doc = doc;
+    bool js_enabled = view->engine->cfg.enable_javascript;
+    ArcrHtmlParser *parser = arcr_html_parser_begin(&view->engine->atoms, safe_html, utf8_len,
+                                                    js_enabled);
+    if (!parser) {
+        free(decoded_utf8);
+        return false;
+    }
+
+    ArcrDocument *doc = arcr_html_parser_document(parser);
+    view->doc           = doc;
+    view->active_parser = parser;
+    arcr_str_copy(view->ready_state, sizeof(view->ready_state), "loading");
+
+    /* Apply user/extension CSS early so computed style queries during parsing see it */
+    if (view->user_css.len > 0u && view->user_css.data) {
+        arcr_dom_append_style_block(doc, view->user_css.data, view->user_css.len);
+    }
+
+    char  *ssr_snap          = NULL;
+    size_t ssr_len           = 0u;
+    bool   needs_nextjs_shim = false;
+    bool   nextjs_shim_ran   = false;
+    bool   hydrator_pre_ran  = false;
+
+    DeferredScriptEntry defer_list[ARCR_DEFER_SCRIPT_MAX];
+    size_t defer_count = 0u;
+
+    uint32_t async_uids[ARCR_ASYNC_SUBRES_MAX];
+    bool     async_is_mod[ARCR_ASYNC_SUBRES_MAX];
+    size_t   async_count = 0u;
+    bool     module_graph_started = false;
+
+    /* Resumable HTML5 parse loop: pauses immediately at every </script> */
+    for (;;) {
+        ArcrDomNode *paused_node = NULL;
+        ArcrHtmlPauseReason reason = arcr_html_parser_resume(parser, &paused_node);
+        if (reason == ARCR_HTML_PARSE_DONE) break;
+
+        if (reason == ARCR_HTML_PARSE_PAUSE_STYLE) {
+            fetch_pending_stylesheets_sync(view);
+            continue;
+        }
+
+        if (reason == ARCR_HTML_PARSE_PAUSE_SCRIPT && paused_node && js_enabled) {
+            if (!hydrator_pre_ran && doc->body != NULL) {
+                arcr_hydrator_before_scripts(view, safe_html, utf8_len,
+                                             &ssr_snap, &ssr_len, &needs_nextjs_shim);
+                hydrator_pre_ran = true;
+            }
+
+            /* Mark external script ref consumed so post-parse subresource pass won't re-fetch */
+            for (ArcrExternalResourceRef *r = doc->ext_scripts_head; r != NULL; r = r->next) {
+                if (r->owner_uid == paused_node->node_uid) {
+                    r->href_or_src = NULL;
+                }
+            }
+
+            ScriptTagKind skind = classify_script_element(doc, paused_node);
+            if (skind == SCRIPT_KIND_NONE) continue;
+
+            /* Scripts wait on pending <link rel="stylesheet"> blocks per HTML5 */
+            fetch_pending_stylesheets_sync(view);
+
+            char eff_base[ARCR_URL_BUF_CAP];
+            view_effective_base_url(view, eff_base, sizeof(eff_base));
+            const char *src_attr   = arcr_dom_get_attr_cstr(doc, paused_node, "src");
+            bool        has_src    = (src_attr && src_attr[0] != '\0');
+            bool        has_async  = (arcr_dom_get_attr_cstr(doc, paused_node, "async") != NULL);
+            bool        has_defer  = (arcr_dom_get_attr_cstr(doc, paused_node, "defer") != NULL);
+
+            if (skind == SCRIPT_KIND_IMPORTMAP) {
+                if (!has_src && paused_node->text && paused_node->text_len > 0u) {
+                    if (module_graph_started) {
+                        js_host_console_log(view,
+                            "[importmap/error] An import map is not allowed after module script load has started.");
+                    } else if (ensure_view_js_vm(view)) {
+                        const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+                        if (js_vt && js_vt->register_import_map) {
+                            (void)js_vt->register_import_map(view->js_vm,
+                                                             paused_node->text,
+                                                             paused_node->text_len,
+                                                             eff_base);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (skind == SCRIPT_KIND_MODULE) {
+                module_graph_started = true;
+                if (has_async && has_src) {
+                    if (async_count < ARCR_ASYNC_SUBRES_MAX) {
+                        async_uids[async_count]   = paused_node->node_uid;
+                        async_is_mod[async_count] = true;
+                        async_count++;
+                    }
+                } else if (has_async && !has_src && paused_node->text && paused_node->text_len > 0u) {
+                    eval_module_script_node(view, paused_node->node_uid);
+                } else if (defer_count < ARCR_DEFER_SCRIPT_MAX) {
+                    defer_list[defer_count].uid       = paused_node->node_uid;
+                    defer_list[defer_count].is_module = true;
+                    defer_count++;
+                }
+                continue;
+            }
+
+            /* Classic script */
+            if (has_src && has_async) {
+                if (async_count < ARCR_ASYNC_SUBRES_MAX) {
+                    async_uids[async_count]   = paused_node->node_uid;
+                    async_is_mod[async_count] = false;
+                    async_count++;
+                }
+                continue;
+            }
+            if (has_src && has_defer) {
+                if (defer_count < ARCR_DEFER_SCRIPT_MAX) {
+                    defer_list[defer_count].uid       = paused_node->node_uid;
+                    defer_list[defer_count].is_module = false;
+                    defer_count++;
+                }
+                continue;
+            }
+
+            /* Parser-blocking Classic script (inline or external <script src="...">) */
+            const char *exec_code = paused_node->text;
+            size_t      exec_len  = paused_node->text_len;
+            char       *fetched_u8 = NULL;
+            char        script_url[ARCR_URL_BUF_CAP];
+            arcr_str_copy(script_url, sizeof(script_url), eff_base);
+
+            if (has_src) {
+                resolve_url_with_engine(view->engine, eff_base, src_attr,
+                                        script_url, sizeof(script_url));
+                uint8_t *sbytes = NULL;
+                size_t   sblen  = 0u;
+                char     sctype[128] = {0};
+                char     sfinal[ARCR_URL_BUF_CAP] = {0};
+                if (!engine_fetch_resource_traced(view, "script", view->engine, script_url,
+                                                  view->url, "GET", NULL, 0u, true,
+                                                  &sbytes, &sblen, sfinal, sizeof(sfinal),
+                                                  sctype, sizeof(sctype),
+                                                  NULL, NULL, 0u, NULL, NULL) || !sbytes) {
+                    engine_free_resource(view->engine, sbytes);
+                    continue;
+                }
+                if (sfinal[0] != '\0') {
+                    arcr_str_copy(script_url, sizeof(script_url), sfinal);
+                }
+                fetched_u8 = decode_html_bytes_to_utf8_alloc(sbytes, sblen, sctype, &exec_len);
+                engine_free_resource(view->engine, sbytes);
+                exec_code = fetched_u8;
+            }
+
+            if (exec_code && exec_len > 0u && ensure_view_js_vm(view)) {
+                const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+                if (needs_nextjs_shim && !nextjs_shim_ran && js_vt && js_vt->eval_script) {
+                    const char *nx_shim =
+                        "window.__next_f = window.__next_f || [];"
+                        "window.process = window.process || {env:{NODE_ENV:'production'}};"
+                        "window.global = window;";
+                    (void)js_vt->eval_script(view->js_vm, nx_shim, strlen(nx_shim));
+                    nextjs_shim_ran = true;
+                }
+
+                /* Initialize form defaults discovered so far before running script */
+                ArcrAtom inp_a = arcr_atom_intern_lower(&view->engine->atoms, "input", 5u);
+                ArcrAtom ta_a  = arcr_atom_intern_lower(&view->engine->atoms, "textarea", 8u);
+                init_form_defaults_recursive(doc, doc->root, inp_a, ta_a);
+
+                eval_classic_script_with_url(view, exec_code, exec_len, script_url);
+                sync_doc_title_effects(view);
+
+                if (view->pending_js_nav_url[0] != '\0' || view->pending_hist_nav_idx >= 0) {
+                    free(fetched_u8);
+                    break;
+                }
+            }
+            free(fetched_u8);
+        }
+    }
+
+    (void)arcr_html_parser_finish(parser);
+    view->active_parser = NULL;
+
+    if (!hydrator_pre_ran) {
+        arcr_hydrator_before_scripts(view, safe_html, utf8_len,
+                                     &ssr_snap, &ssr_len, &needs_nextjs_shim);
+        hydrator_pre_ran = true;
+    }
+
+    /* If a blocking script triggered immediate navigation, commit that navigation now */
+    if (handle_pending_js_navigation(view, NULL, 0u)) {
+        free(ssr_snap);
+        free(decoded_utf8);
+        return true;
+    }
 
     ArcrAtom input_atom    = arcr_atom_intern_lower(&view->engine->atoms, "input", 5u);
     ArcrAtom textarea_atom = arcr_atom_intern_lower(&view->engine->atoms, "textarea", 8u);
@@ -2154,98 +4082,139 @@ static bool load_html_internal(ArcrWebView      *view,
 
     if (doc->title && doc->title[0] != '\0') {
         arcr_str_copy(view->title, sizeof(view->title), doc->title);
-    } else {
+    } else if (view->title[0] == '\0' || strcmp(view->title, "새 탭") == 0) {
         arcr_str_copy(view->title, sizeof(view->title), eff_url);
     }
     if (view->cb.on_title_changed) {
         view->cb.on_title_changed(view->cb.userdata, view->title);
     }
 
-    /* Fetch <link rel="stylesheet">, <img src>, <script src> in parallel */
-    fetch_document_subresources(view);
+    /* Fetch any stylesheets encountered after the last script */
+    fetch_pending_stylesheets_sync(view);
 
-    /* Apply live injected user/extension CSS if present */
-    if (view->user_css.len > 0u && view->user_css.data) {
-        arcr_dom_append_style_block(doc, view->user_css.data, view->user_css.len);
-    }
+    /* HTML5 "The end": readyState -> "interactive", run defer & module queue, fire DOMContentLoaded */
+    view_set_ready_state(view, "interactive");
 
-    /* Pre-script hydrator hook (<noscript> hide, Google CSS, Next.js SSR snapshot) */
-    char  *ssr_snap          = NULL;
-    size_t ssr_len           = 0u;
-    bool   needs_nextjs_shim = false;
-    arcr_hydrator_before_scripts(view, safe_html, html_len,
-                                 &ssr_snap, &ssr_len, &needs_nextjs_shim);
+    if (js_enabled && defer_count > 0u) {
+        char eff_base[ARCR_URL_BUF_CAP];
+        view_effective_base_url(view, eff_base, sizeof(eff_base));
+        for (size_t i = 0u; i < defer_count; ++i) {
+            if (view->pending_js_nav_url[0] != '\0' || view->pending_hist_nav_idx >= 0) break;
+            if (defer_list[i].is_module) {
+                eval_module_script_node(view, defer_list[i].uid);
+            } else {
+                ArcrDomNode *sn = arcr_dom_find_by_uid(doc->root, defer_list[i].uid);
+                if (!sn) continue;
+                const char *src_attr = arcr_dom_get_attr_cstr(doc, sn, "src");
+                if (!src_attr || src_attr[0] == '\0') continue;
 
-    /* Execute <script> blocks safely via UID array (lazy-loads arcr_js_portable ONLY if needed!) */
-    if (view->engine->cfg.enable_javascript && doc->has_scripts) {
-        ArcrAtom script_atom = arcr_atom_intern_lower(&view->engine->atoms, "script", 6u);
-        size_t max_scripts = (size_t)doc->node_count + 1u;
-        uint32_t *script_uids = (uint32_t *)malloc(max_scripts * sizeof(uint32_t));
-        size_t script_count = 0u;
-        if (script_uids) {
-            collect_executable_script_uids(doc, doc->root, script_atom,
-                                           script_uids, &script_count, max_scripts);
-        }
-
-        if (script_count > 0u && ensure_view_js_vm(view)) {
-            const ArcrJsVTable *js_vt = get_js_vt(view->engine);
-            if (needs_nextjs_shim && js_vt && js_vt->eval_script) {
-                const char *nx_shim =
-                    "window.__next_f = window.__next_f || [];"
-                    "window.process = window.process || {env:{NODE_ENV:'production'}};"
-                    "window.global = window;";
-                (void)js_vt->eval_script(view->js_vm, nx_shim, strlen(nx_shim));
+                char script_url[ARCR_URL_BUF_CAP];
+                resolve_url_with_engine(view->engine, eff_base, src_attr,
+                                        script_url, sizeof(script_url));
+                uint8_t *sbytes = NULL;
+                size_t   sblen  = 0u;
+                char     sctype[128] = {0};
+                char     sfinal[ARCR_URL_BUF_CAP] = {0};
+                if (engine_fetch_resource_traced(view, "script", view->engine, script_url,
+                                                 view->url, "GET", NULL, 0u, true,
+                                                 &sbytes, &sblen, sfinal, sizeof(sfinal),
+                                                 sctype, sizeof(sctype),
+                                                 NULL, NULL, 0u, NULL, NULL) && sbytes) {
+                    size_t u8_len = 0u;
+                    char *u8 = decode_html_bytes_to_utf8_alloc(sbytes, sblen, sctype, &u8_len);
+                    engine_free_resource(view->engine, sbytes);
+                    if (u8) {
+                        eval_classic_script_with_url(view, u8, u8_len,
+                                                     sfinal[0] ? sfinal : script_url);
+                        free(u8);
+                    }
+                } else {
+                    engine_free_resource(view->engine, sbytes);
+                }
             }
-
-            run_document_scripts_safe(view, script_atom, script_uids, script_count);
-            free(script_uids);
-            script_uids = NULL;
-
-            if (handle_pending_js_navigation(view, NULL, 0u)) {
-                free(ssr_snap);
-                return true;
-            }
-
-            if (js_vt && js_vt->dispatch_dom_event_ex) {
-                bool dummy_prev = false;
-                (void)js_vt->dispatch_dom_event_ex(view->js_vm, 0u, "DOMContentLoaded",
-                                                   0, 0, 0, &dummy_prev);
-                (void)js_vt->dispatch_dom_event_ex(view->js_vm, 0u, "load",
-                                                   0, 0, 0, &dummy_prev);
-            } else if (js_vt && js_vt->dispatch_dom_event) {
-                (void)js_vt->dispatch_dom_event(view->js_vm, 0u, "DOMContentLoaded");
-                (void)js_vt->dispatch_dom_event(view->js_vm, 0u, "load");
-            }
-
-            if (handle_pending_js_navigation(view, NULL, 0u)) {
-                free(ssr_snap);
-                return true;
-            }
-
             sync_doc_title_effects(view);
-            fetch_document_subresources(view);
         }
-        free(script_uids);
+
+        if (handle_pending_js_navigation(view, NULL, 0u)) {
+            free(ssr_snap);
+            free(decoded_utf8);
+            return true;
+        }
     }
 
-    /* Post-script hydrator (Next.js/zuzunza SSR recovery, YouTube cinema, X/Twitter card) */
-    if (arcr_hydrator_after_scripts(view, safe_html, html_len, ssr_snap, ssr_len)) {
+    if (view->js_vm) {
+        const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+        if (js_vt && js_vt->dispatch_dom_event_ex) {
+            bool dummy_prev = false;
+            (void)js_vt->dispatch_dom_event_ex(view->js_vm, 0u, "DOMContentLoaded",
+                                               0, 0, 0, &dummy_prev);
+        } else if (js_vt && js_vt->dispatch_dom_event) {
+            (void)js_vt->dispatch_dom_event(view->js_vm, 0u, "DOMContentLoaded");
+        }
+        if (handle_pending_js_navigation(view, NULL, 0u)) {
+            free(ssr_snap);
+            free(decoded_utf8);
+            return true;
+        }
+        sync_doc_title_effects(view);
+    }
+
+    /* Post-script hydrator (excluded automatically when cfg.conformance_mode == true!) */
+    if (arcr_hydrator_after_scripts(view, safe_html, utf8_len, ssr_snap, ssr_len)) {
         sync_doc_title_effects(view);
     }
     free(ssr_snap);
+    free(decoded_utf8);
+
+    /* Fetch any new stylesheets injected by scripts, then start non-blocking async images/scripts */
+    fetch_pending_stylesheets_sync(view);
+    start_async_subresources_if_needed(view, async_uids, async_is_mod, async_count);
+
+    /* If no background subresource batch is still in flight, transition to "complete" & fire load */
+    if (!view->subres_job) {
+        view_set_ready_state(view, "complete");
+        if (view->js_vm) {
+            const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+            if (js_vt && js_vt->dispatch_dom_event_ex) {
+                bool dummy_prev = false;
+                (void)js_vt->dispatch_dom_event_ex(view->js_vm, 0u, "load",
+                                                   0, 0, 0, &dummy_prev);
+            } else if (js_vt && js_vt->dispatch_dom_event) {
+                (void)js_vt->dispatch_dom_event(view->js_vm, 0u, "load");
+            }
+            if (handle_pending_js_navigation(view, NULL, 0u)) {
+                return true;
+            }
+            sync_doc_title_effects(view);
+        }
+    }
 
     /* Attach <video>/<audio> media sessions on demand */
     sync_view_video_players(view);
 
     restyle_and_relayout(view);
-    view->load_progress = 100;
+    view->load_progress = view->subres_job ? 90 : 100;
     return true;
+}
+
+static bool load_html_internal(ArcrWebView      *view,
+                               const char       *base_url,
+                               const char       *utf8_html,
+                               size_t            html_len,
+                               ArcrSecurityState sec_state,
+                               const char       *sec_detail) {
+    return load_html_bytes_internal(view, base_url,
+                                    (const uint8_t *)(utf8_html ? utf8_html : ""),
+                                    utf8_html ? html_len : 0u,
+                                    "text/html; charset=utf-8",
+                                    sec_state, sec_detail, true);
 }
 
 bool arcr_webview_load_html(ArcrWebView *view, const char *base_url,
                             const char *utf8_html, size_t html_len) {
     if (!view) return false;
     arcr_webview_stop_loading(view);
+    view->current_navigation_id = engine_alloc_nav_id(view->engine);
 
     ArcrSecurityState sec = ARCR_SEC_LOCAL_OR_NONE;
     if (base_url) {
@@ -2294,8 +4263,10 @@ static void render_navigation_error_page(ArcrWebView      *view,
         strbuf_append_cstr(&sb, "<p>원격 서버 응답이 없거나 네트워크 연결에 실패했습니다.</p>");
     }
 
+    char safe_failed_url[ARCR_URL_BUF_CAP];
+    sanitize_trace_url(failed_url ? failed_url : "", safe_failed_url, sizeof(safe_failed_url));
     strbuf_append_cstr(&sb, "<code>URL: ");
-    hydrator_append_html_escaped(&sb, failed_url ? failed_url : "");
+    hydrator_append_html_escaped(&sb, safe_failed_url);
     if (detail && detail[0] != '\0') {
         strbuf_append_cstr(&sb, " | Detail: ");
         hydrator_append_html_escaped(&sb, detail);
@@ -2303,7 +4274,8 @@ static void render_navigation_error_page(ArcrWebView      *view,
     strbuf_append_cstr(&sb, "</code></div></body></html>");
 
     if (sb.data) {
-        (void)load_html_internal(view, failed_url, sb.data, sb.len, sec_state, detail);
+        (void)load_html_bytes_internal(view, safe_failed_url, (const uint8_t *)sb.data, sb.len,
+                                       "text/html; charset=utf-8", sec_state, detail, false);
     }
     strbuf_free(&sb);
 }
@@ -2323,6 +4295,8 @@ static bool navigate_or_post_internal(ArcrWebView *view, const char *utf8_url,
         arcr_str_copy(target_url, sizeof(target_url), utf8_url);
     }
 
+    view->current_navigation_id = engine_alloc_nav_id(view->engine);
+
     if (arcr_str_starts_with_nocase(target_url, "about:blank")) {
         return load_html_internal(view, "about:blank", "<html><body></body></html>", 26u,
                                   ARCR_SEC_LOCAL_OR_NONE, "");
@@ -2330,15 +4304,16 @@ static bool navigate_or_post_internal(ArcrWebView *view, const char *utf8_url,
 
     uint8_t          *bytes       = NULL;
     size_t            blen        = 0u;
-    char              final_url[ARCR_URL_BUF_CAP];
+    char              final_url[ARCR_URL_BUF_CAP] = {0};
+    char              ctype[128]  = {0};
     ArcrSecurityState sec         = ARCR_SEC_LOCAL_OR_NONE;
     char              detail[256] = {0};
     bool              was_blocked = false;
     int               http_status = 0;
 
-    bool ok = engine_fetch_resource_ex(
-        view->engine, target_url, view->url, method, post_body, post_len,
-        false, &bytes, &blen, final_url, sizeof(final_url),
+    bool ok = engine_fetch_resource_traced(
+        view, "navigation", view->engine, target_url, view->url, method, post_body, post_len,
+        false, &bytes, &blen, final_url, sizeof(final_url), ctype, sizeof(ctype),
         &sec, detail, sizeof(detail), &was_blocked, &http_status);
 
     if (!ok || !bytes) {
@@ -2347,8 +4322,19 @@ static bool navigate_or_post_internal(ArcrWebView *view, const char *utf8_url,
         return false;
     }
 
-    bool loaded = load_html_internal(view, final_url[0] ? final_url : target_url,
-                                     (const char *)bytes, blen, sec, detail);
+    /* Update last navigation trace entry's document_id once the new document commits */
+    bool loaded = load_html_bytes_internal(view, final_url[0] ? final_url : target_url,
+                                           bytes, blen, ctype, sec, detail, true);
+    eng_mutex_lock(&view->trace_mtx);
+    for (size_t i = 0u; i < view->trace_count; ++i) {
+        size_t idx = (view->trace_start + i) % ARCR_TRACE_RING_CAP;
+        if (view->traces[idx].navigation_id == view->current_navigation_id &&
+            strcmp(view->traces[idx].initiator, "navigation") == 0) {
+            view->traces[idx].document_id = view->current_document_id;
+        }
+    }
+    eng_mutex_unlock(&view->trace_mtx);
+
     engine_free_resource(view->engine, bytes);
     return loaded;
 }
@@ -2377,12 +4363,18 @@ static bool start_async_nav_internal(ArcrWebView *view, const char *utf8_url,
         arcr_str_copy(target_url, sizeof(target_url), utf8_url);
     }
 
+    uint64_t nav_id = engine_alloc_nav_id(view->engine);
+    view->current_navigation_id = nav_id;
+
     if (arcr_str_starts_with_nocase(target_url, "about:blank")) {
         return load_html_internal(view, "about:blank", "<html><body></body></html>", 26u,
                                   ARCR_SEC_LOCAL_OR_NONE, "");
     }
 
     if (check_url_blocked(view->engine, target_url, view->url)) {
+        view_record_trace_explicit(view, nav_id, view->current_document_id,
+                                   "navigation", target_url, target_url, 0, "", 0u, 0u,
+                                   false, "url-filter", 0ULL);
         render_navigation_error_page(view, target_url, ARCR_SEC_LOCAL_OR_NONE,
                                      "Blocked by URL Filter", true);
         return false;
@@ -2402,6 +4394,7 @@ static bool start_async_nav_internal(ArcrWebView *view, const char *utf8_url,
     eng_mutex_init(&job->mtx);
     job->refs             = 2; /* 1 owned by WebView, 1 owned by worker thread */
     job->progress         = 15;
+    job->navigation_id    = nav_id;
     job->eng              = view->engine;
     job->net_vt           = get_net_vt(view->engine);
     job->private_browsing = view->engine->cfg.private_browsing;
@@ -2468,8 +4461,9 @@ bool arcr_webview_post_async(ArcrWebView *view, const char *utf8_url,
                              const char *form_urlencoded_body, size_t body_len) {
     return start_async_nav_internal(view, utf8_url, "POST", form_urlencoded_body, body_len);
 }
+
 /* -------------------------------------------------------------------------
- * 13. Animation Tick (60 FPS JS + CSS @keyframes + GIF + <video>) & Inspection
+ * 13. Animation Tick (60 FPS JS + Async Subres + CSS @keyframes + GIF + <video>)
  * ------------------------------------------------------------------------- */
 static void step_dom_anim_gifs_recursive(ArcrDomNode *node, uint64_t now_usec,
                                          bool *io_changed, bool *io_any_anim) {
@@ -2516,13 +4510,28 @@ bool arcr_webview_tick(ArcrWebView *view, uint64_t now_usec) {
         eng_mutex_unlock(&job->mtx);
 
         if (done) {
-            view->async_job     = NULL;
-            view->load_progress = 100;
+            view->async_job             = NULL;
+            view->load_progress         = 100;
+            view->current_navigation_id = job->navigation_id;
+
+            view_record_trace_resp(view, "navigation", job->req_url, &job->resp,
+                                   job->net_ok ? "" : NULL, job->duration_usec);
+
             if (job->net_ok && job->resp.body) {
                 const char *furl = job->resp.final_url[0] ? job->resp.final_url : job->req_url;
-                (void)load_html_internal(view, furl,
-                                         (const char *)job->resp.body, job->resp.body_len,
-                                         job->resp.security, job->resp.detail);
+                (void)load_html_bytes_internal(view, furl,
+                                               job->resp.body, job->resp.body_len,
+                                               job->resp.content_type,
+                                               job->resp.security, job->resp.detail, true);
+                eng_mutex_lock(&view->trace_mtx);
+                for (size_t i = 0u; i < view->trace_count; ++i) {
+                    size_t idx = (view->trace_start + i) % ARCR_TRACE_RING_CAP;
+                    if (view->traces[idx].navigation_id == job->navigation_id &&
+                        strcmp(view->traces[idx].initiator, "navigation") == 0) {
+                        view->traces[idx].document_id = view->current_document_id;
+                    }
+                }
+                eng_mutex_unlock(&view->trace_mtx);
             } else {
                 render_navigation_error_page(view, job->req_url, job->resp.security,
                                              job->resp.detail, false);
@@ -2532,7 +4541,17 @@ bool arcr_webview_tick(ArcrWebView *view, uint64_t now_usec) {
         }
     }
 
-    /* 2. Advance JS timers, Promise microtasks & requestAnimationFrame(ts) */
+    /* 1b. Commit finished non-blocking subresources (slow images / async scripts) */
+    if (view->subres_job) {
+        if (flush_finished_subres_job(view, true)) {
+            view->load_progress = 100;
+            any_updated = true;
+        } else if (!view->subres_job) {
+            view->load_progress = 100;
+        }
+    }
+
+    /* 2. Advance JS timers, async Fetch completions, Promise microtasks & rAF(ts) */
     if (view->js_vm && view->doc) {
         const ArcrJsVTable *js_vt = get_js_vt(view->engine);
         if (js_vt && js_vt->tick_timers_and_raf) {
@@ -2638,6 +4657,12 @@ bool arcr_webview_has_active_animations(const ArcrWebView *view) {
         }
     }
     return false;
+}
+
+bool arcr_webview_has_pending_js_work(const ArcrWebView *view) {
+    if (!view || !view->engine || !view->js_vm) return false;
+    const ArcrJsVTable *js_vt = get_js_vt(view->engine);
+    return (js_vt && js_vt->has_pending_timers) ? js_vt->has_pending_timers(view->js_vm) : false;
 }
 
 const char *arcr_webview_get_html_source(const ArcrWebView *view, size_t *out_len) {
@@ -3650,6 +5675,14 @@ bool arcr_webview_paint(ArcrWebView *view, uint32_t *argb_pixels,
     if (!view || !view->engine || !argb_pixels ||
         width <= 0 || height <= 0 || stride_pixels < width) {
         return false;
+    }
+
+    if (view->subres_job) {
+        if (flush_finished_subres_job(view, true)) {
+            view->load_progress = 100;
+        } else if (!view->subres_job) {
+            view->load_progress = 100;
+        }
     }
 
     uint64_t t0 = arcr_platform_monotonic_usec();

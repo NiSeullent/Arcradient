@@ -33,27 +33,37 @@ typedef struct ArcrCertCheckInput {
 } ArcrCertCheckInput;
 
 typedef struct ArcrHttpRequest {
-    const char *url;
-    const char *method;           /* "GET", "POST", "HEAD", etc. */
-    const char *post_body;        /* Optional form/JSON payload */
-    size_t      post_body_len;
-    const char *content_type;     /* Default: application/x-www-form-urlencoded */
-    const char *accept;           /* Optional Accept header override */
-    const char *referer;          /* Optional Referer header */
-    const char *extra_headers;    /* Optional raw "Header: Val\r\n" lines */
-    bool        private_browsing; /* Do not read/write persistent cookies when true */
-    bool        bypass_cache;
+    const char         *url;
+    const char         *method;           /* "GET", "POST", "HEAD", "OPTIONS", etc. */
+    const char         *post_body;        /* Optional form/JSON payload */
+    size_t              post_body_len;
+    const char         *content_type;     /* Default: application/x-www-form-urlencoded */
+    const char         *accept;           /* Optional Accept header override */
+    const char         *referer;          /* Optional Referer header */
+    const char         *origin;           /* Optional CORS Origin header */
+    const char         *extra_headers;    /* Optional raw "Header: Val\r\n" lines */
+    const volatile int *cancel_flag;      /* Optional cancellation signal (*cancel_flag != 0 aborts I/O) */
+    bool                private_browsing; /* Do not read/write persistent cookies when true */
+    bool                bypass_cache;
+    bool                include_credentials; /* Send/store cookies on cross-origin when true */
 } ArcrHttpRequest;
 
 typedef struct ArcrHttpResponse {
     int               status_code;
     char              final_url[ARCR_NET_MAX_URL_LEN];
     char              content_type[256];
-    uint8_t          *body;       /* Null-terminated byte buffer (caller frees via free_resource / free_response) */
+    uint8_t          *body;            /* Null-terminated byte buffer (freed via free_response) */
     size_t            body_len;
+    size_t            encoded_bytes;   /* Wire payload bytes before decompression */
+    size_t            decoded_bytes;   /* Decompressed payload bytes */
+    char             *raw_headers;     /* "\r\n"-delimited response headers (freed via free_response) */
+    size_t            raw_headers_len;
     ArcrSecurityState security;
     char              detail[256];
     bool              from_cache;
+    bool              redirected;
+    bool              cancelled;
+    bool              length_mismatch;
 } ArcrHttpResponse;
 
 typedef struct ArcrNetVTable {

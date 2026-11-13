@@ -84,6 +84,7 @@ typedef struct ArcrEngineConfig {
     bool            force_cpu_rendering;
     bool            enable_javascript;
     bool            private_browsing;  /* Ephemeral cookies/storage when true */
+    bool            conformance_mode;  /* Pure standards path: excludes legacy site-name hydrators */
     uint32_t        worker_threads;    /* 0 = auto hardware core count */
     size_t          max_cache_bytes;
     const char     *module_search_dir; /* Directory containing arcr_*.dll / libarcr_*.so */
@@ -91,31 +92,48 @@ typedef struct ArcrEngineConfig {
 } ArcrEngineConfig;
 
 typedef struct ArcrEngineStats {
-    uint32_t detected_cpu_flags;
-    uint32_t active_simd_level;
-    uint32_t active_gpu_backend;
-    uint32_t worker_thread_count;
-    bool     gpu_available;
-    bool     gpu_fallback_triggered;
-    bool     net_module_loaded;
-    bool     js_module_loaded;
-    bool     media_module_loaded;
-    bool     devtools_module_loaded;
-    size_t   arena_allocated_bytes;
-    size_t   arena_used_bytes;
-    size_t   interned_atom_count;
-    size_t   style_shared_hits;
-    size_t   glyph_cache_entries;
-    size_t   glyph_cache_hits;
-    size_t   js_heap_bytes;
-    uint32_t dom_node_count;
-    uint32_t layout_box_count;
-    uint32_t display_cmd_count;
-    uint32_t tiles_rendered_last_frame;
-    uint64_t last_layout_usec;
-    uint64_t last_paint_usec;
-    uint32_t blocked_requests_count;
+    uint32_t    detected_cpu_flags;
+    uint32_t    active_simd_level;
+    uint32_t    active_gpu_backend;
+    uint32_t    worker_thread_count;
+    bool        gpu_available;
+    bool        gpu_fallback_triggered;
+    bool        net_module_loaded;
+    bool        js_module_loaded;
+    bool        media_module_loaded;
+    bool        devtools_module_loaded;
+    const char *js_engine_backend;
+    size_t      arena_allocated_bytes;
+    size_t      arena_used_bytes;
+    size_t      interned_atom_count;
+    size_t      style_shared_hits;
+    size_t      glyph_cache_entries;
+    size_t      glyph_cache_hits;
+    size_t      js_heap_bytes;
+    uint32_t    dom_node_count;
+    uint32_t    layout_box_count;
+    uint32_t    display_cmd_count;
+    uint32_t    tiles_rendered_last_frame;
+    uint64_t    last_layout_usec;
+    uint64_t    last_paint_usec;
+    uint32_t    blocked_requests_count;
 } ArcrEngineStats;
+
+typedef struct ArcrRequestTraceEntry {
+    uint64_t navigation_id;
+    uint64_t document_id;
+    uint64_t request_id;
+    char     initiator[32];      /* "navigation", "css", "script", "module", "img", "fetch", "xhr" */
+    char     url[512];           /* Sanitized request URL (credentials stripped) */
+    char     final_url[512];     /* Post-redirect final URL */
+    int32_t  status_code;
+    char     mime_type[128];
+    size_t   encoded_bytes;
+    size_t   decoded_bytes;
+    bool     from_cache;
+    char     blocked_reason[64]; /* "", "url-filter", "cors", "bad-mime", "cancelled", "tls-error", "net-error" */
+    uint64_t duration_usec;
+} ArcrRequestTraceEntry;
 
 typedef struct ArcrWebViewCallbacks {
     void *userdata;
@@ -153,6 +171,13 @@ bool arcr_webview_navigate_url(ArcrWebView *view, const char *utf8_url);
 bool arcr_webview_post_url(ArcrWebView *view, const char *utf8_url,
                            const char *form_urlencoded_body, size_t body_len);
 
+/* Session History & SPA pushState/popstate Navigation */
+bool arcr_webview_can_go_back(const ArcrWebView *view);
+bool arcr_webview_can_go_forward(const ArcrWebView *view);
+bool arcr_webview_go_back(ArcrWebView *view);
+bool arcr_webview_go_forward(ArcrWebView *view);
+bool arcr_webview_reload(ArcrWebView *view);
+
 /* Multi-core Non-Blocking Async Navigation, Animation Tick & Inspection */
 bool    arcr_webview_navigate_async(ArcrWebView *view, const char *utf8_url);
 bool    arcr_webview_post_async(ArcrWebView *view, const char *utf8_url,
@@ -162,11 +187,20 @@ bool    arcr_webview_is_loading(const ArcrWebView *view);
 int32_t arcr_webview_get_load_progress(const ArcrWebView *view);
 bool    arcr_webview_tick(ArcrWebView *view, uint64_t now_usec);
 bool    arcr_webview_has_active_animations(const ArcrWebView *view);
+bool    arcr_webview_has_pending_js_work(const ArcrWebView *view);
 const char *arcr_webview_get_html_source(const ArcrWebView *view, size_t *out_len);
 void    arcr_webview_query_context_at(const ArcrWebView *view, int32_t x, int32_t y,
                                       char *out_link_url, size_t link_cap,
                                       char *out_media_url, size_t media_cap,
                                       bool *out_is_editable);
+
+/* End-to-End Navigation / Document / Request Trace Inspection */
+uint64_t    arcr_webview_get_navigation_id(const ArcrWebView *view);
+uint64_t    arcr_webview_get_document_id(const ArcrWebView *view);
+const char *arcr_webview_get_ready_state(const ArcrWebView *view);
+size_t      arcr_webview_get_request_traces(const ArcrWebView *view,
+                                            ArcrRequestTraceEntry *out_entries,
+                                            size_t max_entries);
 
 /* Extension / Reader / DevTools live injection */
 bool arcr_webview_inject_user_css(ArcrWebView *view, const char *utf8_css, size_t css_len);

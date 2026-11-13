@@ -92,9 +92,15 @@ typedef struct ArcrComputedStyle {
     uint8_t            opacity; /* 0..255 (255 = 1.0) */
     int32_t            z_index;
 
+#define ARCR_MAX_GRID_TRACKS 12u
+
     uint32_t           color_argb;
     uint32_t           bg_argb;
     uint32_t           border_argb;
+    uint32_t           border_top_argb;
+    uint32_t           border_right_argb;
+    uint32_t           border_bottom_argb;
+    uint32_t           border_left_argb;
     uint32_t           shadow_argb;
     int32_t            shadow_blur;
     int32_t            shadow_offset_y;
@@ -105,8 +111,12 @@ typedef struct ArcrComputedStyle {
     uint32_t           grad_end_argb;
     int32_t            grad_angle_deg;
 
+    /* CSS Mask Image (e.g. data:image/svg+xml icon tinted with bg_argb) */
+    const char        *mask_image_url;
+
     int32_t            font_px;
     int32_t            line_height_pct; /* e.g. 145 = 1.45x */
+    int32_t            line_height_px;  /* >0 when explicit px/rem/em line-height is set */
     bool               font_bold;
     bool               font_monospace;
     bool               underline;
@@ -115,7 +125,10 @@ typedef struct ArcrComputedStyle {
     bool               word_break_keep_all;
     bool               white_space_pre;
     bool               white_space_nowrap;
-    uint8_t            text_transform; /* 0=none, 1=uppercase, 2=lowercase */
+    bool               list_style_none;
+    bool               sr_only_clip;    /* clip: rect(0,0,0,0) / clip-path: inset(50%) */
+    uint8_t            text_transform;  /* 0=none, 1=uppercase, 2=lowercase */
+    uint8_t            container_type;  /* 0=normal, 1=inline-size, 2=size */
     ArcrTextAlign      text_align;
 
     int32_t            border_radius;
@@ -161,6 +174,8 @@ typedef struct ArcrComputedStyle {
     int32_t            grid_columns;    /* >0 when grid-template-columns: repeat(N, ...) */
     int32_t            grid_min_col_px; /* >0 for repeat(auto-fill/auto-fit, minmax(Npx, 1fr)) */
     int32_t            grid_col_span;   /* >=1 for grid-column: span N */
+    uint8_t            grid_track_count;/* >0 for explicit track list e.g. "240px 1fr" */
+    int32_t            grid_track_specs[ARCR_MAX_GRID_TRACKS]; /* >0 = px, <0 = negated fr, 0 = auto */
 
     /* 2D CSS Transforms (applied during layout/paint & @keyframes interpolation) */
     int32_t            translate_x_px;
@@ -182,11 +197,12 @@ typedef struct ArcrComputedStyle {
     uint32_t           dependency_flags;
 } ArcrComputedStyle;
 
-#define ARCR_STYLE_DEP_EM    (1u << 0)
-#define ARCR_STYLE_DEP_VAR   (1u << 1)
-#define ARCR_STYLE_DEP_MEDIA (1u << 2)
-#define ARCR_STYLE_DEP_STATE (1u << 3)
-#define ARCR_STYLE_DEP_ANIM  (1u << 4)
+#define ARCR_STYLE_DEP_EM        (1u << 0)
+#define ARCR_STYLE_DEP_VAR       (1u << 1)
+#define ARCR_STYLE_DEP_MEDIA     (1u << 2)
+#define ARCR_STYLE_DEP_STATE     (1u << 3)
+#define ARCR_STYLE_DEP_ANIM      (1u << 4)
+#define ARCR_STYLE_DEP_CONTAINER (1u << 5)
 
 typedef struct ArcrCssMediaEnv {
     int32_t viewport_width;
@@ -208,5 +224,10 @@ void arcr_css_resolve_tree_animated(ArcrDocument *doc, ArcrStylesheet *sheet,
                                     bool *out_has_active_animations);
 
 bool arcr_css_parse_color(const char *str, size_t len, uint32_t *out_argb);
+
+/* Truthful CSS @supports / CSS.supports() evaluation against supported engine properties & values */
+bool arcr_css_supports_declaration(const char *prop, size_t prop_len,
+                                   const char *val, size_t val_len);
+bool arcr_css_supports_condition(const char *cond, size_t cond_len);
 
 #endif /* ARCR_CSS_H */

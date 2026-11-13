@@ -31,12 +31,15 @@ typedef enum WaterscapePresentBackend {
     WS_PRESENT_X11_XIMAGE   = 6  /* Linux X11 Standard XPutImage Fallback */
 } WaterscapePresentBackend;
 
+#define WATERSCAPE_APP_USER_MODEL_ID L"Waterscape.Browser.2"
+
 typedef struct WaterscapeWindowOptions {
     const char *window_title;
     int32_t     initial_width;
     int32_t     initial_height;
-    bool        force_cpu_presenter; /* Force GDI / XShm CPU presentation */
-    uint32_t    auto_close_ms;       /* > 0: automatically close window after N ms (CI/Xvfb) */
+    bool        force_cpu_presenter;  /* Force GDI / XShm CPU presentation */
+    bool        force_classic_frame;  /* Force single OS frame without DWM titlebar extension */
+    uint32_t    auto_close_ms;        /* > 0: automatically close window after N ms (CI/Xvfb) */
 } WaterscapeWindowOptions;
 
 const char *waterscape_present_backend_name(WaterscapePresentBackend backend);
@@ -46,6 +49,14 @@ const char *waterscape_present_backend_name(WaterscapePresentBackend backend);
  * viewport framebuffer has been dirtied since the last `arcr_shell_render_frame`.
  */
 bool waterscape_shell_needs_repaint(const ArcrBrowserShell *shell);
+
+/*
+ * Opens an OS-owned Open or Save file dialog modal to the active browser window
+ * (Win32 Common Item Dialog on Vista+ / GetOpenFileNameW fallback on Win2000 SP4)
+ * and restores focus to the browser window upon dismissal.
+ */
+bool waterscape_show_file_dialog(bool is_save, const char *default_filename_utf8,
+                                 char *out_path_utf8, size_t out_cap);
 
 /*
  * Opens a native OS desktop window for `shell` and runs the interactive event +

@@ -40,6 +40,21 @@ const char *waterscape_present_backend_name(WaterscapePresentBackend backend) {
     }
 }
 
+bool waterscape_show_file_dialog(bool is_save, const char *default_filename_utf8,
+                                 char *out_path_utf8, size_t out_cap) {
+    (void)is_save;
+    (void)default_filename_utf8;
+    if (!out_path_utf8 || out_cap == 0u) return false;
+    out_path_utf8[0] = '\0';
+
+    const char *env_path = getenv("WATERSCAPE_FILE_DIALOG_PATH");
+    if (env_path && env_path[0] != '\0') {
+        arcr_str_copy(out_path_utf8, out_cap, env_path);
+        return true;
+    }
+    return false;
+}
+
 #if defined(WATERSCAPE_HAVE_X11)
 
 #include <X11/Xatom.h>
@@ -62,6 +77,7 @@ typedef struct X11PresenterSurface {
     WaterscapePresentBackend backend;
     bool                     allow_shm;
     bool                     os_fullscreen;
+    WaterscapeFrameMetrics   fm;
 
     XImage                  *ximg;
     XShmSegmentInfo          shminfo;
@@ -91,6 +107,36 @@ typedef struct X11PresenterSurface {
     bool                     owns_clipboard;
     char                     last_synced_clip[8192];
 } X11PresenterSurface;
+
+static int32_t x11_detect_dpi(Display *dpy, int screen) {
+    const char *env_dpi = getenv("WATERSCAPE_FORCE_DPI");
+    if (env_dpi && env_dpi[0] != '\0') {
+        int v = atoi(env_dpi);
+        if (v >= 72 && v <= 384) return (int32_t)v;
+    }
+
+    const char *rms = XResourceManagerString(dpy);
+    if (rms) {
+        const char *p = strstr(rms, "Xft.dpi:");
+        if (p) {
+            p += 8;
+            while (*p == ' ' || *p == '\t') ++p;
+            double xft_dpi = atof(p);
+            if (xft_dpi >= 72.0 && xft_dpi <= 384.0) {
+                return (int32_t)(xft_dpi + 0.5);
+            }
+        }
+    }
+
+    int px_w = DisplayWidth(dpy, screen);
+    int mm_w = DisplayWidthMM(dpy, screen);
+    if (px_w > 0 && mm_w > 20) {
+        double raw = ((double)px_w * 25.4) / (double)mm_w;
+        if (raw >= 84.0 && raw <= 108.0) return 96;
+        if (raw >= 72.0 && raw <= 384.0) return (int32_t)(raw + 0.5);
+    }
+    return 96;
+}
 
 static volatile int g_x11_shm_err_trapped = 0;
 
@@ -454,6 +500,16 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
     int32_t init_w = (opts && opts->initial_width > 0)  ? opts->initial_width  : 1080;
     int32_t init_h = (opts && opts->initial_height > 0) ? opts->initial_height : 720;
 
+    /* X11 WM owns the single outer window frame & caption; shell draws zero caption glyphs */
+    arcr_shell_default_frame_metrics(&surf.fm);
+    surf.fm.mode                   = ARCR_FRAME_OS_SINGLE;
+    surf.fm.dpi                    = x11_detect_dpi(dpy, surf.screen);
+    surf.fm.os_caption_height_px   = 0;
+    surf.fm.caption_inset_left_px  = 0;
+    surf.fm.caption_inset_right_px = 0;
+    surf.fm.window_active          = true;
+    surf.fm.is_maximized           = false;
+    arcr_shell_set_frame_metrics(shell, &surf.fm);
     arcr_shell_resize(shell, init_w, init_h);
 
     surf.win = XCreateSimpleWindow(
@@ -470,7 +526,7 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
     XSetWMProtocols(dpy, surf.win, &wm_delete, 1);
 
     XSelectInput(dpy, surf.win,
-                 ExposureMask | StructureNotifyMask | KeyPressMask |
+                 ExposureMask | StructureNotifyMask | FocusChangeMask | KeyPressMask |
                  ButtonPressMask | ButtonReleaseMask | PointerMotionMask);
 
     surf.gc            = DefaultGC(dpy, surf.screen);
@@ -489,9 +545,9 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
         return 1;
     }
 
-    printf("  X11 Presenter  : %s (%dx%d, depth %d)\n",
+    printf("  X11 Presenter  : %s (%dx%d, depth %d, %d DPI, Single-Frame OS)\n",
            waterscape_present_backend_name(surf.backend),
-           (int)init_w, (int)init_h, surf.depth);
+           (int)init_w, (int)init_h, surf.depth, (int)surf.fm.dpi);
 
     XMapWindow(dpy, surf.win);
     if (arcr_shell_is_fullscreen(shell)) {
@@ -708,6 +764,22 @@ int waterscape_run_desktop_window(ArcrEngine *engine,
                 }
                 break;
             }
+
+            case FocusIn:
+                if (!surf.fm.window_active) {
+                    surf.fm.window_active = true;
+                    arcr_shell_set_frame_metrics(shell, &surf.fm);
+                    needs_paint = true;
+                }
+                break;
+
+            case FocusOut:
+                if (surf.fm.window_active) {
+                    surf.fm.window_active = false;
+                    arcr_shell_set_frame_metrics(shell, &surf.fm);
+                    needs_paint = true;
+                }
+                break;
 
             case SelectionRequest:
                 x11_handle_selection_request(&surf, &ev.xselectionrequest);

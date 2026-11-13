@@ -74,6 +74,25 @@ typedef struct ArcrDomNode {
     /* Optional decoded <img>, inline <svg>, <video>, or 2D <canvas> surface */
     ArcrDomSurface            *surface;
 
+    /* Raw SVG source for currentColor & layout-sized dynamic re-rasterization */
+    const char                *raw_svg_markup;
+    size_t                     raw_svg_len;
+    uint32_t                   svg_rendered_color;
+    int32_t                    svg_rendered_w;
+    int32_t                    svg_rendered_h;
+
+    /* HTML5 <template> inert content fragment & Shadow DOM root */
+    struct ArcrDomNode        *template_content;
+    struct ArcrDomNode        *shadow_root;
+    bool                       shadow_open;
+
+    /* Last computed border-box geometry from layout (for getBoundingClientRect / offsetWidth) */
+    int32_t                    layout_x;
+    int32_t                    layout_y;
+    int32_t                    layout_w;
+    int32_t                    layout_h;
+    bool                       has_layout_box;
+
     struct ArcrDomNode        *parent;
     struct ArcrDomNode        *first_child;
     struct ArcrDomNode        *last_child;
@@ -97,6 +116,12 @@ typedef struct ArcrExternalResourceRef {
     struct ArcrExternalResourceRef *next;
 } ArcrExternalResourceRef;
 
+typedef enum ArcrQuirksMode {
+    ARCR_QUIRKS_NO_QUIRKS      = 0, /* Standards mode (<!doctype html>) */
+    ARCR_QUIRKS_LIMITED_QUIRKS = 1,
+    ARCR_QUIRKS_FULL_QUIRKS    = 2
+} ArcrQuirksMode;
+
 typedef struct ArcrDocument {
     ArcrArena                arena;       /* Persistent DOM string/attr arena */
     ArcrArena                style_arena; /* Resettable arena for ComputedStyle resolution (0 hover leak!) */
@@ -115,6 +140,7 @@ typedef struct ArcrDocument {
     ArcrExternalResourceRef *ext_images_head;
     uint32_t                 node_count;
     uint32_t                 next_uid;
+    ArcrQuirksMode           quirks_mode;
     bool                     has_scripts;
     bool                     has_media;
     bool                     has_images;
@@ -154,6 +180,10 @@ const char   *arcr_dom_get_input_value(const ArcrDocument *doc, const ArcrDomNod
 ArcrDomSurface *arcr_dom_ensure_surface(ArcrDocument *doc, ArcrDomNode *elem,
                                         int32_t width, int32_t height);
 
+/* Re-rasterizes inline <svg> with resolved currentColor and layout dimensions */
+bool arcr_dom_rerasterize_svg(ArcrDocument *doc, ArcrDomNode *svg_elem,
+                              uint32_t current_color_argb, int32_t target_w, int32_t target_h);
+
 /* Fast DOM queries for JS & CSS */
 ArcrDomNode  *arcr_dom_find_by_uid(ArcrDomNode *root, uint32_t uid);
 ArcrDomNode  *arcr_dom_get_element_by_id(const ArcrDocument *doc, const char *id_str);
@@ -168,8 +198,25 @@ void          arcr_dom_append_style_block(ArcrDocument *doc, const char *css, si
 /* Computes 64-bit Bloom filter bitmask for an atom */
 uint64_t arcr_bloom_bits_for_atom(ArcrAtom atom);
 
-/* Parses UTF-8 HTML5 with spec-grade error recovery & inline <svg> rasterization */
+/* Parses UTF-8 HTML5 in one shot (with scripting_enabled=true default) */
 ArcrDocument *arcr_html_parse(ArcrAtomTable *atoms, const char *utf8_html, size_t len);
+
+/* Resumable HTML5 parser for spec-accurate parser-blocking <script> & document.write */
+typedef struct ArcrHtmlParser ArcrHtmlParser;
+
+typedef enum ArcrHtmlPauseReason {
+    ARCR_HTML_PARSE_DONE         = 0,
+    ARCR_HTML_PARSE_PAUSE_SCRIPT = 1, /* Closed </script>: inspect *out_script_node before resuming */
+    ARCR_HTML_PARSE_PAUSE_STYLE  = 2  /* Closed <link rel="stylesheet">: optional stylesheet barrier */
+} ArcrHtmlPauseReason;
+
+ArcrHtmlParser     *arcr_html_parser_begin(ArcrAtomTable *atoms, const char *utf8_html,
+                                           size_t len, bool scripting_enabled);
+ArcrDocument       *arcr_html_parser_document(ArcrHtmlParser *parser);
+ArcrHtmlPauseReason arcr_html_parser_resume(ArcrHtmlParser *parser, ArcrDomNode **out_node);
+bool                arcr_html_parser_document_write(ArcrHtmlParser *parser,
+                                                    const char *utf8_chunk, size_t chunk_len);
+ArcrDocument       *arcr_html_parser_finish(ArcrHtmlParser *parser);
 
 /* Parses an HTML fragment and appends its nodes under `target_parent` (for innerHTML) */
 bool arcr_html_parse_fragment(ArcrDocument *doc, ArcrDomNode *target_parent,

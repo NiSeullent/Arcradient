@@ -30,15 +30,51 @@ typedef enum ArcrShellTheme {
     ARCR_SHELL_THEME_WIN2000_CLASSIC = 2 /* Opaque, 3D Win32 bevels, zero alpha overhead */
 } ArcrShellTheme;
 
+typedef enum WaterscapeFrameMode {
+    ARCR_FRAME_OS_SINGLE     = 0, /* OS draws outer frame & caption; shell draws 0 caption glyphs */
+    ARCR_FRAME_DWM_EXTENDED  = 1, /* Win10/11 DWM custom titlebar: tab strip shares Row 1 with OS caption buttons */
+    ARCR_FRAME_SIMULATED     = 2  /* Offscreen showcase / standalone simulated frame */
+} WaterscapeFrameMode;
+
+typedef enum ArcrShellChromeZone {
+    ARCR_CHROME_CONTENT          = 0, /* Web content viewport */
+    ARCR_CHROME_CAPTION_DRAG     = 1, /* Empty draggable area of tab strip -> HTCAPTION */
+    ARCR_CHROME_TAB_OR_CONTROL   = 2, /* Interactive tab, '+', toolbar, address bar, splitter -> HTCLIENT */
+    ARCR_CHROME_OS_CAPTION_INSET = 3  /* Reserved OS minimize/maximize/close button area */
+} ArcrShellChromeZone;
+
+typedef enum ArcrDevToolsDock {
+    ARCR_DEVTOOLS_DOCK_BOTTOM = 0,
+    ARCR_DEVTOOLS_DOCK_RIGHT  = 1
+} ArcrDevToolsDock;
+
+typedef struct WaterscapeFrameMetrics {
+    WaterscapeFrameMode mode;
+    int32_t             dpi;                    /* 96 = 100%, 120 = 125%, 144 = 150%, 192 = 200% */
+    int32_t             os_caption_height_px;   /* Row 1 min height when DWM extended */
+    int32_t             caption_inset_left_px;  /* Left reserved system area in Row 1 */
+    int32_t             caption_inset_right_px; /* Right reserved system caption buttons width in Row 1 */
+    bool                window_active;          /* Active vs inactive caption/tab visual state */
+    bool                is_maximized;
+    bool                high_contrast;          /* OS High Contrast accessibility mode */
+    uint32_t            hc_bg_argb;
+    uint32_t            hc_fg_argb;
+    uint32_t            hc_accent_argb;
+    uint32_t            hc_border_argb;
+} WaterscapeFrameMetrics;
+
 typedef struct ArcrShellLayoutMetrics {
-    ArcrRect window_caption_rect;   /* Optional Classic Win2000 titlebar when simulated */
-    ArcrRect tab_strip_rect;        /* 1. 탭 표시줄 (32px; 0px in F11 fullscreen) */
-    ArcrRect nav_toolbar_rect;      /* 2. 탐색 도구 모음 (36px; 0px in F11 fullscreen) */
-    ArcrRect bookmarks_bar_rect;    /* 3. 선택형 북마크 바 (0px hidden by default, 24px shown) */
+    ArcrRect window_caption_rect;   /* Simulated Classic titlebar ONLY when mode == ARCR_FRAME_SIMULATED */
+    ArcrRect tab_strip_rect;        /* 1. 탭 표시줄 (36 DIP min; 0px in F11 fullscreen) */
+    ArcrRect os_caption_inset_rect; /* Reserved native OS caption buttons rect inside Row 1 */
+    ArcrRect nav_toolbar_rect;      /* 2. 탐색 도구 모음 (40 DIP; 0px in F11 fullscreen) */
+    ArcrRect address_bar_rect;      /* Address omnibox rect in device pixels */
+    ArcrRect bookmarks_bar_rect;    /* 3. 선택형 북마크 바 (0px hidden by default, 28 DIP shown) */
     ArcrRect content_viewport;      /* 4. 웹 콘텐츠 영역 (Maximized remaining space) */
     ArcrRect status_overlay_rect;   /* 5. 하단 좌측 임시 상태 표시 (Shown on hover/load) */
-    ArcrRect find_bar_rect;         /* 6. 문서 내 검색 바 (0px hidden, 28px on Ctrl+F) */
-    ArcrRect devtools_dock_rect;    /* 7. 하단 하드웨어·개발자 도구 독 (0px hidden, 150px on F12) */
+    ArcrRect find_bar_rect;         /* 6. 문서 내 검색 바 (0px hidden, 32 DIP on Ctrl+F) */
+    ArcrRect devtools_dock_rect;    /* 7. 내부 개발자 도구 독 (Bottom or Right, resizable) */
+    ArcrRect devtools_splitter_rect;/* 5 DIP draggable/keyboard splitter bar */
     ArcrRect vscrollbar_rect;       /* 8. 세로 스크롤바 트랙 */
     ArcrRect vscrollbar_thumb_rect; /* 9. 세로 스크롤바 썸 */
 } ArcrShellLayoutMetrics;
@@ -65,6 +101,29 @@ void              arcr_shell_default_config(ArcrShellConfig *out_cfg, ArcrShellT
 ArcrBrowserShell *arcr_shell_create(ArcrEngine *engine, const ArcrShellConfig *cfg);
 void              arcr_shell_destroy(ArcrBrowserShell *shell);
 void              arcr_shell_resize(ArcrBrowserShell *shell, int32_t width, int32_t height);
+
+/* Frame Ownership, DPI & DevTools Layout Controls */
+void              arcr_shell_default_frame_metrics(WaterscapeFrameMetrics *out_fm);
+void              arcr_shell_set_frame_metrics(ArcrBrowserShell *shell,
+                                               const WaterscapeFrameMetrics *fm);
+void              arcr_shell_get_frame_metrics(const ArcrBrowserShell *shell,
+                                               WaterscapeFrameMetrics *out_fm);
+ArcrShellChromeZone arcr_shell_hit_test_chrome_zone(const ArcrBrowserShell *shell,
+                                                    int32_t client_x, int32_t client_y);
+
+void              arcr_shell_set_devtools_dock(ArcrBrowserShell *shell,
+                                               ArcrDevToolsDock dock, int32_t size_dip);
+ArcrDevToolsDock  arcr_shell_get_devtools_dock(const ArcrBrowserShell *shell);
+int32_t           arcr_shell_get_devtools_size_dip(const ArcrBrowserShell *shell);
+void              arcr_shell_set_devtools_tab(ArcrBrowserShell *shell, int32_t tab_idx);
+int32_t           arcr_shell_get_devtools_tab(const ArcrBrowserShell *shell);
+
+/* Accessibility (Win32 UIA) & Layout Inspection Queries */
+const char       *arcr_shell_get_address_bar_text(const ArcrBrowserShell *shell);
+const char       *arcr_shell_get_tab_title(const ArcrBrowserShell *shell, size_t tab_index);
+bool              arcr_shell_get_tab_rect(const ArcrBrowserShell *shell, size_t tab_index,
+                                          ArcrRect *out_rect);
+int32_t           arcr_shell_get_tab_overflow_count(const ArcrBrowserShell *shell);
 
 /* Add-ons & Profile Access */
 WsAddonManager *arcr_shell_get_addons(ArcrBrowserShell *shell);
